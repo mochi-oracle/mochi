@@ -1,0 +1,29 @@
+node_modules/
+contracts/out/
+contracts/cache/
+contracts/work/*/out/
+contracts/work/*/cache/
+.env
+.env.*
+*.log
+.agents/runs/
+.e2e/
+contracts/work/
+.DS_Store
+*.tsbuildinfo
+*.pem
+*-deployer.json
+*-relayer.json
+# A global excludes file may ignore token*/id_*/secrets*; vendored libraries need those paths (e.g. OZ token/).
+!/contracts/lib/**/token*
+!/contracts/vendor/**/token*
+
+# Generated website output and local claim storage
+web/site/dist/
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+
+!/scripts/token-policy.ts
+
+!/test/token-policy.test.ts
