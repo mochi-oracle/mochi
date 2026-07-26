@@ -1,0 +1,57 @@
+{
+  "name": "mochi",
+  "license": "PolyForm-Noncommercial-1.0.0",
+  "private": true,
+  "type": "module",
+  "workspaces": [
+    "packages/*",
+    "services/*"
+  ],
+  "scripts": {
+    "test": "bun test",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "contracts:build": "cd contracts && forge build",
+    "contracts:test": "cd contracts && forge test",
+    "deploy:local": "bun scripts/deploy-local.ts",
+    "gen:abis": "cd contracts && forge build && cd .. && bun scripts/gen-abis.ts",
+    "e2e:core": "bun scripts/e2e-core.ts",
+    "e2e": "bun scripts/e2e.ts"
+  },
+  "devDependencies": {
+    "@types/node": "26.6.3",
+    "bun-types": "1.4.2",
+    "drizzle-kit": "0.31.11",
+    "fast-check": "4.10.2",
+    "typescript": "7.0.2"
+  },
+  "dependencies": {
+    "@mochi/chain": "workspace:*",
+    "@mochi/aci": "workspace:*",
+    "@mochi/consensus": "workspace:*",
+    "@mochi/core": "workspace:*",
+    "@mochi/db": "workspace:*",
+    "@mochi/privacy": "workspace:*",
+    "@mochi/protocol": "workspace:*",
+    "@mochi/receipts": "workspace:*",
+    "@mochi/schemas": "workspace:*",
+    "@mochi/sdk": "workspace:*",
+    "@mochi/tee": "workspace:*",
+    "@noble/ciphers": "2.4.0",
+    "@noble/curves": "2.4.0",
+    "@noble/hashes": "2.4.0",
+    "@openzeppelin/contracts-upgradeable": "5.0.2",
+    "@trpc/server": "11.19.0",
+    "@zk-kit/lean-imt": "2.2.2",
+    "@zk-kit/lean-imt.sol": "2.0.0",
+    "bullmq": "6.3.9",
+    "drizzle-orm": "0.45.3",
+    "hono": "4.13.9",
+    "ioredis": "6.0.0",
+    "poseidon-lite": "0.3.0",
+    "poseidon-solidity": "0.0.5",
+    "postgres": "3.4.9",
+    "snarkjs": "0.7.6",
+    "viem": "2.56.9",
+    "zod": "4.6.5"
+  }
+}
