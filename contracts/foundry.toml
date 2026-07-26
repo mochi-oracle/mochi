@@ -1,0 +1,30 @@
+[profile.default]
+src = "src"
+out = "out"
+libs = ["lib"]
+test = "test"
+script = "script"
+solc = "0.8.28"
+evm_version = "prague"
+optimizer = true
+optimizer_runs = 200
+via_ir = true
+# poseidon-solidity's hash libraries are deployed separately (linked). Under via_ir they exceed EIP-170
+# (29.3 / 32.9 KB); compiled like upstream (legacy pipeline, 10k runs) they are 23.6 / 12.6 KB.
+additional_compiler_profiles = [{ name = "poseidon", via_ir = false, optimizer_runs = 10000 }]
+compilation_restrictions = [{ paths = "**/poseidon-solidity/*.sol", via_ir = false, min_optimizer_runs = 10000 }]
+fs_permissions = [{ access = "read", path = "./test/fixtures" }]
+allow_paths = ["../node_modules", "../vendor"]
+remappings = [
+  "forge-std/=lib/forge-std/src/",
+  "@openzeppelin/contracts/=lib/openzeppelin-contracts/contracts/",
+  "@mochi/=src/",
+  "@oz/=lib/openzeppelin-contracts/contracts/",
+  "@oz-upgradeable/=../node_modules/@openzeppelin/contracts-upgradeable/",
+  "lean-imt/=../node_modules/@zk-kit/lean-imt.sol/",
+  "poseidon/=../node_modules/poseidon-solidity/",
+  "poseidon-solidity/=../node_modules/poseidon-solidity/",
+]
+
+[fuzz]
+runs = 512

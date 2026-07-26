@@ -1,0 +1,14 @@
+forge-std/=lib/forge-std/src/
+@openzeppelin/contracts/=lib/openzeppelin-contracts/contracts/
+@mochi/=src/
+@oz/=lib/openzeppelin-contracts/contracts/
+@oz-upgradeable/=../node_modules/@openzeppelin/contracts-upgradeable/
+lean-imt/=../node_modules/@zk-kit/lean-imt.sol/
+poseidon/=../node_modules/poseidon-solidity/
+poseidon-solidity/=../node_modules/poseidon-solidity/
+ppcore/=vendor/privacy-pools-core/packages/contracts/src/
+vendor/privacy-pools-core/packages/contracts/:contracts/=vendor/privacy-pools-core/packages/contracts/src/contracts/
+vendor/privacy-pools-core/packages/contracts/:interfaces/=vendor/privacy-pools-core/packages/contracts/src/interfaces/
+lean-imt/InternalLeanIMT.sol=../node_modules/@zk-kit/lean-imt.sol/InternalLeanIMT.sol
+vendor/privacy-pools-core/packages/contracts/src/:contracts/=vendor/privacy-pools-core/packages/contracts/src/contracts/
+vendor/privacy-pools-core/packages/contracts/src/:interfaces/=vendor/privacy-pools-core/packages/contracts/src/interfaces/
