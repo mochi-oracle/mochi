@@ -1,0 +1,35 @@
+import { ZERO32, hashCanonical, type NormalizedValue, type SchemaDef } from "@mochi/core";
+import { normalizeValue } from "./normalize.ts";
+
+/** Normalizes declared parameters and reports missing required or unknown values. */
+export function normalizeParams(
+  definition: SchemaDef,
+  raw: Record<string, unknown> = {},
+):
+  | { ok: true; params: Record<string, NormalizedValue | null> }
+  | { ok: false; errors: string[] } {
+  const allowedNames = new Set(definition.params.map((parameter) => parameter.name));
+  const errors: string[] = [];
+  for (const name of Object.keys(raw)) {
+    if (!allowedNames.has(name)) errors.push(`unknown parameter: ${name}`);
+  }
+
+  const params: Record<string, NormalizedValue | null> = {};
+  for (const parameter of definition.params) {
+    const normalized = normalizeValue(parameter, raw[parameter.name]);
+    if (!normalized.ok) {
+      errors.push(`${parameter.name}: ${normalized.error}`);
+    } else if (parameter.required && normalized.value === null) {
+      errors.push(`${parameter.name} is required`);
+    } else {
+      params[parameter.name] = normalized.value;
+    }
+  }
+
+  return errors.length > 0 ? { ok: false, errors } : { ok: true, params };
+}
+
+/** Hashes normalized parameters, using ZERO32 when every parameter is null. */
+export function paramsHash(params: Record<string, NormalizedValue | null>) {
+  return Object.values(params).every((value) => value === null) ? ZERO32 : hashCanonical(params);
+}
