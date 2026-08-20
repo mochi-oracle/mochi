@@ -1,0 +1,29 @@
+import { AnswerResSchema, AttestationDocSchema, DecisionResSchema, DispatchReqSchema, DispatchResSchema, RoundOpenReqSchema } from "@mochi/protocol";
+import type { IntakeClient, JurorClient, ConsensusClient } from "./ports.ts";
+
+async function request<T>(url: string, init: RequestInit, timeoutMs: number, parse: (value: unknown) => T): Promise<T> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const response = await fetch(url, { ...init, signal: controller.signal, headers: { "content-type": "application/json", ...init.headers } });
+    const body: unknown = await response.json().catch(() => null);
+    if (!response.ok) throw Object.assign(new Error(`service returned ${response.status}`), { status: response.status, body });
+    return parse(body);
+  } finally { clearTimeout(timer); }
+}
+const json = (body: unknown) => JSON.stringify(body);
+export function createHttpClients(timeoutMs: number): { intake: IntakeClient; juror: JurorClient; consensus: ConsensusClient } {
+  const attestation = (base: string) => request(`${base}/v1/attestation`, { method: "GET" }, timeoutMs, (x) => AttestationDocSchema.parse(x));
+  return {
+    intake: {
+      attestation,
+      dispatch: (base, req) => request(`${base}/v1/dispatch`, { method: "POST", body: json(DispatchReqSchema.parse(req)) }, timeoutMs, (x) => DispatchResSchema.parse(x)),
+    },
+    juror: { attestation, answer: (base, req) => request(`${base}/v1/answer`, { method: "POST", body: json(req) }, timeoutMs, (x) => AnswerResSchema.parse(x)) },
+    consensus: {
+      attestation,
+      open: async (base, req) => { await request(`${base}/v1/rounds`, { method: "POST", body: json(RoundOpenReqSchema.parse(req)) }, timeoutMs, () => undefined); },
+      close: (base, id) => request(`${base}/v1/rounds/${id}/close`, { method: "POST" }, timeoutMs, (x) => DecisionResSchema.parse(x)),
+    },
+  };
+}
