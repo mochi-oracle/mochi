@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<feed xmlns="http://www.w3.org/2005/Atom">
+  <entry><id>https://www.sec.gov/Archives/edgar/data/1234567890/000123456726000001/0001234567-26-000001</id><filing-date>2026-09-25</filing-date><summary>8-K Item 2.02 Results of Operations and Financial Condition</summary></entry>
+  <entry><id>https://www.sec.gov/Archives/edgar/data/1234567890/000123456726000002/0001234567-26-000002</id><filing-date>2026-09-24</filing-date><summary>Item 8.01 Other Events</summary></entry>
+</feed>
