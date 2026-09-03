@@ -1,0 +1,17 @@
+{
+  "name": "@mochi/privacy",
+  "license": "PolyForm-Noncommercial-1.0.0",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts",
+    "./postman": "./src/postman.ts"
+  },
+  "dependencies": {
+    "@zk-kit/lean-imt": "2.2.2",
+    "poseidon-lite": "0.3.0",
+    "snarkjs": "0.7.6",
+    "viem": "*"
+  }
+}
