@@ -1,0 +1,21 @@
+import { createPublicClient, createWalletClient, http, type Address, type Hex } from "viem";
+import { privateKeyToAccount } from "viem/accounts";
+import { runPostman } from "../packages/privacy/src/postman.ts";
+import type { Deployment } from "@mochi/chain";
+import { readFileSync } from "node:fs";
+
+const args = new Map<string,string>();
+for (let i=2;i<process.argv.length;i+=2) args.set(process.argv[i]!,process.argv[i+1]!);
+const rpcUrl = args.get("--rpc") ?? process.env.RPC_URL ?? "http://127.0.0.1:8545";
+const deployment = JSON.parse(readFileSync(args.get("--deployment") ?? "deployments/local.json","utf8")) as Deployment;
+const key = (args.get("--key") ?? process.env.ASP_POSTMAN_KEY) as Hex | undefined;
+if (!key) throw new Error("pass --key or ASP_POSTMAN_KEY (private key is used locally and never printed)");
+if (!deployment.privacy?.entrypoint || !deployment.privacy.pool) throw new Error("deployment has no privacy-pools stack");
+const account = privateKeyToAccount(key);
+const transport = http(rpcUrl);
+const client = createPublicClient({ transport });
+const wallet = createWalletClient({ transport, account });
+const abort = new AbortController();
+process.on("SIGINT", () => abort.abort()); process.on("SIGTERM", () => abort.abort());
+console.log(`ASP postman watching pool ${deployment.privacy.pool}`);
+await runPostman({ client, wallet, entrypoint: deployment.privacy.entrypoint, pool: deployment.privacy.pool, fromBlock: BigInt(deployment.startBlock), approvalDelaySeconds: Number(args.get("--approval-delay-seconds") ?? 0), signal: abort.signal });
