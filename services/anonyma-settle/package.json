@@ -1,0 +1,21 @@
+{
+  "name": "@mochi/svc-anonyma-settle",
+  "license": "PolyForm-Noncommercial-1.0.0",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "bun src/main.ts",
+    "test": "bun test"
+  },
+  "dependencies": {
+    "@mochi/core": "workspace:*",
+    "@mochi/protocol": "workspace:*",
+    "@mochi/schemas": "workspace:*",
+    "@mochi/consensus": "workspace:*",
+    "@mochi/tee": "workspace:*",
+    "@mochi/receipts": "workspace:*",
+    "@mochi/db": "workspace:*",
+    "@mochi/chain": "workspace:*"
+  }
+}
