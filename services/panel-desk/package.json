@@ -1,0 +1,22 @@
+{
+  "name": "@mochi/svc-panel-desk",
+  "license": "PolyForm-Noncommercial-1.0.0",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "bun src/main.ts",
+    "test": "bun test",
+    "evaluator": "bun bin/evaluator.ts"
+  },
+  "dependencies": {
+    "@mochi/core": "workspace:*",
+    "@mochi/protocol": "workspace:*",
+    "@mochi/schemas": "workspace:*",
+    "@mochi/consensus": "workspace:*",
+    "@mochi/tee": "workspace:*",
+    "@mochi/receipts": "workspace:*",
+    "@mochi/db": "workspace:*",
+    "@mochi/chain": "workspace:*"
+  }
+}
