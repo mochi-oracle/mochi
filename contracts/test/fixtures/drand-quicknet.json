@@ -1,0 +1,31 @@
+{
+  "source": "https://api.drand.sh/52db9ba70e0cc0f6eaf7803dd07447a1f5477735fd3f661792ba94600c84e971 (fetched 2026-09-27, each beacon verified with @noble/curves before saving)",
+  "chain": {
+    "hash": "52db9ba70e0cc0f6eaf7803dd07447a1f5477735fd3f661792ba94600c84e971",
+    "publicKey": "83cf0f2896adee7eb8b5f01fcad3912212c437e0073e911fb90022d3e760183c8c4b450b6a0a6c3ac6a5776a2d1064510d1fec758c921cc22b0e17e63aaf4bcb5ed66304de9cf809bd274ca73bab4af5a6e9c76a4bc09e76eae8991ef5ece45a",
+    "genesisTime": 1692803367,
+    "period": 3,
+    "schemeID": "bls-unchained-g1-rfc9380",
+    "dst": "BLS_SIG_BLS12381G1_XMD:SHA-256_SSWU_RO_NUL_"
+  },
+  "beacons": [
+    {
+      "round": 1,
+      "signature": "b55e7cb2d5c613ee0b2e28d6750aabbb78c39dcc96bd9d38c2c2e12198df95571de8e8e402a0cc48871c7089a2b3af4b",
+      "randomness": "1466a6cd24e327188770752f6134001c64d6efcc590ccc26b721611ad96f165a",
+      "publishedAt": 1692803367
+    },
+    {
+      "round": 1000000,
+      "signature": "83ad29e4c409f9470fc2ef02f90214df49e02b441a1a241a82d622d9f608ef98fd8b11a029f1bee9d9e83b45088abe72",
+      "randomness": "b22aad4794f7451896f7a371aa46106fd84d919f3f569acd5b2fddf1d1440af3",
+      "publishedAt": 1695803364
+    },
+    {
+      "round": 32562150,
+      "signature": "aee3f09fc5d95b0a364b08fbef116856312a35a88b538c0ae834cfe3545547926522ee0462dc88355055224564d36e37",
+      "randomness": "1e5d53cb5d23517052ff62b5741f809f1c481bbfbccb1d43becc9bca16efb285",
+      "publishedAt": 1790489814
+    }
+  ]
+}
