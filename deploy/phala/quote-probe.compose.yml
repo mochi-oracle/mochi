@@ -1,0 +1,26 @@
+# Mochi: first real-hardware check on Phala Cloud (Intel TDX via dstack).
+# Returns a raw TDX quote over caller-chosen 64-byte report data, so the Mochi verifier can check a fresh quote
+# against Intel's collateral. Holds no keys or secrets; delete the CVM after the check.
+services:
+  quote-probe:
+    # Official Bun image (publisher: Oven), pinned by digest.
+    image: oven/bun:1.3.14@sha256:e10577f0db68676a7024391c6e5cb4b879ebd17188ab750cf10024a6d700e5c4
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    volumes:
+      - /var/run/dstack.sock:/var/run/dstack.sock
+    command:
+      - bun
+      - -e
+      - |
+        Bun.serve({ port: 8080, hostname: "0.0.0.0", async fetch(req) {
+          const url = new URL(req.url);
+          if (url.pathname === "/health") return new Response("ok");
+          if (url.pathname !== "/quote") return new Response("not found", { status: 404 });
+          const rd = (url.searchParams.get("report_data") ?? "").toLowerCase();
+          if (!/^[0-9a-f]{128}$/.test(rd)) return new Response("report_data must be 64 bytes of hex", { status: 400 });
+          const r = await fetch("http://dstack/GetQuote", { method: "POST", unix: "/var/run/dstack.sock",
+            headers: { "content-type": "application/json" }, body: JSON.stringify({ report_data: rd }) });
+          return new Response(await r.text(), { status: r.status, headers: { "content-type": "application/json" } });
+        } });
