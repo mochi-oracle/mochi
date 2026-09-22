@@ -1,0 +1,76 @@
+name: ci
+on:
+  push:
+  pull_request:
+
+jobs:
+  contracts:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { submodules: recursive }
+      - uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: v1.7.1
+      - uses: oven-sh/setup-bun@v2
+      # Solidity deps of the vendored Privacy Pools code resolve from node_modules (lifecycle scripts never run).
+      - run: bun install --frozen-lockfile --ignore-scripts
+      - name: Build (sizes must stay under EIP-170)
+        working-directory: contracts
+        run: forge build --sizes
+      - name: Test
+        working-directory: contracts
+        run: forge test
+
+  typescript:
+    runs-on: ubuntu-latest
+    services:
+      timescale:
+        image: timescale/timescaledb:latest-pg17
+        env:
+          POSTGRES_USER: mochi
+          POSTGRES_PASSWORD: mochi
+          POSTGRES_DB: mochi
+        ports: ["55432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U mochi" --health-interval 5s --health-timeout 5s --health-retries 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+      - uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: v1.7.1
+      - run: bun install --frozen-lockfile --ignore-scripts
+      # The privacy package deploys the real contracts on anvil; its prover runs under Node (preinstalled on runners).
+      - name: Build contracts (artifacts for deploy tests)
+        working-directory: contracts
+        run: forge build
+      - name: Generated ABIs/bytecode match the contracts
+        run: bun scripts/gen-abis.ts && git diff --exit-code packages/chain/src/abis.ts
+      - name: Typecheck
+        run: bunx tsc --noEmit -p tsconfig.json
+      - name: Test every package and service
+        env:
+          DATABASE_URL: postgres://mochi:mochi@127.0.0.1:55432/mochi
+        run: |
+          set -e
+          for d in packages/* services/*; do
+            echo "::group::$d"
+            (cd "$d" && bun test)
+            echo "::endgroup::"
+          done
+      - name: Privacy guard — no plaintext logging of documents/answers
+        run: |
+          ! grep -rnE 'log\([^)]*(docB64|docText|plain\.text|answerJson|salt)' services/*/src packages/*/src
+
+  website:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+      - run: bun install --frozen-lockfile --ignore-scripts
+      - run: bun install --frozen-lockfile --ignore-scripts
+        working-directory: web/site
+      - run: bun run build
+        working-directory: web/site
+      - run: bun test services/claims/test web/test
