@@ -1,0 +1,37 @@
+name: Public identity guard
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  identity:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+      - name: Set repository-local neutral identity
+        run: |
+          git remote set-url origin https://github.com/mochi-oracle/mochi.git
+          git config --local user.name 'Mochi Project'
+          git config --local user.email source@mochi.invalid
+          git config --local commit.gpgsign false
+          git config --local tag.gpgsign false
+          git config --local --replace-all credential.helper ''
+      - name: Check tracked source and publication remote
+        run: bun scripts/identity-guard.ts --mode all
+      - name: Check every reachable commit, tag, and historical blob
+        run: bun scripts/identity-guard.ts --mode history
+      - name: Check publication candidate locally
+        run: bun scripts/publish-public.ts --check
+      - name: Test identity guard fixtures
+        run: bun test test/identity-guard.test.ts
