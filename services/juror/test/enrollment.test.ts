@@ -1,0 +1,20 @@
+import {test,expect} from 'bun:test';
+import {encodeAbiParameters,keccak256,recoverMessageAddress} from 'viem';
+import {privateKeyToAccount} from 'viem/accounts';
+import {MockTeeProvider} from '@mochi/tee';
+import {enrollmentProof} from '../src/enrollment.ts';
+import {createJurorApp} from '../src/app.ts';
+const root=privateKeyToAccount(`0x${'11'.repeat(32)}`);
+const tee=new MockTeeProvider({seed:`0x${'22'.repeat(32)}`,measurement:`0x${'33'.repeat(32)}`,mockRoot:root});
+const registry=`0x${'44'.repeat(20)}` as const, operator=`0x${'55'.repeat(20)}` as const;
+test('enrollment signature matches the Solidity domain and only the configured operator',async()=>{
+ const p=await enrollmentProof(tee,4663,registry,operator,2);
+ const expected=keccak256(encodeAbiParameters([{type:'string'},{type:'uint256'},{type:'address'},{type:'address'},{type:'address'},{type:'bytes32'},{type:'uint8'}],['mochi.enroll.v1',4663n,registry,operator,tee.signer().address,tee.measurement(),2]));
+ expect(p.digest).toBe(expected);expect(await recoverMessageAddress({message:{raw:p.digest},signature:p.signature})).toBe(tee.signer().address);
+ for(const alternate of [await enrollmentProof(tee,46630,registry,operator,2),await enrollmentProof(tee,4663,operator,registry,2),await enrollmentProof(tee,4663,registry,operator,1)])expect(alternate.digest).not.toBe(p.digest);
+ const {app}=createJurorApp({} as any,()=>enrollmentProof(tee,4663,registry,operator,2));
+ const response=await app.request('/v1/enrollment?operator=0x0000000000000000000000000000000000000001&digest=0x1234');
+ expect(((await response.json()) as {operator:string}).operator).toBe(operator);
+ expect((await app.request('/v1/enrollment',{method:'POST',body:'arbitrary message'})).status).toBe(404);
+ expect((await createJurorApp({} as any).app.request('/v1/enrollment')).status).toBe(503);
+});
