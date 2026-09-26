@@ -1,0 +1,17 @@
+import {test,expect} from 'bun:test';
+import {buildPhalaBatch} from '../../scripts/phala-batch.ts';
+import {parseAbi,decodeFunctionData} from 'viem';
+const a=(n:number)=>`0x${n.toString(16).padStart(40,'0')}` as `0x${string}`;
+const m=`0x${'12'.repeat(32)}` as `0x${string}`;
+const identity=(n:number)=>({address:a(n),operator:a(100),measurement:m});
+const deployment={contracts:{timelock:a(101),jurorRegistry:a(102),queryEscrow:a(103),receiptAnchor:a(104),panel:a(106)},privacy:{entrypoint:a(105)}};
+const input={salt:m,intake:identity(1),consensus:identity(2),jurors:[0,0,1,1,2,2,3,4,4].map((cls,i)=>({...identity(i+3),class:cls})),attestor:a(110),feedRunner:a(111),orchestrator:a(112),indexer:a(113),postman:a(114)};
+test('configuration cannot unpause; activation is a separate delayed operation',()=>{
+ const setup=buildPhalaBatch(deployment,input,'schedule');const live=buildPhalaBatch(deployment,input,'schedule','activate');
+ const signature=live.payloads[0];expect(setup.payloads).not.toContain(signature!);expect(live.callCount).toBe(1);expect(live.delaySeconds).toBe(86400);expect(setup.operationId).not.toBe(live.operationId);
+ expect(decodeFunctionData({abi:parseAbi(['function unpause()']),data:signature!}).functionName).toBe('unpause');
+});
+test('rejects incomplete juries and duplicated enclave keys',()=>{
+ expect(()=>buildPhalaBatch(deployment,{...input,jurors:input.jurors.slice(0,5)},'schedule')).toThrow('nine jurors');
+ expect(()=>buildPhalaBatch(deployment,{...input,consensus:input.intake},'schedule')).toThrow('unique key');
+});
