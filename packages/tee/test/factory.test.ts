@@ -79,6 +79,8 @@ describe("TEE/verifier factories", () => {
       { QUOTE_VERIFIER: "dcap", TDX_ALLOW_DEBUG: "true" },
     ]) expect(() => quoteVerifierFromEnv(env, { rootAddress: root.address })).toThrow();
     expect(() => quoteVerifierFromEnv({})).toThrow(/root address/);
+    await expect(teeProviderFromEnv({ TEE_MEASUREMENT: "dstack-config-v1" }, mock)).rejects.toThrow(/TEE_MODE=dstack/);
+    await expect(teeProviderFromEnv({ TEE_MODE: "dstack", TEE_MEASUREMENT: "unknown" }, mock)).rejects.toThrow(/TEE_MODE=dstack/);
     await expect(teeProviderFromEnv({ TEE_MODE: "sev-snp" }, mock)).rejects.toThrow(/unsupported TEE_MODE/);
     await expect(teeProviderFromEnv({ TEE_MODE: "tdx", TEE_KEYS: "kms" }, mock)).rejects.toThrow(/has no KMS/);
   });

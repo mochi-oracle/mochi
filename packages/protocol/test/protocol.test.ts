@@ -31,3 +31,12 @@ describe("protocol", () => {
     expect(dec(aad.answer(q, "0xAbCdEf0000000000000000000000000000000001"))).toBe(dec(aad.answer(q, "0xabcdef0000000000000000000000000000000001")));
   });
 });
+
+test('quote transport preserves the explicit stable dstack measurement scheme', async () => {
+  const { QuoteSchema, PeerSchema } = await import('../src/index.ts');
+  const quote = {kind:'tdx',measurement:`0x${'11'.repeat(32)}`,reportData:`0x${'22'.repeat(32)}`,raw:'0xaabb',issuedAt:1,measurementScheme:'dstack-config-v1'};
+  expect(QuoteSchema.parse(quote).measurementScheme).toBe('dstack-config-v1');
+  expect(PeerSchema.parse({address:`0x${'33'.repeat(20)}`,encryptionPubKey:`0x${'44'.repeat(32)}`,quote}).quote.measurementScheme).toBe('dstack-config-v1');
+  expect(()=>QuoteSchema.parse({...quote,measurementScheme:'unknown'})).toThrow();
+  expect(()=>QuoteSchema.parse({...quote,kind:'mock'})).toThrow();
+});

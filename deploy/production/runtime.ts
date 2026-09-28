@@ -280,7 +280,7 @@ export async function startProductionRuntime(raw: unknown | undefined, deps: Run
         await upsertEndpoint(db.db, identity.address, i === 0 ? 2 : i === 1 ? 3 : 1, i === 0 ? url("intake") : i === 1 ? url("consensus") : config.endpoints.jurors[i - 2]!);
       }
     } finally { await db.close(); }
-    const dstackBase = { TEE_MODE: "dstack", TEE_KEYS: "kms", QUOTE_VERIFIER: "dcap", DSTACK_SOCKET: env.DSTACK_SOCKET ?? "/var/run/dstack.sock" };
+    const dstackBase = { TEE_MODE: "dstack", TEE_KEYS: "kms", TEE_MEASUREMENT: "dstack-config-v1", QUOTE_VERIFIER: "dcap", DSTACK_SOCKET: env.DSTACK_SOCKET ?? "/var/run/dstack.sock" };
     const childhealth: Record<string, "starting" | "healthy" | "failed"> = {};
     const healthPorts: Record<string, number> = {};
     const exited = new Set<string>();

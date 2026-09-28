@@ -71,3 +71,11 @@ bun scripts/prepare-production-enrollment.ts --deployment <mainnet.json> --ident
 ```
 
 Each possession proof must match the configured key, class, measurement, operator, chain and registry, with a valid juror signature. Output contains one approval for exactly 225,000 MOCHI and nine minimum-bond enrollment calls. Review and execute these from the approved operator wallet after the configure timelock has executed. Repeated execution is not a recovery mechanism; check on-chain enrollment and allowance before signing. Then select enroll mode, verify active attestations, and continue the separate activation phase described above.
+
+## Restart-stable application measurement
+
+Production dstack quotes explicitly use the `dstack-config-v1` measurement scheme. Phala's `mr-kms` boot event can change between restarts even when the application, key provider and persistent keys are unchanged, making a digest of the entire RTMR3 unsuitable for immutable registry enrollment. See [Phala's MR-CONFIG-ID documentation](https://phala.com/tr/posts/mr-config-id-tutorial).
+
+The new scheme hashes a domain separator, MRTD, RTMR0–2 and the hardware-signed MRCONFIGID. It accepts only the documented nonzero V1/V2 configuration commitment layouts with zero padding. V1 binds the application compose hash; V2 additionally binds the application and key provider identity. A reviewed configuration pin and the expected enclave public-key binding remain required at enrollment and by protocol peers. This identifies approved software configuration, not an independently operated VM. The legacy full-register scheme remains the default outside the explicit dstack production configuration.
+
+DCAP signature/collateral verification, TCB status, debug-mode rejection, quote freshness and report-data/key binding continue to apply to the full signed quote. Unknown measurement schemes and malformed configuration identifiers are rejected; there is no fallback that accepts an unverified quote. A code, compose or OS change still changes the configuration measurement and needs a separately reviewed release; restart stability does not imply upgrade compatibility for already-enrolled keys.

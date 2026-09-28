@@ -5,7 +5,7 @@ import { bytesToHex, fromHex, toHex, type Hex, type LocalAccount } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
 import { open, type Envelope } from "./envelope.ts";
 import { keyBinding, type Quote, type TeeProvider } from "./provider.ts";
-import { tdxReportData } from "./tdx-common.ts";
+import { tdxReportData, type MeasurementScheme } from "./tdx-common.ts";
 
 /** Anything that turns 64 bytes of REPORTDATA into a raw TDX quote (e.g. a dstack guest agent). */
 export interface QuoteSource {
@@ -40,6 +40,7 @@ type TdxOptions = {
   now: () => number;
   kmsSignatureChain?: Hex[];
   kmsEncryptionSignatureChain?: Hex[];
+  measurementScheme?: MeasurementScheme;
 };
 
 /** Intel TDX quote provider backed by Linux configfs-tsm. */
@@ -67,7 +68,9 @@ export class TdxTeeProvider implements TeeProvider {
     now?: () => number;
     kmsSignatureChain?: Hex[];
     kmsEncryptionSignatureChain?: Hex[];
+    measurementScheme?: MeasurementScheme;
   }): Promise<TdxTeeProvider> {
+    if (opts.measurementScheme !== undefined && opts.measurementScheme !== "dstack-config-v1") throw new TsmError("unsupported TDX measurement scheme");
     let secp: Uint8Array;
     let encryption: Uint8Array;
     if (opts.keys) {
@@ -95,6 +98,7 @@ export class TdxTeeProvider implements TeeProvider {
       now: opts.now ?? (() => Math.floor(Date.now() / 1000)),
       kmsSignatureChain: opts.kmsSignatureChain,
       kmsEncryptionSignatureChain: opts.kmsEncryptionSignatureChain,
+      measurementScheme: opts.measurementScheme,
     }, secp, encryption);
     const initialQuote = await provider.quote();
     provider.measurementValue = initialQuote.measurement;
@@ -146,6 +150,7 @@ export class TdxTeeProvider implements TeeProvider {
           }
           return {
             kind: "tdx",
+            ...(this.options.measurementScheme ? { measurementScheme: this.options.measurementScheme } : {}),
             measurement: this.measurementValue ?? actualMeasurement,
             reportData: binding,
             raw: bytesToHex(outblob),
@@ -170,7 +175,7 @@ export class TdxTeeProvider implements TeeProvider {
     if (this.measurementValue !== undefined && actualMeasurement.toLowerCase() !== this.measurementValue.toLowerCase()) {
       throw new TsmError("quote measurement changed");
     }
-    return { kind: "tdx", measurement: this.measurementValue ?? actualMeasurement, reportData: binding, raw: bytesToHex(raw), issuedAt,
+    return { kind: "tdx", ...(this.options.measurementScheme ? { measurementScheme: this.options.measurementScheme } : {}), measurement: this.measurementValue ?? actualMeasurement, reportData: binding, raw: bytesToHex(raw), issuedAt,
       ...(this.options.kmsSignatureChain ? { kmsSignatureChain: this.options.kmsSignatureChain } : {}),
       ...(this.options.kmsEncryptionSignatureChain ? { kmsEncryptionSignatureChain: this.options.kmsEncryptionSignatureChain } : {}) };
   }

@@ -1,7 +1,7 @@
 import type { Address, Hex, LocalAccount } from "viem";
 import { parseTdxQuote } from "./dcap/quote.ts";
 import { PcsCollateralSource } from "./dcap/pcs.ts";
-import { tdxMeasurement } from "./tdx-common.ts";
+import { dstackConfigMeasurement, tdxMeasurement, type MeasurementScheme } from "./tdx-common.ts";
 import { TdxTeeProvider, type QuoteSource, type TsmPort } from "./tdx-provider.ts";
 import { DstackKeySource, DstackQuoteSource } from "./dstack.ts";
 import { MockTeeProvider, type TeeProvider } from "./provider.ts";
@@ -15,9 +15,18 @@ const TCB_STATUSES = [
 ] as const;
 
 /** bytes32 on-chain measurement of a raw TDX quote: tdxMeasurement(MRTD, RTMR0..3) of the parsed TD report. */
-export function tdxQuoteMeasurement(rawQuote: Uint8Array): Hex {
+export function tdxQuoteMeasurement(rawQuote: Uint8Array, scheme?: MeasurementScheme): Hex {
   const { td } = parseTdxQuote(rawQuote);
+  if (scheme === "dstack-config-v1") return dstackConfigMeasurement({ mrtd: td.mrTd, mrConfigId: td.mrConfigId, rtmr: td.rtmr });
+  if (scheme !== undefined) throw new Error(`unsupported TDX measurement scheme: ${String(scheme)}`);
   return tdxMeasurement({ mrtd: td.mrTd, rtmr: td.rtmr });
+}
+
+function measurementSchemeFromEnv(env: Env, mode: string): MeasurementScheme | undefined {
+  const selected = env.TEE_MEASUREMENT;
+  if (selected === undefined) return undefined; // retain legacy MRTD + RTMR0..3 measurement
+  if (selected === "dstack-config-v1" && mode === "dstack") return selected;
+  throw new Error("TEE_MEASUREMENT supports dstack-config-v1 only when TEE_MODE=dstack");
 }
 
 /** QUOTE_VERIFIER = "mock" (default) | "dcap". */
@@ -65,6 +74,8 @@ export async function teeProviderFromEnv(
   deps?: { tsm?: TsmPort; quoteSource?: QuoteSource; keySource?: DstackKeySource; role?: "intake" | "juror" | "consensus" },
 ): Promise<TeeProvider> {
   const mode = env.TEE_MODE ?? "mock";
+  const measurementScheme = measurementSchemeFromEnv(env, mode);
+  const measurementOf = (raw: Uint8Array) => tdxQuoteMeasurement(raw, measurementScheme);
   const keysMode = env.TEE_KEYS ?? (mode === "dstack" ? "kms" : "ephemeral");
   if (keysMode !== "kms" && keysMode !== "ephemeral") throw new Error('TEE_KEYS must be "kms" or "ephemeral"');
   if (mode === "mock") return new MockTeeProvider(mock);
@@ -74,7 +85,7 @@ export async function teeProviderFromEnv(
   }
   if (mode === "dstack") {
     const quoteSource = deps?.quoteSource ?? new DstackQuoteSource({ socketPath: env.DSTACK_SOCKET });
-    if (keysMode === "ephemeral") return TdxTeeProvider.create({ measurementOf: tdxQuoteMeasurement, quoteSource });
+    if (keysMode === "ephemeral") return TdxTeeProvider.create({ measurementOf, measurementScheme, quoteSource });
     if (!deps?.role) throw new Error("TEE role is required when TEE_MODE=dstack and TEE_KEYS=kms");
     const label = env.TEE_KEY_LABEL ?? "default";
     if (!/^[a-zA-Z0-9][a-zA-Z0-9._-]{0,63}$/.test(label)) throw new Error("TEE_KEY_LABEL must be 1-64 safe label characters");
@@ -84,7 +95,7 @@ export async function teeProviderFromEnv(
       source.derive(`${prefix}/sign`, "mochi signing key", "mochi/dstack-kms/secp256k1/v1"),
       source.derive(`${prefix}/x25519`, "mochi encryption key", "mochi/dstack-kms/x25519/v1"),
     ]);
-    return TdxTeeProvider.create({ measurementOf: tdxQuoteMeasurement, quoteSource,
+    return TdxTeeProvider.create({ measurementOf, measurementScheme, quoteSource,
       keys: { secp256k1: signing.key, x25519: encryption.key }, kmsSignatureChain: signing.signatureChain,
       kmsEncryptionSignatureChain: encryption.signatureChain });
   }

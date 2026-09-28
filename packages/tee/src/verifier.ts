@@ -1,7 +1,7 @@
 import { decodeAbiParameters, encodeAbiParameters, keccak256, recoverMessageAddress, type Address, type Hex } from "viem";
 import type { Quote } from "./provider.ts";
 import { bytesToHex, hexToBytes } from "viem";
-import { parseTdxReportData, tdxMeasurement } from "./tdx-common.ts";
+import { dstackConfigMeasurement, parseTdxReportData, tdxMeasurement } from "./tdx-common.ts";
 import { verifyTdxQuote, type TdxVerification } from "./dcap/verify.ts";
 import type { CollateralSource } from "./dcap/collateral.ts";
 import { parseTdxQuote } from "./dcap/quote.ts";
@@ -135,7 +135,19 @@ export class DcapQuoteVerifier implements QuoteVerifier {
       return { ok: false as const, reason: "debug TD" };
     }
 
-    const measurement = tdxMeasurement({ mrtd: result.td.mrTd, rtmr: result.td.rtmr });
+    let measurement: Hex;
+    try {
+      const scheme = (quote as Quote & { measurementScheme?: unknown }).measurementScheme;
+      if (scheme === undefined) {
+        measurement = tdxMeasurement({ mrtd: result.td.mrTd, rtmr: result.td.rtmr });
+      } else if (scheme === "dstack-config-v1") {
+        measurement = dstackConfigMeasurement({ mrtd: result.td.mrTd, mrConfigId: result.td.mrConfigId, rtmr: result.td.rtmr });
+      } else {
+        return { ok: false as const, reason: "unknown measurement scheme" };
+      }
+    } catch {
+      return { ok: false as const, reason: "invalid measurement profile" };
+    }
     if (quote.measurement.toLowerCase() !== measurement.toLowerCase()) {
       return { ok: false as const, reason: "measurement field mismatch" };
     }

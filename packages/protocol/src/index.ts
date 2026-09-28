@@ -17,12 +17,13 @@ export const EnvelopeSchema = z.object({ v: z.literal(1), epk: hex32, nonce: hex
 export type EnvelopeJson = z.infer<typeof EnvelopeSchema>;
 
 export const QuoteSchema = z.object({
+  measurementScheme: z.literal("dstack-config-v1").optional(),
   kind: z.enum(["mock", "tdx", "sev-snp", "nvidia-cc"]),
   measurement: hex32,
   reportData: hex32,
   raw: hex,
   issuedAt: z.number().int().nonnegative(),
-});
+}).refine(quote => quote.measurementScheme === undefined || quote.kind === "tdx", "dstack measurement scheme requires TDX");
 
 export const EnclaveRole = z.enum(["INTAKE", "JUROR", "CONSENSUS"]);
 

@@ -16,7 +16,7 @@ export function renderClaimsCompose(revision: string, digest: string, runtimeDig
   service.restart = 'unless-stopped';
   service.volumes = ['claims-data:/data', '/var/run/dstack.sock:/var/run/dstack.sock'];
   service.environment = {
-    TEE_MODE:'dstack', TEE_KEYS:'kms', QUOTE_VERIFIER:'dcap', DSTACK_SOCKET:'/var/run/dstack.sock',
+    TEE_MODE:'dstack', TEE_KEYS:'kms', TEE_MEASUREMENT:'dstack-config-v1', QUOTE_VERIFIER:'dcap', DSTACK_SOCKET:'/var/run/dstack.sock',
     MOCHI_CLAIMS_MODE: 'pilot', MOCHI_CLAIMS_DATABASE: '/data/claims.sqlite', MOCHI_CLAIMS_DAILY_ACTIONS: '40',
     MOCHI_CLAIMS_ACCESS_TOKEN: '${MOCHI_CLAIMS_ACCESS_TOKEN:?protected invitation token required}',
     MOCHI_REVENUE_WORKER_MANIFEST: '${MOCHI_REVENUE_WORKER_MANIFEST:-}',

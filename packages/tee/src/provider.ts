@@ -5,7 +5,7 @@ import { fromHex, encodeAbiParameters, keccak256, toHex, type Hex, type LocalAcc
 import { privateKeyToAccount } from "viem/accounts";
 import { open, type Envelope } from "./envelope.ts";
 
-export interface Quote { kind: "mock" | "tdx" | "sev-snp" | "nvidia-cc"; measurement: Hex; reportData: Hex; raw: Hex; issuedAt: number; kmsSignatureChain?: Hex[]; kmsEncryptionSignatureChain?: Hex[] }
+export interface Quote { measurementScheme?: "dstack-config-v1"; kind: "mock" | "tdx" | "sev-snp" | "nvidia-cc"; measurement: Hex; reportData: Hex; raw: Hex; issuedAt: number; kmsSignatureChain?: Hex[]; kmsEncryptionSignatureChain?: Hex[] }
 export interface TeeProvider {
   readonly kind: Quote["kind"];
   measurement(): Hex;
