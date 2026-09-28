@@ -7,7 +7,7 @@ import { keyBinding, seal, signJurorAnswer, signProvenance, signVerdictAttestati
 import { privateKeyToAccount } from "viem/accounts";
 import { fromHex, keccak256, toHex, type Hex } from "viem";
 import { ROUND_REHEARSAL_FIXTURE } from "./round.ts";
-import { parseRoundVerifyArgs, validatePinnedMeasurement, verifyRoundRehearsalWithTestDependencies, type RoundVerifyTestDependencies } from "./verify.ts";
+import { getLastVerifierDiagnosticForTests, parseRoundVerifyArgs, validatePinnedMeasurement, verifyRoundRehearsalWithTestDependencies, type RoundVerifyTestDependencies } from "./verify.ts";
 import { REAL_ESTIMATED_COST_USD, REAL_MODELS } from "./real-mode.ts";
 
 const accounts = [1, 2, 3, 4, 5].map(i => privateKeyToAccount((`0x${String(i).padStart(64, "0")}`) as Hex));
@@ -91,7 +91,7 @@ function fakeDeps(attestations: unknown, tamper?: "forged" | "ciphertext" | "pub
       provider: "phala-aci", models: REAL_MODELS, estimatedCostUsd: REAL_ESTIMATED_COST_USD,
       costEstimateBasis: "catalog token rates; requested max_tokens and input-byte reservation; actual provider usage may differ",
       receiptVerification: "server-side ACI verification; response metadata is not an independent proof",
-      receipts: [2, 3, 4].map((i, index) => ({ seat: index, modelId: REAL_MODELS[index], receiptId: `receipt-${i}`, sessionId: `session-${i}`, workloadId: `workload-${i}`, verification: "ACI client verified provider signature and exact request/response body hashes in server process" })),
+      receipts: [2, 3, 4].map((i, index) => ({ seat: index, modelId: REAL_MODELS[index], upstreamModelId: `provider-alias-${index}`, receiptId: `receipt-${i}`, sessionId: `session-${i}`, workloadId: `workload-${i}`, verification: "ACI client verified provider signature and exact request/response body hashes in server process" })),
     } });
     return Response.json(result);
   }) as typeof fetch };
@@ -132,5 +132,6 @@ describe("external private round verifier", () => {
     expect(valid).toMatchObject({ ok: true, verifiedIdentities: 5 });
     const { deps } = fakeDeps(attestations, "wrong-answer", true);
     await expect(verifyRoundRehearsalWithTestDependencies("http://127.0.0.1:8080", pin, deps, "real-aci", "x".repeat(40))).rejects.toThrow("Decision answer hash does not match the fixed fixture answer.");
+    expect(getLastVerifierDiagnosticForTests()).toEqual({ stage: "round_result", causeCode: "result_verification" });
   });
 });

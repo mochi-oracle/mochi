@@ -13,6 +13,11 @@ const MAX_RESPONSE = 256 * 1024;
 const MAX_REQUEST = 32 * 1024;
 const FIXTURE_ESCROW = `0x${"00".repeat(20)}` as Address;
 const EXPECTED_FIELDS = { answer: { t: "str", v: "42" } };
+let lastVerifierDiagnostic: { stage: string; causeCode: string; httpStatus?: number } = { stage: "setup", causeCode: "verification_failed" };
+const setVerifierDiagnostic = (stage: string, causeCode: string, httpStatus?: number) => {
+  lastVerifierDiagnostic = { stage, causeCode, ...(httpStatus === undefined ? {} : { httpStatus }) };
+};
+export function getLastVerifierDiagnosticForTests() { return { ...lastVerifierDiagnostic }; }
 const encode = (value: unknown) => new TextEncoder().encode(JSON.stringify(value));
 const fail = (message: string): never => { throw new Error(message); };
 const asRecord = (v: unknown): Record<string, any> => v && typeof v === "object" && !Array.isArray(v) ? v as Record<string, any> : fail("Round response malformed.");
@@ -114,10 +119,13 @@ async function checkAttestations(raw: unknown, pin: Hex, deps: RoundVerifyTestDe
 }
 
 async function verifyRound(baseUrl: string, pin: Hex, deps: RoundVerifyTestDependencies, mode: "synthetic" | "real-aci" = "synthetic", roundAuthSecret?: string): Promise<Record<string, unknown>> {
+  setVerifierDiagnostic("setup", "verification_failed");
   const base = assertBaseUrl(baseUrl);
   // Fetch and fully verify all five real TDX identities before creating or submitting any fixture data.
+  setVerifierDiagnostic("attestation", "attestation_request");
   const attestRes = await boundedEndpointFetch(new URL("/v1/attestations", base), {}, deps.fetch, 40_000);
-  if (!attestRes.ok) fail("Attestation endpoint did not return success.");
+  if (!attestRes.ok) { setVerifierDiagnostic("attestation", "endpoint_http", attestRes.status); fail("Attestation endpoint did not return success."); }
+  setVerifierDiagnostic("attestation", "attestation_verification");
   const attestations = await checkAttestations(await attestRes.json(), pin, deps);
 
   const fixture = ROUND_REHEARSAL_FIXTURE;
@@ -133,8 +141,10 @@ async function verifyRound(baseUrl: string, pin: Hex, deps: RoundVerifyTestDepen
   const envelope = seal(attestations.intake.encryptionPubKey as Hex, encode(upload), aad.intake());
   const body = JSON.stringify({ envelope, payerResultPubKey: payerPubHex });
   if (Buffer.byteLength(body) > MAX_REQUEST) fail("Synthetic round request exceeds the request limit.");
+  setVerifierDiagnostic("round_submit", "round_request");
   const response = await boundedEndpointFetch(new URL("/v1/rehearsal/round", base), { method: "POST", headers: { "content-type": "application/json", ...(mode === "real-aci" && roundAuthSecret ? { authorization: `Bearer ${roundAuthSecret}` } : {}) }, body }, deps.fetch, 120_000);
-  if (!response.ok) fail("Encrypted private round did not return success.");
+  if (!response.ok) { setVerifierDiagnostic("round_submit", "endpoint_http", response.status); fail("Encrypted private round did not return success."); }
+  setVerifierDiagnostic("round_result", "result_verification");
   const result = asRecord(await response.json()), intake = asRecord(result.intake), decision = asRecord(result.decision);
   let reportedReceipts: unknown[] = [];
   if (mode === "real-aci") {
@@ -144,7 +154,7 @@ async function verifyRound(baseUrl: string, pin: Hex, deps: RoundVerifyTestDepen
     reportedReceipts = receipts;
     for (let i = 0; i < 3; i++) {
       const receipt = asRecord(receipts[i]);
-      if (receipt.seat !== i || receipt.modelId !== REAL_MODELS[i] || typeof receipt.receiptId !== "string" || !receipt.receiptId || typeof receipt.sessionId !== "string" || !receipt.sessionId || typeof receipt.workloadId !== "string" || !receipt.workloadId || receipt.verification !== "ACI client verified provider signature and exact request/response body hashes in server process") fail("Provider receipt metadata did not match the allowed model set.");
+      if (receipt.seat !== i || receipt.modelId !== REAL_MODELS[i] || typeof receipt.upstreamModelId !== "string" || !receipt.upstreamModelId || typeof receipt.receiptId !== "string" || !receipt.receiptId || typeof receipt.sessionId !== "string" || !receipt.sessionId || typeof receipt.workloadId !== "string" || !receipt.workloadId || receipt.verification !== "ACI client verified provider signature and exact request/response body hashes in server process") fail("Provider receipt metadata did not match the allowed model set.");
     }
   }
   if (intake.docCommit?.toLowerCase() !== expectedDocCommit.toLowerCase() || intake.paramsHash?.toLowerCase() !== expectedParamsHash.toLowerCase()) fail("Intake fixture commitment mismatch.");
@@ -174,6 +184,7 @@ async function verifyRound(baseUrl: string, pin: Hex, deps: RoundVerifyTestDepen
   if (vi.answerHash?.toLowerCase() !== decisionHash.toLowerCase() || votes.some((v: Record<string, any>) => v.answerHash?.toLowerCase() !== decisionHash.toLowerCase())) fail("Decision answer hash does not match the fixed fixture answer.");
   if (result.fixture?.chainId !== 31337 || result.fixture?.queryId !== fixture.queryId || result.fixture?.schemaId !== fixture.schemaId || result.fixture?.schemaVersion !== fixture.schemaVersion || result.fixture?.verdictsAddress?.toLowerCase() !== fixture.verdictsAddress.toLowerCase() || result.fixture?.sourceProvenance !== "SUBMITTED") fail("Response fixture identity mismatch.");
 
+  setVerifierDiagnostic("result_decrypt", "private_result_verification");
   const plainBytes = open(payerSecret, decision.privateResult, aad.result(id));
   const privateResult = PrivateResultPlainSchema.parse(JSON.parse(new TextDecoder().decode(plainBytes)));
   if (privateResult.verdictId.toLowerCase() !== id.toLowerCase() || privateResult.salt.toLowerCase() !== fixture.salt.toLowerCase()) fail("Private result body mismatch.");
@@ -185,8 +196,10 @@ async function verifyRound(baseUrl: string, pin: Hex, deps: RoundVerifyTestDepen
   if (keccak256(privateResult.payload as Hex).toLowerCase() !== String(vi.payloadHash).toLowerCase()) fail("Private payload hash mismatch.");
   let realModelPassports: unknown;
   if (mode === "real-aci") {
+    setVerifierDiagnostic("post_inference_attestation", "attestation_request");
     const post = await boundedEndpointFetch(new URL("/v1/attestations", base), {}, deps.fetch, 40_000);
-    if (!post.ok) fail("Post-inference attestation endpoint did not return success.");
+    if (!post.ok) { setVerifierDiagnostic("post_inference_attestation", "endpoint_http", post.status); fail("Post-inference attestation endpoint did not return success."); }
+    setVerifierDiagnostic("post_inference_attestation", "passport_verification");
     const postDocs = await checkAttestations(await post.json(), pin, deps);
     realModelPassports = await Promise.all(postDocs.jurors.map(async (doc, index) => {
       if (doc.passport.provider !== "phala-aci" || !doc.passport.modelId.includes(`${REAL_MODELS[index]} [receipt=`) || !doc.passport.modelId.includes(";session=") || !doc.passport.modelId.includes(";workload=")) fail("Post-inference signed model passport is missing expected receipt metadata.");
@@ -227,5 +240,9 @@ if (import.meta.main) {
   try { args = parseRoundVerifyArgs(Bun.argv.slice(2)); }
   catch { process.stderr.write("Usage: bun deploy/phala/round-rehearsal/verify.ts --measurement 0x<64 hex> [--base-url https://HOST]\n"); process.exitCode = 2; }
   if (args) try { process.stdout.write(`${JSON.stringify(await verifyRoundRehearsal(args.baseUrl, args.measurement, args.mode, args.mode === "real-aci" ? process.env.MOCHI_ROUND_AUTH_SECRET : undefined), null, 2)}\n`); }
-  catch { process.stderr.write("Confidential round rehearsal verification failed; response data is suppressed.\n"); process.exitCode = 1; }
+  catch {
+    process.stderr.write("Confidential round rehearsal verification failed; response data is suppressed.\n");
+    process.stderr.write(`${JSON.stringify({ event: "round_verification_diagnostic", ...lastVerifierDiagnostic })}\n`);
+    process.exitCode = 1;
+  }
 }

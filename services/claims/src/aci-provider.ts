@@ -73,7 +73,7 @@ export function createAciJuror(options: AciJurorOptions): Juror {
       let timeoutTriggered = false;
       const timer = setTimeout(() => { timeoutTriggered = true; controller.abort(); }, options.timeoutMs ?? DEFAULT_TIMEOUT_MS);
       try {
-        const request = createClaimChatRequest(options.model, bundle, outputTokens);
+        const request = createClaimChatRequest(options.model, bundle, outputTokens, { aciVerified: true });
         if (controller.signal.aborted) { stage = 'aci_exchange'; errorCode = 'REQUEST_ABORTED'; throw new Error('Provider request unavailable'); }
         stage = 'attestation';
         const result = await client.chat(JSON.parse(request), { signal: controller.signal, maxResponseBytes: CLAIMS_MAX_RESPONSE_BYTES, requireUpToDate: true });

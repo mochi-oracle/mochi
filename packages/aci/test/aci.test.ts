@@ -45,6 +45,27 @@ async function replay(events: Array<{ imr: number; digest: string }>) {
 }
 
 describe("Phala ACI verifier parity", () => {
+  test("requires confidential routing before network access and keeps only bounded HTTP diagnostics", async () => {
+    let currentData = "", requests = 0;
+    const client = new AciClient({ baseUrl: "https://aci.test/v1", apiKey: "test-key", now: () => 1_700_000_000,
+      dcap: (q) => callback(bytes(currentData))(q),
+      fetch: (async (input: string | URL, init?: RequestInit) => {
+        requests++;
+        if (String(input).includes("attestation")) { const nonce = String(input).match(/nonce=([0-9a-f]{64})/)![1]!; const r = report(nonce); currentData = r.attestation.report_data; return Response.json(r); }
+        const body = JSON.parse(new TextDecoder().decode(init?.body as Uint8Array));
+        expect(body.provider).toEqual({ zdr: true, aci_verified: true });
+        return new Response("private provider response", { status: 429, headers: { "retry-after": "999999" } });
+      }) as typeof fetch });
+    await expect(client.chat({ model: "demo", provider: { aci_verified: false } })).rejects.toMatchObject({ code: "request_confidentiality" });
+    await expect(client.chat({ model: "demo", provider: [] })).rejects.toMatchObject({ code: "request_provider" });
+    expect(requests).toBe(0);
+    try { await client.chat({ model: "demo", provider: { zdr: true } }); throw new Error("expected failure"); }
+    catch (error) {
+      expect(error).toMatchObject({ code: "inference_http", httpStatus: 429, retryAfterMs: 120_000 });
+      expect(JSON.stringify(error)).not.toContain("private provider response");
+    }
+    expect(requests).toBe(2); // No inference retry or plaintext fallback.
+  });
   test("pins fixture digest and report-data construction", async () => {
     const f = rawFixture;
     expect(workloadKeysetDigest(f.attestation.workload_keyset)).toBe(f.workload_keyset_digest);
@@ -92,14 +113,14 @@ describe("Phala ACI verifier parity", () => {
   });
   test("receipt provider comes from the gateway's route.selected event", async () => {
     const request = new TextEncoder().encode('{"model":"g"}'); const response = new TextEncoder().encode('{"ok":1}');
-    const receipt = signedReceipt(request, response, { provider: undefined, event_log: [
+    const receipt = signedReceipt(request, response, { model: "google/gemma-4-31b-it", provider: undefined, event_log: [
       { type: "request.received", body_hash: digest(request) },
       { type: "route.selected", target_route_id: "tinfoil:google/gemma-4-31b-it" },
       { type: "upstream.verified", result: "verified", required: true, model_id: "gemma4-31b", session_id: "s-9" },
       { type: "response.returned", wire_hash: digest(response) },
     ] });
     const out = await verifyAciReceipt(receipt, { established: established(), requestBody: request, responseBody: response, requireConfidential: true });
-    expect(out).toMatchObject({ provider: "tinfoil", modelId: "gemma4-31b", sessionId: "s-9" });
+    expect(out).toMatchObject({ provider: "tinfoil", requestedModelId: "google/gemma-4-31b-it", modelId: "gemma4-31b", sessionId: "s-9" });
   });
   test("requires verified upstream session and receipt workload binding", async () => {
     const request = enc.encode("req"); const response = enc.encode("res"); const est = established();
@@ -127,18 +148,21 @@ describe("Phala ACI verifier parity", () => {
   });
   test("AciClient retries until the third receipt poll, requires headers, refreshes stale reports, and fails closed on DCAP", async () => {
     const noncePattern = /nonce=([0-9a-f]{64})/; let now = 1_700_000_000; let attestCount = 0; let receiptCount = 0; let omitHeader = false; let failDcap = false; const redirectModes: Array<RequestInit['redirect']> = [];
-    const responseBytes = enc.encode(JSON.stringify({ choices: [{ message: { content: "{}" } }] })); let requestBytes = new Uint8Array(); let currentReportData = ""; let currentKeyset = KEYSET;
+    const responseBytes = enc.encode(JSON.stringify({ choices: [{ message: { content: "{}" } }] })); let requestBytes = new Uint8Array(); let currentReportData = ""; let currentKeyset = KEYSET; let receiptModel = "demo";
     const fetch = (async (input: string | URL, init?: RequestInit) => {
       redirectModes.push(init?.redirect);
       const url = String(input);
       if (url.includes("attestation")) { attestCount++; const nonce = url.match(noncePattern)![1]!; currentKeyset = attestCount === 1 ? KEYSET : { ...KEYSET, not_after: 2_100_000_000 }; const r = report(nonce, currentKeyset); currentReportData = r.attestation.report_data; return Response.json(r); }
       if (url.endsWith("chat/completions")) { requestBytes = new Uint8Array(init?.body as ArrayBuffer); return new Response(responseBytes, { headers: omitHeader ? {} : { "x-receipt-id": "rcpt-1" } }); }
       receiptCount++; if (receiptCount <= 2) return new Response("pending", { status: 404 });
-      return Response.json(signedReceipt(requestBytes, responseBytes, {}, "r1", currentKeyset));
+      return Response.json(signedReceipt(requestBytes, responseBytes, { model: receiptModel }, "r1", currentKeyset));
     }) as typeof globalThis.fetch;
     const client = new AciClient({ baseUrl: "https://aci.test/v1", apiKey: "test-key", fetch, now: () => now, dcap: (q) => failDcap ? { ok: false, status: "Invalid", reportType: "tdx", reportData: new Uint8Array() } : { ok: q[0] === 0xaa, status: "UpToDate", reportType: "tdx", reportData: callback(bytes(currentReportData))(q).reportData } });
     const result = await client.chat({ model: "demo", messages: [] }); expect(result.receipt.receiptId).toBe("rcpt-1"); expect(receiptCount).toBe(3); expect(attestCount).toBe(1);
     expect(redirectModes.every((mode) => mode === "error")).toBe(true);
+    receiptModel = "wrong-model";
+    await expect(client.chat({ model: "demo", messages: [] })).rejects.toMatchObject({ code: "receipt_model" });
+    receiptModel = "demo";
     omitHeader = true; await expect(client.chat({ model: "demo", messages: [] })).rejects.toMatchObject({ code: "receipt_header" });
     now = 2_000_000_001; await client.attest(); expect(attestCount).toBe(2);
     failDcap = true; now += 3601; await expect(client.chat({ model: "demo", messages: [] })).rejects.toMatchObject({ code: "dcap_failed" });

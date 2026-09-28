@@ -54,6 +54,7 @@ export interface RoundRehearsalOptions {
   runners: readonly [ModelRunner, ModelRunner, ModelRunner];
   passports?: readonly [{ modelId: string; lineage: string; weightsSha256: Hex; openWeights: boolean; provider: string; zdr: boolean }, { modelId: string; lineage: string; weightsSha256: Hex; openWeights: boolean; provider: string; zdr: boolean }, { modelId: string; lineage: string; weightsSha256: Hex; openWeights: boolean; provider: string; zdr: boolean }];
   clock: JurorClock;
+  onDiagnostic?: (event: { stage: string; causeCode: string; seat?: number; httpStatus?: number }) => void;
 }
 
 export interface RoundRehearsalInput { envelope: Envelope; payerResultPubKey: Hex }
@@ -129,33 +130,54 @@ export function createRoundRehearsal(options: RoundRehearsalOptions) {
   }
 
   async function run(input: RoundRehearsalInput): Promise<RoundRehearsalResult> {
+    const diagnostic = (stage: string, causeCode: string, seat?: number, httpStatus?: number) => options.onDiagnostic?.({ stage, causeCode, ...(seat === undefined ? {} : { seat }), ...(httpStatus === undefined ? {} : { httpStatus }) });
     // Validate full fixture before intake storage or any juror runner invocation.
     let plain;
     try { plain = IntakeUploadPlainSchema.parse(JSON.parse(new TextDecoder().decode(options.tees.intake.decryptEnvelope(input.envelope, aad.intake())))); }
-    catch { throw new TypeError("invalid intake envelope or fixture"); }
-    if (plain.v !== 1 || plain.schemaId !== SchemaId.FREEFORM_FACT || plain.salt !== SALT || JSON.stringify(plain.params) !== JSON.stringify(PARAMS) || plain.contentType !== "text/plain" || plain.docB64 !== Buffer.from(FIXTURE_BYTES).toString("base64")) throw new TypeError("input does not match the fixed synthetic fixture");
-    if (!/^0x[0-9a-f]{64}$/.test(input.payerResultPubKey)) throw new TypeError("invalid payer result public key");
+    catch { diagnostic("request", "fixture_rejected"); throw new TypeError("invalid intake envelope or fixture"); }
+    if (plain.v !== 1 || plain.schemaId !== SchemaId.FREEFORM_FACT || plain.salt !== SALT || JSON.stringify(plain.params) !== JSON.stringify(PARAMS) || plain.contentType !== "text/plain" || plain.docB64 !== Buffer.from(FIXTURE_BYTES).toString("base64")) { diagnostic("request", "fixture_rejected"); throw new TypeError("input does not match the fixed synthetic fixture"); }
+    if (!/^0x[0-9a-f]{64}$/.test(input.payerResultPubKey)) { diagnostic("request", "fixture_rejected"); throw new TypeError("invalid payer result public key"); }
     const expectedCommit = docCommit(SALT, docHash(FIXTURE_BYTES));
     const expectedPayerCommit = payerCommitment(input.payerResultPubKey);
-    if (committedDoc && (committedDoc !== expectedCommit || committedPayer !== expectedPayerCommit)) throw new TypeError("query fixture is already bound to another document or payer key");
+    if (committedDoc && (committedDoc !== expectedCommit || committedPayer !== expectedPayerCommit)) { diagnostic("request", "fixture_already_bound"); throw new TypeError("query fixture is already bound to another document or payer key"); }
     committedDoc = expectedCommit;
     committedPayer = expectedPayerCommit;
-    const provenance = await intake.intakeUpload(input.envelope);
-    if (provenance.docCommit !== expectedCommit || provenance.paramsHash !== PARAMS_HASH || provenance.provenance.kind !== 0) throw new Error("intake fixture binding failed");
-    const peerDocs = await attestations();
-    const jurorPeers = await Promise.all(jurors.map(async (j, seat) => {
-      const att = await j.attestation();
-      return { seat, address: jurorAddresses[seat]!, encryptionPubKey: att.encryptionPubKey, quote: att.quote };
-    }));
+    let provenance;
+    try { provenance = await intake.intakeUpload(input.envelope); }
+    catch { diagnostic("intake", "intake_failed"); throw new Error("intake failed"); }
+    if (provenance.docCommit !== expectedCommit || provenance.paramsHash !== PARAMS_HASH || provenance.provenance.kind !== 0) { diagnostic("intake", "intake_binding_failed"); throw new Error("intake fixture binding failed"); }
+    let peerDocs;
+    let jurorPeers;
+    try {
+      peerDocs = await attestations();
+      jurorPeers = await Promise.all(jurors.map(async (j, seat) => {
+        const att = await j.attestation();
+        return { seat, address: jurorAddresses[seat]!, encryptionPubKey: att.encryptionPubKey, quote: att.quote };
+      }));
+    } catch { diagnostic("attestation", "peer_attestation_failed"); throw new Error("peer attestation failed"); }
     const consensusPeer: Peer = { address: consensusAddress, encryptionPubKey: peerDocs.consensus.encryptionPubKey, quote: peerDocs.consensus.quote };
-    const dispatched = await intake.dispatch({ queryId: QUERY_ID, jurors: jurorPeers, consensus: consensusPeer } as DispatchReq);
-    await consensus.openRound({ queryId: QUERY_ID, round: 0, consensusSeed: dispatched.consensusSeed as never, payerResultPubKey: input.payerResultPubKey });
+    let dispatched;
+    try { dispatched = await intake.dispatch({ queryId: QUERY_ID, jurors: jurorPeers, consensus: consensusPeer } as DispatchReq); }
+    catch { diagnostic("dispatch", "dispatch_failed"); throw new Error("dispatch failed"); }
+    try { await consensus.openRound({ queryId: QUERY_ID, round: 0, consensusSeed: dispatched.consensusSeed as never, payerResultPubKey: input.payerResultPubKey }); }
+    catch { diagnostic("consensus_open", "consensus_open_failed"); throw new Error("consensus open failed"); }
     await Promise.all(dispatched.jurors.map(async ({ seat, docEnvelope }) => {
-      const result = await jurors[seat]!.answer({ queryId: QUERY_ID, seat, docEnvelope, consensus: consensusPeer, consensusUrl } as never);
-      if (!result.delivered) throw new Error("juror answer was not delivered to in-process consensus");
+      try {
+        const result = await jurors[seat]!.answer({ queryId: QUERY_ID, seat, docEnvelope, consensus: consensusPeer, consensusUrl } as never);
+        if (!result.delivered) { diagnostic("juror_delivery", "answer_not_delivered", seat); throw new Error("juror answer was not delivered to in-process consensus"); }
+      } catch (error) {
+        if (!(error instanceof Error && error.message === "juror answer was not delivered to in-process consensus")) {
+          const runner = options.runners[seat] as ModelRunner & { lastFailure?: { causeCode: string; httpStatus?: number } };
+          const failure = runner.lastFailure;
+          diagnostic(failure ? "model_inference" : "juror", failure?.causeCode ?? "juror_rejected", seat, failure?.httpStatus);
+        }
+        throw error;
+      }
     }));
-    const decision = await consensus.closeRound(QUERY_ID);
-    if (decision.public || !decision.privateResult) throw new Error("private rehearsal result projection failed");
+    let decision;
+    try { decision = await consensus.closeRound(QUERY_ID); }
+    catch { diagnostic("consensus_close", "consensus_close_failed"); throw new Error("consensus close failed"); }
+    if (decision.public || !decision.privateResult) { diagnostic("consensus_close", "private_result_missing"); throw new Error("private rehearsal result projection failed"); }
     return {
       fixture: { schemaId: SchemaId.FREEFORM_FACT, schemaVersion: 1, queryId: QUERY_ID, chainId: CHAIN_ID, verdictsAddress: VERDICTS, sourceProvenance: "SUBMITTED" },
       intake: { docCommit: provenance.docCommit as Hex, paramsHash: provenance.paramsHash as Hex, provenance: { kind: 0, originId: provenance.provenance.originId as Hex, fetchedAt: provenance.provenance.fetchedAt, tokensK: provenance.tokensK, transcriptHash: provenance.provenance.transcriptHash as Hex }, intakeSig: provenance.intakeSig as Hex, identity: provenance.intake as Address },

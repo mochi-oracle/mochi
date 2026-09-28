@@ -172,16 +172,24 @@ test("Phala ACI runner enforces configured output and exact request-size bounds"
 });
 
 test("Phala ACI runner keeps long provider receipt identifiers boundable in passports", async () => {
-  const rawReceipt = { receiptId: "r".repeat(64), sessionId: "s".repeat(64), workloadId: "w".repeat(64), modelId: "google/gemma-4-31b-it" };
+  const rawReceipt = { receiptId: "r".repeat(64), sessionId: "s".repeat(64), workloadId: "w".repeat(64), modelId: "gemma4-31b-it", requestedModelId: "google/gemma-4-31b-it" };
   const runner = new PhalaAciRunner({ client: { chat: async () => ({
     json: { choices: [{ message: { content: "{}" } }] }, receipt: rawReceipt,
     established: { workloadId: rawReceipt.workloadId, tcbStatus: "UpToDate" },
-  }) } as never, model: rawReceipt.modelId, timeoutMs: 1000, compactReceiptMetadata: true });
+  }) } as never, model: rawReceipt.requestedModelId, timeoutMs: 1000, compactReceiptMetadata: true });
   await runner.run({ system: "s", user: "u", document: "d", jsonSchema: {}, maxTokens: 4 });
-  expect(runner.lastProviderReceipt).toEqual(rawReceipt);
+  expect(runner.lastProviderReceipt).toEqual({ receiptId: rawReceipt.receiptId, sessionId: rawReceipt.sessionId, workloadId: rawReceipt.workloadId, modelId: rawReceipt.requestedModelId, upstreamModelId: rawReceipt.modelId });
   expect(runner.lastReceipt?.receiptId).toMatch(/^sha256:[0-9a-f]{32}$/u);
   const passportModelId = `${runner.lastReceipt!.modelId} [receipt=${runner.lastReceipt!.receiptId};session=${runner.lastReceipt!.sessionId};workload=${runner.lastReceipt!.workloadId}]`;
   expect(passportModelId.length).toBeLessThanOrEqual(200);
+});
+
+test("Phala ACI runner exposes only allowlisted provider HTTP diagnostics", async () => {
+  const failure = Object.assign(new Error("provider body and private prompt must stay hidden"), { code: "inference_http", httpStatus: 429, retryAfterMs: 5000 });
+  const runner = new PhalaAciRunner({ client: { chat: async () => { throw failure; } } as never, model: "m", timeoutMs: 1000 });
+  await expect(runner.run({ system: "secret", user: "secret", document: "secret", jsonSchema: {}, maxTokens: 8 })).rejects.toBeInstanceOf(RunnerError);
+  expect(runner.lastFailure).toEqual({ causeCode: "inference_http", httpStatus: 429 });
+  expect(JSON.stringify(runner.lastFailure)).not.toContain("private prompt");
 });
 
 describe("OpenAI compatible runner", () => {

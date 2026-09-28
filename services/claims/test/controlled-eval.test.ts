@@ -115,9 +115,9 @@ describe('controlled claims evaluation', () => {
     })).toBe(0);
     const report = JSON.parse(output);
     expect(report.providerUsage).toMatchObject({ attemptedCalls: 3, completedTelemetry: 1, missingTelemetry: 2, missingUsageCalls: 3 });
-    expect(report.providerUsage.byModel['deepseek/deepseek-v4-flash-0731']).toMatchObject({ attemptedCalls: 1, completedTelemetry: 1, missingTelemetry: 0, missingUsageCalls: 1 });
-    expect(report.providerUsage.byModel['qwen/qwen3.8-27b']).toMatchObject({ attemptedCalls: 1, completedTelemetry: 0, missingTelemetry: 1, missingUsageCalls: 1 });
-    expect(report.cases[0].providerFailures).toEqual([{ model: 'deepseek/deepseek-v4-flash-0731', stage: 'aci_exchange', errorCode: 'REQUEST_ABORTED' }]);
+    expect(report.providerUsage.byModel['meta-llama/llama-3.3-70b-instruct']).toMatchObject({ attemptedCalls: 1, completedTelemetry: 1, missingTelemetry: 0, missingUsageCalls: 1 });
+    expect(report.providerUsage.byModel['nvidia/nemotron-3.5-lightning']).toMatchObject({ attemptedCalls: 1, completedTelemetry: 0, missingTelemetry: 1, missingUsageCalls: 1 });
+    expect(report.cases[0].providerFailures).toEqual([{ model: 'meta-llama/llama-3.3-70b-instruct', stage: 'aci_exchange', errorCode: 'REQUEST_ABORTED' }]);
     expect(output).not.toContain('mock-only');
   });
 });

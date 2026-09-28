@@ -31,10 +31,13 @@ test('attestation attempts are bounded and failures reveal no details',async()=>
 });
 test('real ACI mode reports fixture chain honestly and authorizes the single paid round',async()=>{
  let calls=0;
- const handler=createRoundHandler({attestations:async()=>({}),run:async()=>{calls++;return {ok:true}}},{mode:'real-aci',roundAuthSecret:'x'.repeat(40)});
+ const diagnostics: unknown[]=[];
+ const handler=createRoundHandler({attestations:async()=>({}),run:async()=>{calls++;return {ok:true}}},{mode:'real-aci',roundAuthSecret:'x'.repeat(40),onDiagnostic:event=>diagnostics.push(event)});
  expect(await (await handler(new Request('http://localhost/health'))).json()).toMatchObject({chain:'fixture',models:'real-phala-aci',fixtureOnly:true,payments:false});
  expect((await handler(request())).status).toBe(401);
  expect((await handler(new Request('http://localhost/v1/rehearsal/round',{method:'POST',headers:{authorization:`Bearer ${'y'.repeat(40)}`},body:JSON.stringify(input)}))).status).toBe(401);
+ expect(diagnostics).toHaveLength(2);
+ expect(diagnostics.every(event=>JSON.stringify(event)==='{"stage":"authorization","causeCode":"auth_rejected"}')).toBe(true);
  const authorized=()=>new Request('http://localhost/v1/rehearsal/round',{method:'POST',headers:{authorization:`Bearer ${'x'.repeat(40)}`},body:JSON.stringify(input)});
  expect((await handler(authorized())).status).toBe(200);
  expect((await handler(authorized())).status).toBe(429);

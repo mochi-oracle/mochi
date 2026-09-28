@@ -79,6 +79,19 @@ describe("Phala synthetic private round composition", () => {
     await expect(createRoundRehearsal(good).run({ envelope: uploadEnvelope(other.encryptionPublicKey()), payerResultPubKey: toHex(payer.publicKey) as Hex })).rejects.toThrow("invalid intake envelope");
   });
 
+  test("reports only safe stage, provider cause code and HTTP status on juror failure", async () => {
+    const diagnostics: unknown[] = [];
+    const options = makeOptions({ onDiagnostic: (event) => diagnostics.push(event) });
+    const privateFailure = new Error("private prompt and provider response body");
+    const failedRunner = { lastFailure: { causeCode: "inference_http", httpStatus: 429 }, async run() { throw privateFailure; } };
+    const runners = [failedRunner, options.runners[1], options.runners[2]] as unknown as RoundRehearsalOptions["runners"];
+    const flow = createRoundRehearsal({ ...options, runners });
+    await expect(flow.run({ envelope: uploadEnvelope(options.tees.intake.encryptionPublicKey()), payerResultPubKey: toHex(payer.publicKey) as Hex })).rejects.toBeDefined();
+    expect(diagnostics).toContainEqual({ stage: "model_inference", causeCode: "inference_http", seat: 0, httpStatus: 429 });
+    expect(JSON.stringify(diagnostics)).not.toContain("private prompt");
+    expect(JSON.stringify(diagnostics)).not.toContain("provider response body");
+  });
+
   test("private result is bound to payer key; a wrong key cannot decrypt it", async () => {
     const options = makeOptions();
     const flow = createRoundRehearsal(options);

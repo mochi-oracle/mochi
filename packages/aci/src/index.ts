@@ -9,7 +9,19 @@ import { bytesToHex, hexToBytes } from "@noble/hashes/utils.js";
 export type AciReport = Record<string, any>;
 export type EstablishedAciReport = { workloadId: string; keysetDigest: string; receiptKeys: any[]; staleAfter: number; tcbStatus: string };
 export class AciVerificationError extends Error {
-  constructor(readonly code: string) { super(`ACI verification failed: ${code}`); this.name = "AciVerificationError"; }
+  readonly httpStatus?: number;
+  readonly retryAfterMs?: number;
+  constructor(readonly code: string, http?: { status: number; retryAfterMs?: number }) {
+    super(`ACI verification failed: ${code}`); this.name = "AciVerificationError";
+    if (http && Number.isInteger(http.status) && http.status >= 100 && http.status <= 599) this.httpStatus = http.status;
+    if (http?.retryAfterMs !== undefined && Number.isFinite(http.retryAfterMs) && http.retryAfterMs >= 0) this.retryAfterMs = Math.min(http.retryAfterMs, 120_000);
+  }
+}
+function httpFailure(code: string, response: Response): AciVerificationError {
+  const value = response.headers.get("retry-after");
+  const seconds = value !== null && /^\d+(?:\.\d+)?$/.test(value) ? Number(value) : undefined;
+  // Retain only bounded numbers; provider bodies and headers can contain private data.
+  return new AciVerificationError(code, { status: response.status, ...(seconds !== undefined ? { retryAfterMs: seconds * 1000 } : {}) });
 }
 const encoder = new TextEncoder();
 const hash = (bytes: Uint8Array) => sha256(bytes);
@@ -159,7 +171,7 @@ function hash384(bytes: Uint8Array): Uint8Array {
   // Noble's synchronous SHA-384 keeps event-log replay deterministic in Bun and browsers.
   return sha384(bytes);
 }
-export async function verifyAciReceipt(receipt: any, options: { established: EstablishedAciReport; requestBody: Uint8Array; responseBody: Uint8Array; requireConfidential: true }): Promise<{ receiptId: string; modelId: string; provider: string; sessionId: string }> {
+export async function verifyAciReceipt(receipt: any, options: { established: EstablishedAciReport; requestBody: Uint8Array; responseBody: Uint8Array; requireConfidential: true }): Promise<{ receiptId: string; modelId: string; requestedModelId: string; provider: string; sessionId: string }> {
   if (!receipt || receipt.api_version !== "aci/1" || receipt.workload_keyset_digest !== options.established.keysetDigest) throw new AciVerificationError("receipt_binding");
   if (receipt.workload_id !== undefined && receipt.workload_id !== options.established.workloadId) throw new AciVerificationError("receipt_binding");
   const key = options.established.receiptKeys.find((k) => k.key_id === receipt.key_id);
@@ -176,7 +188,7 @@ export async function verifyAciReceipt(receipt: any, options: { established: Est
   // The gateway records its routing decision as `route.selected` with target_route_id "<provider>:<model>".
   const route = events.find((e: any) => e.type === "route.selected")?.target_route_id;
   const routedProvider = typeof route === "string" && route.includes(":") ? route.slice(0, route.indexOf(":")) : undefined;
-  return { receiptId: String(receipt.receipt_id ?? ""), modelId: String(upstream?.model_id ?? receipt.model ?? ""), provider: String(upstream?.provider ?? routedProvider ?? receipt.provider ?? "phala-aci"), sessionId: String(upstream?.session_id ?? "") };
+  return { receiptId: String(receipt.receipt_id ?? ""), modelId: String(upstream?.model_id ?? receipt.model ?? ""), requestedModelId: typeof receipt.model === "string" ? receipt.model : "", provider: String(upstream?.provider ?? routedProvider ?? receipt.provider ?? "phala-aci"), sessionId: String(upstream?.session_id ?? "") };
 }
 
 export class AciClient {
@@ -194,7 +206,7 @@ export class AciClient {
     // owns its abort signal and can only establish the report it requested.
     const nonce = hex(crypto.getRandomValues(new Uint8Array(32)));
     const response = await this.fetcher(`${this.options.baseUrl.replace(/\/$/, "")}/aci/attestation?nonce=${nonce}`, { headers: { authorization: `Bearer ${this.options.apiKey}` }, signal, redirect: "error" });
-    if (!response.ok || response.redirected) throw new AciVerificationError(response.redirected ? "attestation_redirect" : "attestation_http");
+    if (!response.ok || response.redirected) throw httpFailure(response.redirected ? "attestation_redirect" : "attestation_http", response);
     const report = JSON.parse(new TextDecoder().decode(await readBounded(response, MAX_ATTESTATION_BYTES, signal))) as AciReport;
     aborted(signal);
     const verified = await verifyAciReport(report, { nonce, dcap: this.options.dcap, now: this.now(), allowedWorkloads: this.options.allowedWorkloads });
@@ -207,12 +219,21 @@ export class AciClient {
     const signal = options.signal;
     const maxResponseBytes = options.maxResponseBytes ?? DEFAULT_MAX_RESPONSE_BYTES;
     if (!Number.isSafeInteger(maxResponseBytes) || maxResponseBytes < 1) throw new TypeError("maxResponseBytes must be a positive safe integer");
+    if (!body || typeof body !== "object" || Array.isArray(body)) throw new AciVerificationError("request_shape");
+    const request = body as Record<string, unknown>;
+    if (typeof request.model !== "string" || !request.model) throw new AciVerificationError("request_model");
+    const provider = request.provider;
+    if (provider !== undefined && (!provider || typeof provider !== "object" || Array.isArray(provider))) throw new AciVerificationError("request_provider");
+    const routing = (provider ?? {}) as Record<string, unknown>;
+    if (routing.aci_verified !== undefined && routing.aci_verified !== true) throw new AciVerificationError("request_confidentiality");
+    // Receipt verification happens after inference. Require attested routing
+    // before forwarding so an unavailable confidential route cannot leak input.
+    const bytes = encoder.encode(JSON.stringify({ ...request, provider: { ...routing, aci_verified: true } }));
     aborted(signal);
     const established = await this.attest(signal);
     if (options.requireUpToDate && established.tcbStatus !== "UpToDate") throw new AciVerificationError("tcb_status");
-    const bytes = encoder.encode(JSON.stringify(body));
     const response = await this.fetcher(`${this.options.baseUrl.replace(/\/$/, "")}/chat/completions`, { method: "POST", headers: { "content-type": "application/json", authorization: `Bearer ${this.options.apiKey}` }, body: bytes, signal, redirect: "error" });
-    if (!response.ok || response.redirected) throw new AciVerificationError(response.redirected ? "inference_redirect" : "inference_http");
+    if (!response.ok || response.redirected) throw httpFailure(response.redirected ? "inference_redirect" : "inference_http", response);
     const responseBytes = await readBounded(response, maxResponseBytes, signal);
     const receiptId = response.headers.get("x-receipt-id");
     if (!receiptId) throw new AciVerificationError("receipt_header");
@@ -227,6 +248,7 @@ export class AciClient {
       if (attempt < 3) await abortableDelay(100 * (attempt + 1), signal);
     }
     if (!receipt) throw new AciVerificationError("receipt_unavailable");
+    if (receipt.requestedModelId !== request.model) throw new AciVerificationError("receipt_model");
     aborted(signal);
     try { return { json: JSON.parse(new TextDecoder().decode(responseBytes)), receipt, established }; } catch { throw new AciVerificationError("response_json"); }
   }

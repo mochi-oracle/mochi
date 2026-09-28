@@ -7,8 +7,8 @@ import { controlledEvaluationFixtures, type ControlledFixture } from './controll
 import { evaluateClaims, type ClaimEvaluationReport } from './index.ts';
 
 export const CONTROLLED_MODELS = [
-  'deepseek/deepseek-v4-flash-0731',
-  'qwen/qwen3.8-27b',
+  'meta-llama/llama-3.3-70b-instruct',
+  'nvidia/nemotron-3.5-lightning',
   'google/gemma-4-31b-it',
 ] as const;
 export const CONTROLLED_BASE_URL = 'https://inference.phala.com/v1';
@@ -19,13 +19,13 @@ const MAX_REQUEST_BYTES = 32_768;
 const MAX_RESERVED_OUTPUT_TOKENS = CONTROLLED_MAX_OUTPUT_TOKENS;
 const SPEND_CAP_NANODOLLARS = CONTROLLED_SPEND_CAP_USD * 1_000_000_000;
 const PRICE: Record<(typeof CONTROLLED_MODELS)[number], { input: number; output: number }> = {
-  'deepseek/deepseek-v4-flash-0731': { input: 0.00000044, output: 0.00000132 },
-  'qwen/qwen3.8-27b': { input: 0.00000024, output: 0.0000025 },
+  'meta-llama/llama-3.3-70b-instruct': { input: 0.000002, output: 0.000002 },
+  'nvidia/nemotron-3.5-lightning': { input: 0.00000007, output: 0.00000020 },
   'google/gemma-4-31b-it': { input: 0.00000015, output: 0.00000046 },
 };
 const PRICE_NANODOLLARS: Record<(typeof CONTROLLED_MODELS)[number], { input: number; output: number }> = {
-  'deepseek/deepseek-v4-flash-0731': { input: 440, output: 1_320 },
-  'qwen/qwen3.8-27b': { input: 240, output: 2_500 },
+  'meta-llama/llama-3.3-70b-instruct': { input: 2_000, output: 2_000 },
+  'nvidia/nemotron-3.5-lightning': { input: 70, output: 200 },
   'google/gemma-4-31b-it': { input: 150, output: 460 },
 };
 
@@ -75,7 +75,7 @@ export function createBoundedControlledJurors(
     return {
       id, model,
       async assess(bundle, signal) {
-        const request = createClaimChatRequest(model, bundle, CONTROLLED_MAX_OUTPUT_TOKENS);
+        const request = createClaimChatRequest(model, bundle, CONTROLLED_MAX_OUTPUT_TOKENS, { aciVerified: true });
         if (new TextEncoder().encode(request).length > MAX_REQUEST_BYTES) throw new Error('Controlled provider request exceeds the live byte bound.');
         // Reservation is synchronous before assess() can make its single provider request.
         if (calls >= CONTROLLED_MAX_CALLS || reservedNanoDollars + reserveNanoDollars > SPEND_CAP_NANODOLLARS) throw new Error('Controlled live call or spend bound reached.');
@@ -128,7 +128,7 @@ export async function runControlled(args: string[], env: Record<string, string |
     : controlledEvaluationFixtures.slice(0, options.maxCases);
   if (options.live && !env.PHALA_AI_API_KEY) { write('Live mode requires PHALA_AI_API_KEY.\n'); return 2; }
   if (options.live && fixtures.some((item) => CONTROLLED_MODELS.some((model) => {
-    try { return new TextEncoder().encode(createClaimChatRequest(model, item.bundle, CONTROLLED_MAX_OUTPUT_TOKENS)).length > MAX_REQUEST_BYTES; }
+    try { return new TextEncoder().encode(createClaimChatRequest(model, item.bundle, CONTROLLED_MAX_OUTPUT_TOKENS, { aciVerified: true })).length > MAX_REQUEST_BYTES; }
     catch { return true; }
   }))) {
     write('A selected controlled provider request exceeds the live byte bound.\n'); return 2;

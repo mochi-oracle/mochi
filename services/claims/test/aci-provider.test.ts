@@ -23,6 +23,7 @@ describe('createAciJuror', () => {
     expect(await juror.assess(bundle)).toEqual({ assessment: 'supported' });
     const request = sent as { model: string; messages: Array<{ content: string }> };
     expect(request.model).toBe('confidential-model');
+    expect(sent).toMatchObject({ provider: { aci_verified: true } });
     expect(request.messages[1]?.content).toContain('Quoted evidence.');
     expect(maxResponseBytes).toBe(32_000);
     expect(requireUpToDate).toBe(true);

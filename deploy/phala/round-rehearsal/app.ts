@@ -12,7 +12,7 @@ const MAX_BODY = 24 * 1024;
 export function createRoundHandler(service: {
   attestations(): Promise<unknown>;
   run(input: z.infer<typeof RequestSchema>): Promise<unknown>;
-}, options: { mode?: 'synthetic' | 'real-aci'; roundAuthSecret?: string } = {}) {
+}, options: { mode?: 'synthetic' | 'real-aci'; roundAuthSecret?: string; onDiagnostic?: (event: { stage: string; causeCode: string }) => void } = {}) {
   const mode = options.mode ?? 'synthetic';
   let active = false;
   let attempts = 0;
@@ -39,7 +39,7 @@ export function createRoundHandler(service: {
       const actual = supplied.startsWith('Bearer ') ? supplied.slice(7) : '';
       const suppliedHash = createHash('sha256').update(actual).digest();
       const expectedHash = createHash('sha256').update(expected ?? '').digest();
-      if (!expected || !actual || !timingSafeEqual(suppliedHash, expectedHash)) return json({ error: 'UNAUTHORIZED' }, 401);
+      if (!expected || !actual || !timingSafeEqual(suppliedHash, expectedHash)) { options.onDiagnostic?.({ stage: 'authorization', causeCode: 'auth_rejected' }); return json({ error: 'UNAUTHORIZED' }, 401); }
     }
     if (active) return json({ error: 'ROUND_BUSY' }, 429);
     if (attempts >= attemptLimit) return json({ error: 'ROUND_LIMIT' }, 429);
@@ -48,6 +48,7 @@ export function createRoundHandler(service: {
     attempts++;
     const reader = request.body?.getReader();
     let timer: ReturnType<typeof setTimeout> | undefined;
+    let parsed = false;
     try {
       const size = Number(request.headers.get('content-length') ?? '0');
       if (!Number.isFinite(size) || size > MAX_BODY) return json({ error: 'BODY_TOO_LARGE' }, 413);
@@ -68,9 +69,11 @@ export function createRoundHandler(service: {
       let offset = 0;
       for (const chunk of chunks) { bytes.set(chunk, offset); offset += chunk.byteLength; }
       const input = RequestSchema.parse(JSON.parse(new TextDecoder().decode(bytes)));
+      parsed = true;
       return json(await service.run(input));
     } catch {
       // Never expose submitted plaintext, key material, provider data or exception messages.
+      if (!parsed) options.onDiagnostic?.({ stage: 'request', causeCode: 'request_rejected' });
       return json({ error: 'ROUND_REJECTED' }, 400);
     } finally {
       clearTimeout(timer);
