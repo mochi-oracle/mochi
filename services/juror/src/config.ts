@@ -19,7 +19,7 @@ const ConfigSchema = z.object({
   PHALA_AI_API_KEY: z.string().optional(),
   PHALA_ACI_MODEL: z.string().min(1).optional(),
   PHALA_ACI_ALLOWED_WORKLOADS: z.string().optional(),
-  RUNNER: z.enum(["openai", "stub"]).default("stub"),
+  RUNNER: z.enum(["openai", "stub", "phala-aci"]).default("stub"),
   MODEL_TIMEOUT_MS: z.coerce.number().int().positive().default(120_000),
   TEE_MODE: z.enum(["mock", "tdx", "dstack"]).default("mock"),
   TEE_KEYS: z.enum(["kms", "ephemeral"]).optional(),
@@ -40,6 +40,8 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
     throw new Error("MODEL_WEIGHTS_SHA256 or MODEL_WEIGHTS_DIR is required when RUNNER=openai");
   }
   if (config.MODEL_WEIGHTS_SHA256 && config.MODEL_WEIGHTS_DIR) throw new Error("set only one of MODEL_WEIGHTS_SHA256 or MODEL_WEIGHTS_DIR");
+  if (config.RUNNER === "phala-aci" && config.MODEL_PROVIDER !== "phala-aci") throw new Error("RUNNER=phala-aci requires MODEL_PROVIDER=phala-aci");
+  if (config.MODEL_PROVIDER === "phala-aci" && config.RUNNER !== "phala-aci") throw new Error("MODEL_PROVIDER=phala-aci requires RUNNER=phala-aci");
   if (config.MODEL_PROVIDER === "phala-aci" && (!config.PHALA_AI_API_KEY || !config.PHALA_ACI_MODEL)) throw new Error("PHALA_AI_API_KEY and PHALA_ACI_MODEL are required when MODEL_PROVIDER=phala-aci");
   return config;
 }

@@ -4,17 +4,17 @@
 // corp-actions.split@RHC through the on-chain crosscheck.
 // Prereqs: anvil on :8545, TimescaleDB on :55432 (see README). Usage: bun scripts/e2e.ts
 import { spawn, type Subprocess } from "bun";
-import { mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { x25519 } from "@noble/curves/ed25519.js";
 import { bls12_381 } from "@noble/curves/bls12-381.js";
 import { sha256, sha512 } from "@noble/hashes/sha2.js";
 import postgres from "postgres";
-import { createPublicClient, createWalletClient, http, keccak256, parseAbi, recoverMessageAddress, toHex, type Abi, type Address, type Hex } from "viem";
+import { createPublicClient, createWalletClient, http, keccak256, parseAbi, parseEventLogs, recoverMessageAddress, toHex, type Abi, type Address, type Hex } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
 import { Role, SchemaId, ZERO32, docCommit as computeDocCommit, docHash, toBytes32String, verdictId as verdictIdOf } from "@mochi/core";
 import { createDb, migrate, upsertEndpoint } from "@mochi/db";
-import { MockQuoteVerifier, MockTeeProvider, keyBinding, open, seal, type Quote } from "@mochi/tee";
+import { MockQuoteVerifier, MockTeeProvider, keyBinding, open, recoverProvenance, seal, type Quote } from "@mochi/tee";
 import { PrivateResultPlainSchema, aad, payerCommit } from "@mochi/protocol";
 import { verifyReceipt } from "@mochi/receipts";
 import { MochiClient } from "@mochi/sdk";
@@ -28,13 +28,14 @@ import { chainFor, drandRoundMessage, type Deployment } from "@mochi/chain";
 import { DEV_KEYS } from "./deploy-local.ts";
 
 const ROOT = join(import.meta.dir, "..");
-const RUN = join(ROOT, ".e2e");
+const RUN = process.env.MOCHI_E2E_RUN_DIR ?? join(ROOT, ".e2e");
 // The harness runs its own anvil (fresh chain + clock every run) on a dedicated port.
 const ANVIL_PORT = 18545;
 const RPC = `http://127.0.0.1:${ANVIL_PORT}`;
-const PG_ADMIN = "postgres://mochi:mochi@127.0.0.1:55432/mochi";
-const DB_URL = "postgres://mochi:mochi@127.0.0.1:55432/mochi_e2e";
+const PG_ADMIN = process.env.MOCHI_E2E_PG_ADMIN ?? "postgres://mochi:mochi@127.0.0.1:55432/mochi";
+const DB_URL = process.env.MOCHI_E2E_DATABASE_URL ?? "postgres://mochi:mochi@127.0.0.1:55432/mochi_e2e";
 const DEPLOYMENT = join(RUN, "deployment.json");
+const SERVICE_BUILD_DIR = process.env.E2E_SERVICE_BUILD_DIR;
 const PAYER_KEY: Hex = "0x8b3a350cf5c34c9194ca85829a2df0ec3153be0318b5e2d3348e872092edffba"; // anvil #5
 const MEASUREMENT = keccak256(toHex("mochi-mock-enclave-v1"));
 const ROOT_KEY = keccak256(toHex("mochi-mock-root"));
@@ -46,6 +47,7 @@ const LINEAGE = ["qwen", "llama", "mistral", "phi", "deepseek"];
 const ANONYMA_SECRET = "e2e-anonyma-hmac-secret";
 // MOCHI_E2E_MODE=load runs the §7 load targets instead of the functional flows (same stack).
 const MODE = process.env.MOCHI_E2E_MODE ?? "flows";
+const STARTED_AT = Date.now();
 const RANDOMNESS_MODE = process.env.MOCHI_E2E_RANDOMNESS === "drand" ? "drand" : "blockhash";
 const DRAND_GENESIS = 1;
 const DRAND_PERIOD = 3;
@@ -146,7 +148,11 @@ function startDocServer() {
 }
 
 function service(name: string, dir: string, env: Record<string, string>) {
-  const p = spawn(["bun", "src/main.ts"], {
+  const bundledServices = new Set(["intake", "consensus", "juror", "gateway", "indexer", "attestor", "orchestrator"]);
+  const bundle = SERVICE_BUILD_DIR && join(SERVICE_BUILD_DIR, "services", `${dir}.mjs`);
+  if (SERVICE_BUILD_DIR && bundledServices.has(dir) && !existsSync(bundle!)) throw new Error(`missing bundled service: ${bundle}`);
+  const entry = bundle && existsSync(bundle) ? bundle : "src/main.ts";
+  const p = spawn(["bun", entry], {
     cwd: join(ROOT, "services", dir),
     env: { ...process.env, HOST: "127.0.0.1", MOCHI_DEPLOYMENT: DEPLOYMENT, ...env },
     stdout: Bun.file(join(RUN, `${name}.log`)),
@@ -157,8 +163,13 @@ function service(name: string, dir: string, env: Record<string, string>) {
 }
 
 async function main() {
-  rmSync(RUN, { recursive: true, force: true });
-  mkdirSync(RUN, { recursive: true });
+  if (process.env.MOCHI_E2E_RUN_DIR) {
+    if (existsSync(RUN) && readdirSync(RUN).length > 0) throw new Error(`MOCHI_E2E_RUN_DIR must be empty: ${RUN}`);
+    mkdirSync(RUN, { recursive: true });
+  } else {
+    rmSync(RUN, { recursive: true, force: true });
+    mkdirSync(RUN, { recursive: true });
+  }
 
   // Preflight: the harness owns these ports; fail fast (instead of timing out) if a stale run still holds one.
   for (const port of [ANVIL_PORT, ...Object.values(PORTS).filter((p) => p !== PORTS.jurorBase), ...Array.from({ length: 10 }, (_, i) => PORTS.jurorBase + i)]) {
@@ -277,13 +288,6 @@ async function main() {
   service("panel-desk", "panel-desk", {
     ...common, PORT: String(PORTS.panel), RPC_URL: RPC, KEEPER_KEY, INTAKE_URL: `http://127.0.0.1:${PORTS.intake}`, POLL_MS: "500", ...(RANDOMNESS_MODE === "drand" ? { DRAND_RELAYS: DRAND_RELAY } : {}),
   });
-  service("orchestrator", "orchestrator", {
-    ...common, PORT: String(PORTS.orchestrator), ORCHESTRATOR_KEY: DEV_KEYS.orchestrator, FEED_RUNNER_KEY: DEV_KEYS.orchestrator,
-    MAX_PARALLEL_QUERIES: MODE === "load" ? "32" : "8",
-    INTAKE_URL: `http://127.0.0.1:${PORTS.intake}`, CONSENSUS_URL: `http://127.0.0.1:${PORTS.consensus}`, POLL_MS: "500",
-    ...(RANDOMNESS_MODE === "drand" ? { DRAND_RELAYS: DRAND_RELAY } : {}),
-    JUROR_TIMEOUT_MS: "20000", ROUND_CLOSE_MAX_WAIT_MS: "20000",
-  });
   service("indexer", "indexer", { ...common, PORT: String(PORTS.indexer), POLL_MS: "500", ANCHORER_KEY: DEV_KEYS.orchestrator });
   // ACME Stock Token whose multiplier schedule matches the notice (2-for-1 effective 2026-10-15).
   const tokenHash = await wallet(DEV_KEYS.deployer).deployContract({ abi: A.MockStockTokenAbi as Abi, bytecode: A.MockStockTokenBytecode, args: [] as never });
@@ -344,7 +348,12 @@ async function main() {
     const salt: Hex = opts.isPublic ? ZERO32 : toHex(crypto.getRandomValues(new Uint8Array(32)));
     const plain = { v: 1, schemaId: opts.schemaId, salt, params: opts.params ?? {}, contentType: "text/plain", docB64: Buffer.from(opts.text).toString("base64") };
     const envelope = seal(intakeAtt.encryptionPubKey, new TextEncoder().encode(JSON.stringify(plain)), aad.intake());
-    const intakeRes = await (await fetch(`${gw}/v1/intake/upload?n=3`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ envelope }) })).json() as { docCommit: Hex; quote: unknown };
+    const intakeRes = await (await fetch(`${gw}/v1/intake/upload?n=3`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ envelope }) })).json() as { docCommit: Hex; quote: unknown; intake: Address; intakeSig: Hex; provenance: { docCommit: Hex; kind: number; originId: Hex; fetchedAt: string; tokensK: number; transcriptHash: Hex } };
+    const provenance = { ...intakeRes.provenance, fetchedAt: BigInt(intakeRes.provenance.fetchedAt) };
+    const signer = await recoverProvenance(dep.chainId, C.queryEscrow, provenance, intakeRes.intakeSig);
+    ok(signer.toLowerCase() === intakeRes.intake.toLowerCase(), "intake response signature recovers its declared enclave identity");
+    await until("intake response signer active", async () => await read<boolean>(C.jurorRegistry, R, "isActive", [signer, Role.INTAKE]) || undefined, 20_000);
+    ok(true, "intake response signer is active in the on-chain registry");
     ok(intakeRes.docCommit === computeDocCommit(salt, docHash(new TextEncoder().encode(opts.text))), `intake docCommit = keccak(salt ‖ sha256(doc))${opts.isPublic ? "" : " (salted)"}`);
     const resultPriv = x25519.utils.randomSecretKey();
     const resultPub = toHex(x25519.getPublicKey(resultPriv));
@@ -360,12 +369,40 @@ async function main() {
     ok((await pub.waitForTransactionReceipt({ hash })).status === "success", `payer sent the gateway-prepared openWithUSDG tx (query ${prep.queryId.slice(0, 12)}…)`);
     return { queryId: prep.queryId, resultPriv, salt };
   }
-  const waitVerdict = (queryId: Hex, label: string) =>
-    until(`${label} verdict`, async () => {
+  const waitVerdict = (queryId: Hex, label: string) => (async () => {
+    const started = Date.now();
+    const verdictId = await until(`${label} verdict`, async () => {
       const q = await (await fetch(`${gw}/v1/queries/${queryId}`)).json() as { latestVerdictId?: Hex; latestVerdict?: Hex; query?: { status: number } };
       const vid = (q.latestVerdictId ?? q.latestVerdict) as Hex | undefined;
       return vid && !/^0x0+$/.test(vid) ? vid : undefined;
     }, 120_000);
+    console.log(`  ⏱ ${label} verdict: ${((Date.now() - started) / 1000).toFixed(1)}s`);
+    return verdictId;
+  })();
+
+  console.log("3b. Public USDG payment expires before orchestration and refunds the payer in full");
+  const refundBefore = await read<bigint>(C.usdg, A.MockUSDGAbi, "balanceOf", [payer]);
+  await send(DEV_KEYS.deployer, C.queryEscrow, A.QueryEscrowAbi, "setQueryTtl", [2n]);
+  const expired = await submit({ schemaId: SchemaId.SPLIT, text: "Refund Co (NASDAQ: RFND) announced a test split.", isPublic: true });
+  const openForRefund = await read<{ paid: bigint; deadline: bigint; status: number }>(C.queryEscrow, A.QueryEscrowAbi, "getQuery", [expired.queryId]);
+  ok(openForRefund.paid > 0n && Number(openForRefund.status) === 1, `public query opened and paid ${openForRefund.paid} USDG units`);
+  const latestTimestamp = BigInt((await pub.getBlock({ blockTag: "latest" })).timestamp);
+  await pub.request({ method: "evm_increaseTime" as never, params: [Number(openForRefund.deadline - latestTimestamp + 2n)] as never });
+  await pub.request({ method: "evm_mine" as never, params: [] as never });
+  await send(DEV_KEYS.deployer, C.queryEscrow, A.QueryEscrowAbi, "expire", [expired.queryId]);
+  const expiredQuery = await read<{ status: number }>(C.queryEscrow, A.QueryEscrowAbi, "getQuery", [expired.queryId]);
+  const refundAfter = await read<bigint>(C.usdg, A.MockUSDGAbi, "balanceOf", [payer]);
+  ok(Number(expiredQuery.status) === 6 && refundAfter === refundBefore, "expired USDG query refunded its full payment to refundTo");
+  await send(DEV_KEYS.deployer, C.queryEscrow, A.QueryEscrowAbi, "setQueryTtl", [3600n]);
+
+  service("orchestrator", "orchestrator", {
+    ...common, PORT: String(PORTS.orchestrator), ORCHESTRATOR_KEY: DEV_KEYS.orchestrator, FEED_RUNNER_KEY: DEV_KEYS.orchestrator,
+    MAX_PARALLEL_QUERIES: MODE === "load" ? "32" : "8",
+    INTAKE_URL: `http://127.0.0.1:${PORTS.intake}`, CONSENSUS_URL: `http://127.0.0.1:${PORTS.consensus}`, POLL_MS: "500",
+    ...(RANDOMNESS_MODE === "drand" ? { DRAND_RELAYS: DRAND_RELAY } : {}),
+    JUROR_TIMEOUT_MS: "20000", ROUND_CLOSE_MAX_WAIT_MS: "20000",
+  });
+  await until("orchestrator health", async () => (await fetch(`http://127.0.0.1:${PORTS.orchestrator}/health`)).ok || undefined);
 
   if (MODE === "load") {
     await runLoad({ gw, feedRunner, payer, send, read, submit, waitVerdict, C, db });
@@ -381,6 +418,8 @@ async function main() {
   });
   const onchainA = await read<{ status: number; agreementBps: number }>(C.verdicts, A.MochiVerdictsAbi, "getVerdict", [vidA]);
   ok(Number(onchainA.status) === 1 && Number(onchainA.agreementBps) === 10000, "public verdict on-chain: VERDICT at 10000 bps");
+  const settledA = await read<{ status: number; paid: bigint }>(C.queryEscrow, A.QueryEscrowAbi, "getQuery", [A1.queryId]);
+  ok(Number(settledA.status) === 3 && settledA.paid > 0n, "public USDG payment settled after the on-chain verdict");
   ok(JSON.stringify(vA).includes("ACME"), "gateway serves the public answer (ticker ACME)");
 
   console.log("5. (B) Private FREEFORM query: salted commitments on-chain, result sealed to the payer's key");
@@ -423,7 +462,6 @@ async function main() {
     return fetch(input, init);
   }) as typeof fetch, quoteVerifier: verifier, intakeMeasurement: MEASUREMENT, chain: { deployment: dep, publicClient: pub } });
   let lastPrivateRelayBody = "";
-  const privateBalanceBefore = await pub.readContract({ address: C.usdg, abi: parseAbi(["function balanceOf(address) view returns (uint256)" ]), functionName: "balanceOf", args: [C.queryEscrow] });
   const sdkPrivate = await privateSdk.ask({
     schema: SchemaId.FREEFORM_FACT,
     document: { bytes: new TextEncoder().encode("Pool Co reserves were fully backed on September 30, 2026."), contentType: "text/plain" },
@@ -436,9 +474,11 @@ async function main() {
   ok(relayTx.from.toLowerCase() === relayerAddress.toLowerCase() && relayTx.from.toLowerCase() !== payer.toLowerCase(), "openShielded transaction is sent by the gateway relayer, not the payer");
   const privateQuote = sdkPrivate.quote;
   const privateTotal = BigInt(privateQuote.jurorFees) + BigInt(privateQuote.protocolFee);
-  const escrowBalance = await pub.readContract({ address: C.usdg, abi: parseAbi(["function balanceOf(address) view returns (uint256)"]), functionName: "balanceOf", args: [C.queryEscrow] });
   const privateQuery = await read<{ paid: bigint }>(C.queryEscrow, A.QueryEscrowAbi, "getQuery", [sdkPrivate.queryId]);
-  ok(privateQuery.paid === privateTotal && escrowBalance - privateBalanceBefore === privateTotal, `escrow credited exactly the private quote (${privateTotal} USDG units)`);
+  const privateReceipt = await pub.getTransactionReceipt({ hash: sdkPrivate.txHash });
+  const shieldedSpends = parseEventLogs({ abi: A.PrivacyPoolShieldedPaymentsAbi, logs: privateReceipt.logs, eventName: "ShieldedSpend" });
+  const shieldedSpend = shieldedSpends.find((event) => event.address.toLowerCase() === privacy.adapter.toLowerCase() && event.args.context.toLowerCase() === sdkPrivate.queryId.toLowerCase());
+  ok(privateQuery.paid === privateTotal && shieldedSpend?.args.amount === privateTotal, `shielded adapter transferred exactly the private quote (${privateTotal} USDG units)`);
   const privateVerdictId = await waitVerdict(sdkPrivate.queryId, "shielded-pool private");
   await until("shielded private ciphertext", async () => {
     const response = await fetch(`${gw}/v1/verdict/${privateVerdictId}`);
@@ -627,7 +667,7 @@ async function main() {
   ok(vPanel.escalated && Number(vPanel.round) === 255, "panel verdict on-chain (escalated, PANEL_ROUND)");
   ok(pnlEntry.asOf === BigInt(Date.parse("2026-11-20T00:00:00Z") / 1000) && keccak256(panelPayload) !== ZERO32, "keeper pushed the panel verdict into corp-actions.split@RHC[PNL] (crosscheck passed)");
 
-  console.log("\nE2E PASSED: all services, every flow.");
+  console.log(`\nE2E PASSED: all services, every flow (${((Date.now() - STARTED_AT) / 1000).toFixed(1)}s).`);
 }
 
 /** §7 load targets: 200-ticker corp-actions at N=3 (< 30 min) and earnings p95 < 120 s at N=7. */
