@@ -2,6 +2,7 @@ import { describe, expect, test } from 'bun:test';
 import { controlledEvaluationFixtures } from '../eval/controlled-fixtures.ts';
 import { CONTROLLED_MAX_CALLS, CONTROLLED_MAX_OUTPUT_TOKENS, CONTROLLED_MODELS, CONTROLLED_SPEND_CAP_USD, createBoundedControlledJurors, parseControlledArgs, runControlled } from '../eval/controlled-run.ts';
 import type { Juror } from '../src/types.ts';
+import { evaluateClaims } from '../eval/index.ts';
 
 describe('controlled claims evaluation', () => {
   test('contains 12 deterministic fictional evidence cases with varied labels and bounded source text', () => {
@@ -74,7 +75,8 @@ describe('controlled claims evaluation', () => {
     expect(report.fixtureCount).toBe(12);
     expect(report.cases).toHaveLength(12);
     expect(report.cases.find((item: { id: string }) => item.id === 'crypto-no-evidence')?.status).toBe('assessed');
-    expect(report.providerUsage.calls).toBe(33);
+    expect(report.providerUsage.attemptedCalls).toBe(33);
+    expect(report.providerUsage.completedTelemetry).toBe(33);
     expect(report.estimatedCost.actualBilledCostUsd).toBeNull();
     expect(report.estimatedCost.partialEstimatedCostUsd).toBeGreaterThan(0);
     expect(output).not.toContain('The fictional');
@@ -86,7 +88,36 @@ describe('controlled claims evaluation', () => {
     const oneCase = JSON.parse(output);
     expect(oneCase.fixtureCount).toBe(1);
     expect(oneCase.expectedCalls).toBe(3);
-    expect(oneCase.providerUsage.calls).toBe(3);
+    expect(oneCase.providerUsage.attemptedCalls).toBe(3);
     expect(oneCase.cases[0].id).toBe('crypto-supply-contradiction');
+  });
+
+  test('counts started attempts separately from absent telemetry and keeps delayed events with their fixture', async () => {
+    let output = '';
+    const factory = (options: { id: string; model: string; onTelemetry?: (event: { id: string; model: string; elapsedMs: number; outcome: 'success' | 'failure'; stage?: 'complete' | 'request_build' | 'attestation' | 'inference' | 'receipt' | 'aci_exchange' | 'response_parse'; errorCode?: string; usage?: { promptTokens?: number; completionTokens?: number; totalTokens?: number } }) => void }): Juror => ({
+      id: options.id, model: options.model,
+      async assess() {
+        if (options.id === 'controlled-1') {
+          setTimeout(() => options.onTelemetry?.({ id: options.id, model: options.model, elapsedMs: 4, outcome: 'failure', stage: 'aci_exchange', errorCode: 'REQUEST_ABORTED' }), 0);
+          return {};
+        }
+        return new Promise<never>(() => {});
+      },
+    });
+    const fixture = controlledEvaluationFixtures.find((item) => item.id === 'crypto-supply-contradiction')!;
+    expect(await runControlled(['--live', '--case', fixture.id], { PHALA_AI_API_KEY: 'mock-only' }, (text) => { output += text; }, {
+      jurorFactory: factory,
+      evaluate: async (options) => {
+        for (const juror of options?.jurors ?? []) void juror.assess(fixture.bundle);
+        await new Promise((resolve) => setTimeout(resolve, 5));
+        return evaluateClaims({ fixtures: [fixture] });
+      },
+    })).toBe(0);
+    const report = JSON.parse(output);
+    expect(report.providerUsage).toMatchObject({ attemptedCalls: 3, completedTelemetry: 1, missingTelemetry: 2, missingUsageCalls: 3 });
+    expect(report.providerUsage.byModel['deepseek/deepseek-v4-flash-0731']).toMatchObject({ attemptedCalls: 1, completedTelemetry: 1, missingTelemetry: 0, missingUsageCalls: 1 });
+    expect(report.providerUsage.byModel['qwen/qwen3.8-27b']).toMatchObject({ attemptedCalls: 1, completedTelemetry: 0, missingTelemetry: 1, missingUsageCalls: 1 });
+    expect(report.cases[0].providerFailures).toEqual([{ model: 'deepseek/deepseek-v4-flash-0731', stage: 'aci_exchange', errorCode: 'REQUEST_ABORTED' }]);
+    expect(output).not.toContain('mock-only');
   });
 });

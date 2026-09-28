@@ -1,4 +1,5 @@
 #!/usr/bin/env bun
+import { AsyncLocalStorage } from 'node:async_hooks';
 import { createAciJuror } from '../src/aci-provider.ts';
 import type { Assessment, Juror } from '../src/types.ts';
 import { createClaimChatRequest, type ChatJurorTelemetry } from '../src/providers.ts';
@@ -59,18 +60,18 @@ export function parseControlledArgs(args: string[]): ControlledOptions {
 
 type JurorFactory = (options: Parameters<typeof createAciJuror>[0]) => Juror;
 interface ControlledTelemetry extends ChatJurorTelemetry { fixtureId: string }
+interface ControlledAttempt { fixtureId: string; model: string }
 export function createBoundedControlledJurors(
-  key: string, telemetry: ControlledTelemetry[], factory: JurorFactory = createAciJuror,
-  onTelemetry?: (event: ChatJurorTelemetry, fixtureId: string) => void,
+  key: string, telemetry: ControlledTelemetry[], factory: JurorFactory = createAciJuror, attempts: ControlledAttempt[] = [],
 ): Juror[] {
   let calls = 0;
   let reservedNanoDollars = 0;
   return CONTROLLED_MODELS.map((model, index) => {
     const id = `controlled-${index + 1}`;
     const reserveNanoDollars = MAX_REQUEST_BYTES * PRICE_NANODOLLARS[model].input + MAX_RESERVED_OUTPUT_TOKENS * PRICE_NANODOLLARS[model].output;
-    let activeFixtureId = 'unknown';
+    const activeFixtureId = new AsyncLocalStorage<string>();
     const juror = factory({ id, model, baseUrl: CONTROLLED_BASE_URL, apiKey: key, maxOutputTokens: CONTROLLED_MAX_OUTPUT_TOKENS,
-      onTelemetry: (event) => { if (onTelemetry) onTelemetry(event, activeFixtureId); else telemetry.push({ ...event, fixtureId: activeFixtureId }); } });
+      onTelemetry: (event) => { telemetry.push({ ...event, fixtureId: activeFixtureId.getStore() ?? 'unknown' }); } });
     return {
       id, model,
       async assess(bundle, signal) {
@@ -80,33 +81,38 @@ export function createBoundedControlledJurors(
         if (calls >= CONTROLLED_MAX_CALLS || reservedNanoDollars + reserveNanoDollars > SPEND_CAP_NANODOLLARS) throw new Error('Controlled live call or spend bound reached.');
         calls++;
         reservedNanoDollars += reserveNanoDollars;
-        activeFixtureId = bundle.id;
-        try { return await juror.assess(bundle, signal); }
-        finally { activeFixtureId = 'unknown'; }
+        attempts.push({ fixtureId: bundle.id, model });
+        return await activeFixtureId.run(bundle.id, () => juror.assess(bundle, signal));
       },
     };
   });
 }
 
-function estimatedCost(telemetry: ChatJurorTelemetry[], expectedCalls: number) {
+function estimatedCost(telemetry: ControlledTelemetry[], attempts: ControlledAttempt[]) {
   let estimate = 0;
-  let complete = telemetry.length === expectedCalls;
-  const perModel: Record<string, { calls: number; usageReportedCalls: number; promptTokens: number; completionTokens: number; partialEstimatedCostUsd: number }> = {};
+  let complete = telemetry.length === attempts.length;
+  const perModel: Record<string, { attemptedCalls: number; completedTelemetry: number; usageReportedCalls: number; missingUsageCalls: number; promptTokens: number; completionTokens: number; partialEstimatedCostUsd: number }> = {};
+  for (const attempt of attempts) {
+    const row = perModel[attempt.model] ??= { attemptedCalls: 0, completedTelemetry: 0, usageReportedCalls: 0, missingUsageCalls: 0, promptTokens: 0, completionTokens: 0, partialEstimatedCostUsd: 0 };
+    row.attemptedCalls++;
+    row.missingUsageCalls++;
+  }
   for (const event of telemetry) {
     const usage = event.usage;
     if (!(event.model in PRICE)) { complete = false; continue; }
-    const row = perModel[event.model] ??= { calls: 0, usageReportedCalls: 0, promptTokens: 0, completionTokens: 0, partialEstimatedCostUsd: 0 };
-    row.calls++;
+    const row = perModel[event.model] ??= { attemptedCalls: 0, completedTelemetry: 0, usageReportedCalls: 0, missingUsageCalls: 0, promptTokens: 0, completionTokens: 0, partialEstimatedCostUsd: 0 };
+    row.completedTelemetry++;
     if (usage?.promptTokens === undefined || usage.completionTokens === undefined) { complete = false; continue; }
     const price = PRICE[event.model as keyof typeof PRICE];
     const cost = usage.promptTokens * price.input + usage.completionTokens * price.output;
     estimate += cost;
     row.usageReportedCalls++;
+    row.missingUsageCalls = Math.max(0, row.missingUsageCalls - 1);
     row.promptTokens += usage.promptTokens;
     row.completionTokens += usage.completionTokens;
     row.partialEstimatedCostUsd += cost;
   }
-  return { status: 'reported_token_estimate' as const, partialEstimatedCostUsd: estimate, allExpectedCallsReportedUsage: complete,
+  return { status: 'reported_token_estimate' as const, partialEstimatedCostUsd: estimate, allAttemptedCallsReportedUsage: complete,
     perModel, actualBilledCostUsd: null as null,
     note: 'Partial token-price estimate uses calls with both prompt and completion usage reported. Missing usage means unknown cost; this estimate is not actual billing. The internal pre-request reservation uses the requested 1024 output tokens, which providers may exceed (a prior response reported 1281 completion tokens). The configured provider-side USD 10 limit is the billing safeguard.' };
 }
@@ -128,8 +134,9 @@ export async function runControlled(args: string[], env: Record<string, string |
     write('A selected controlled provider request exceeds the live byte bound.\n'); return 2;
   }
   const telemetry: ControlledTelemetry[] = [];
+  const attempts: ControlledAttempt[] = [];
   let jurors: Juror[] | undefined;
-  if (options.live) jurors = createBoundedControlledJurors(env.PHALA_AI_API_KEY!, telemetry, dependencies.jurorFactory ?? createAciJuror);
+  if (options.live) jurors = createBoundedControlledJurors(env.PHALA_AI_API_KEY!, telemetry, dependencies.jurorFactory ?? createAciJuror, attempts);
   let report: ClaimEvaluationReport;
   try { report = await (dependencies.evaluate ?? evaluateClaims)({ mode: options.live ? 'live' : 'offline', allowLiveJurors: options.live, jurors, fixtures, now: () => new Date('2026-09-28T00:00:00.000Z') }); }
   catch { write('Evaluation failed. Raw provider errors and response data are suppressed.\n'); return 1; }
@@ -150,31 +157,36 @@ export async function runControlled(args: string[], env: Record<string, string |
       preRequestReservationAllowanceUsd: CONTROLLED_SPEND_CAP_USD, providerConfiguredSpendLimitUsd: CONTROLLED_SPEND_CAP_USD,
       requestedMaxOutputTokensPerCall: CONTROLLED_MAX_OUTPUT_TOKENS,
       reservationNote: 'The pre-request reservation is an estimate; provider-reported output usage can exceed the requested output token value.',
-      providerUsage: usageSummary(telemetry), estimatedCost: estimatedCost(telemetry, expectedCalls) } : {}),
+      providerUsage: usageSummary(telemetry, attempts), estimatedCost: estimatedCost(telemetry, attempts) } : {}),
     limitations: report.limitations,
   }, null, 2)}\n`);
   return 0;
 }
 
-function usageSummary(events: ControlledTelemetry[]) {
-  const sumField = (rows: ControlledTelemetry[], field: 'promptTokens' | 'completionTokens' | 'totalTokens') => {
+function usageSummary(events: ControlledTelemetry[], attempts: ControlledAttempt[]) {
+  const sumField = (rows: ControlledTelemetry[], attemptedCalls: number, field: 'promptTokens' | 'completionTokens' | 'totalTokens') => {
     const reported = rows.map((item) => item.usage?.[field]).filter((value): value is number => value !== undefined);
-    return { reportedTokens: reported.length ? reported.reduce((sum, value) => sum + value, 0) : null, reportedCalls: reported.length, missingCalls: rows.length - reported.length };
+    return { reportedTokens: reported.length ? reported.reduce((sum, value) => sum + value, 0) : null, reportedCalls: reported.length, missingCalls: attemptedCalls - reported.length };
   };
   const byModel = Object.fromEntries(CONTROLLED_MODELS.map((model) => {
     const rows = events.filter((item) => item.model === model);
+    const attemptedCalls = attempts.filter((item) => item.model === model).length;
     const failureCodesByStage: Record<string, number> = {};
     for (const item of rows) if (item.outcome === 'failure') {
       const key = `${item.stage ?? 'unknown'}:${item.errorCode ?? 'unknown'}`;
       failureCodesByStage[key] = (failureCodesByStage[key] ?? 0) + 1;
     }
-    return [model, { calls: rows.length, successes: rows.filter((item) => item.outcome === 'success').length, failures: rows.filter((item) => item.outcome === 'failure').length,
-      callsWithUsage: rows.filter((item) => item.usage).length, promptTokens: sumField(rows, 'promptTokens'), completionTokens: sumField(rows, 'completionTokens'), totalTokens: sumField(rows, 'totalTokens'),
+    return [model, { attemptedCalls, completedTelemetry: rows.length, missingTelemetry: Math.max(0, attemptedCalls - rows.length), successes: rows.filter((item) => item.outcome === 'success').length, failures: rows.filter((item) => item.outcome === 'failure').length,
+      callsWithUsage: rows.filter((item) => item.usage).length,
+      missingUsageCalls: Math.max(0, attemptedCalls - rows.filter((item) => item.usage?.promptTokens !== undefined && item.usage.completionTokens !== undefined).length),
+      promptTokens: sumField(rows, attemptedCalls, 'promptTokens'), completionTokens: sumField(rows, attemptedCalls, 'completionTokens'), totalTokens: sumField(rows, attemptedCalls, 'totalTokens'),
       failureCodesByStage }];
   }));
-  return { calls: events.length, successes: events.filter((item) => item.outcome === 'success').length, failures: events.filter((item) => item.outcome === 'failure').length,
+  return { attemptedCalls: attempts.length, completedTelemetry: events.length, missingTelemetry: Math.max(0, attempts.length - events.length),
+    successes: events.filter((item) => item.outcome === 'success').length, failures: events.filter((item) => item.outcome === 'failure').length,
     callsWithUsage: events.filter((item) => item.usage).length,
-    promptTokens: sumField(events, 'promptTokens'), completionTokens: sumField(events, 'completionTokens'), totalTokens: sumField(events, 'totalTokens'), byModel };
+    missingUsageCalls: Math.max(0, attempts.length - events.filter((item) => item.usage?.promptTokens !== undefined && item.usage.completionTokens !== undefined).length),
+    promptTokens: sumField(events, attempts.length, 'promptTokens'), completionTokens: sumField(events, attempts.length, 'completionTokens'), totalTokens: sumField(events, attempts.length, 'totalTokens'), byModel };
 }
 
 if (import.meta.main) {
