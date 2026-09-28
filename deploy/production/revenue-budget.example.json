@@ -1,0 +1,11 @@
+{
+  "approvedBudgetId": "APPROVED_BUDGET_REQUIRED",
+  "budgetId": "APPROVED_BUDGET_REQUIRED",
+  "asOfMs": 0,
+  "availableReviewFunds": null,
+  "uncoveredDailyOperatingCost": null,
+  "retainedOperatingReserve": null,
+  "modelLiabilities": null,
+  "infrastructureLiabilities": null,
+  "refunds": null
+}

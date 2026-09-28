@@ -21,3 +21,15 @@ The dry-run CLI takes its gross review revenue only from a persisted allocation,
 `obligations.json` must contain exactly `modelLiabilities`, `infrastructureLiabilities`, `refunds`, and `reserves`; each value is a nonnegative decimal string in atomic USDG units or `null`. A `null` value is reported as an eligibility block. The command prints the plan as JSON and exits without constructing a wallet or adapter.
 
 SQLite files contain an accounting audit trail. Back them up, restrict access, and reconcile them against chain settlement records and the treasury before any operational decision. SQLite locks are appropriate for a single host and local processes; they are not a distributed lock or a replacement for a managed transactional database in a multi-host service.
+
+## Read-only on-chain revenue ingestion
+
+`settlement-ingestion.ts` can ingest the opt-in `ReviewProtocolRevenueSettled` event using a read-only viem `PublicClient`. Configure the exact chain, QueryEscrow, USDG, reviewed remainder recipient, start block, and bounded chunk size. It requires an RPC `finalized` block tag and historical reads; there is no latest-block fallback. It records only successful, canonical, attributable transfers for DECIDED USDG/SHIELDED/ANONYMA queries. FEED subsidy events are verified and excluded. The event amount is the post-panel protocol remainder, never gross review payments, developer fees, refunds, or unspent deposits.
+
+Each accepted record persists the chain, escrow, token and recipient plus block/hash, transaction/hash, log index, query ID, pay path/status and matched USDG transfer evidence. A unique chain/transaction/log index and canonical event ID make exact replays harmless and conflicting replays fail. Each chunk advances the SQLite cursor atomically with its records. On restart, the ingester checks the saved checkpoint against the canonical block hash and stops on a reorg or mismatch; it also rechecks the finalized anchor before committing. Keep each poll bounded with `maxChunks`; resume by calling the ingester again. This is a local audit ledger, so independently reconcile it against the chain before operational use and back it up with the rest of the SQLite accounting data.
+
+The opt-in contract hook remains disabled when its recipient is zero. Enabling that governance setting requires deliberate reviewed policy and does not enable automatic purchases or burns. No wallet or write client is used by ingestion.
+
+See [Revenue operations](REVENUE-OPERATIONS.md) for the enforced 30-day reserve, $25 batch threshold, fresh budget requirements, ingestion command and policy-aware preview. The older generic dry-run above does not enforce the launch reserve or batch policy.
+
+The current receipt verifier accepts one revenue settlement event per transaction and exactly one matching preceding USDG transfer. Multi-settlement aggregator transactions fail closed and require an explicitly reviewed extension before use.

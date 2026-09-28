@@ -16,6 +16,7 @@ const address = (n: string) => `0x${n.repeat(40)}`;
 const config: BuybackConfig = {
   enabled: true,
   reviewedPolicyId: 'test-only-reviewed-policy',
+  operatingBudgetId: 'test-budget',
   teamConfirmedTokenAddress: true,
   chainId: 4663n,
   tokenAddress: address('1'),
@@ -27,10 +28,10 @@ const config: BuybackConfig = {
 };
 const request: BuybackRequest = {
   settledBatchId: 'settled-reviews-2026-09-28-a',
-  grossReviewRevenue: 50_000n,
+  grossReviewRevenue: 150000000n,
   usdgUnitsPerUsd: 1_000_000n,
-  obligations: { modelLiabilities: 20_000n, infrastructureLiabilities: 5_000n, refunds: 5_000n, reserves: 10_000n },
-  requestedAmount: 10_000n,
+  obligations: { modelLiabilities: 60000000n, infrastructureLiabilities: 15000000n, refunds: 15000000n, reserves: 30000000n },
+  requestedAmount: 30000000n,
 };
 const makeQuote = (execution: BuybackExecution): BuybackQuote => ({
   chainId: execution.chainId,
@@ -98,7 +99,7 @@ class MemoryStore implements BuybackStore {
 class MockAdapter implements BuybackAdapter {
   submissions = 0;
   reconciliations = 0;
-  funds = { chainId: 4663n, treasuryAddress: config.reviewTreasuryAddress!, usdgAddress: config.usdgAddress!, usdgBalance: 50_000n, attributableReviewFunds: 50_000n as bigint | null };
+  funds = { chainId: 4663n, treasuryAddress: config.reviewTreasuryAddress!, usdgAddress: config.usdgAddress!, usdgBalance: 150000000n, attributableReviewFunds: 150000000n as bigint | null };
   quote: (execution: BuybackExecution) => BuybackQuote = makeQuote;
   reconcileState: Reconciliation = { status: 'submitted', transactionRef: 'tx-1' };
   submit: () => Promise<{ transactionRef: string }> = async () => ({ transactionRef: 'tx-1' });
@@ -109,10 +110,38 @@ class MockAdapter implements BuybackAdapter {
 }
 
 function dependencies(adapter = new MockAdapter(), store = new MemoryStore()) {
-  return { deps: { config, adapter, store, now: () => 1_000_000 }, adapter, store };
+  return { deps: { config, adapter, store, now: () => 1_000_000, loadOperatingBudget: async () => ({budgetId:'test-budget',asOfMs:1_000_000,uncoveredDailyOperatingCost:1_000_000n,retainedOperatingReserve:0n}) }, adapter, store };
 }
 
 describe('runReviewBuyback', () => {
+  test('new purchases cannot bypass the budget reader, reserve rule or $25 threshold', async () => {
+    const { deps, adapter } = dependencies();
+    expect(await runReviewBuyback(request, { ...deps, loadOperatingBudget: undefined })).toMatchObject({ status: 'blocked', reasons: ['operating_budget_unavailable'] });
+    expect(await runReviewBuyback({ ...request, obligations: { ...request.obligations, reserves: 0n } }, deps)).toMatchObject({ status: 'blocked', reasons: ['reserve_top_up_mismatch'] });
+    expect(await runReviewBuyback({ ...request, requestedAmount: 24_999_999n }, deps)).toMatchObject({ status: 'blocked', reasons: ['below_minimum_batch'] });
+    expect(await runReviewBuyback({ ...request, usdgUnitsPerUsd: 100n }, deps)).toMatchObject({ status: 'blocked', reasons: ['invalid_request'] });
+    expect(adapter.submissions).toBe(0);
+    expect(await runReviewBuyback({ ...request, requestedAmount: 25_000_000n }, deps)).toMatchObject({ status: 'submitted', amountIn: 25_000_000n });
+    expect(adapter.submissions).toBe(1);
+  });
+
+  test('existing reserves cannot be spent again, and policy evidence persists with the reservation', async () => {
+    const { deps, adapter, store } = dependencies();
+    const loadOperatingBudget = async () => ({ budgetId: 'test-budget', asOfMs: 1_000_000, uncoveredDailyOperatingCost: 1_000_000n, retainedOperatingReserve: 30_000_000n });
+    const funded = { ...request, obligations: { ...request.obligations, reserves: 0n }, requestedAmount: 30_000_000n };
+    expect(await runReviewBuyback({ ...funded, requestedAmount: 30_000_001n }, { ...deps, loadOperatingBudget })).toMatchObject({ status: 'blocked', reasons: ['requested_amount_exceeds_eligible_residual'] });
+    expect(adapter.submissions).toBe(0);
+    expect(await runReviewBuyback(funded, { ...deps, loadOperatingBudget })).toMatchObject({ status: 'submitted' });
+    expect(store.records.get(request.settledBatchId)?.operatingPolicy).toMatchObject({ retainedReserve: 30_000_000n, requiredTopUp: 0n, reserveTarget: 30_000_000n });
+  });
+
+  test('an expired budget never prevents reconciliation of an already uncertain transaction', async () => {
+    const { deps, adapter } = dependencies();
+    await runReviewBuyback(request, deps);
+    const result = await runReviewBuyback(request, { ...deps, loadOperatingBudget: undefined });
+    expect(result.status).toBe('submitted');
+    expect(adapter.submissions).toBe(1);
+  });
   test('disabled by default and requires explicit nonzero team/route addresses', async () => {
     const { deps, adapter } = dependencies();
     expect(await runReviewBuyback(request, { ...deps, config: undefined })).toEqual({ status: 'disabled', reason: 'disabled' });
@@ -160,9 +189,9 @@ describe('runReviewBuyback', () => {
       receivedTokenAmount: 990n,
     } };
     const recovered = await runReviewBuyback(request, deps);
-    expect(recovered).toEqual({ status: 'purchased', transactionRef: 'tx-recovered', amountIn: 10_000n, receivedTokenAmount: 990n });
+    expect(recovered).toEqual({ status: 'purchased', transactionRef: 'tx-recovered', amountIn: 30000000n, receivedTokenAmount: 990n });
     const repeated = await runReviewBuyback(request, deps);
-    expect(repeated).toEqual({ status: 'already_purchased', transactionRef: 'tx-recovered', amountIn: 10_000n, receivedTokenAmount: 990n });
+    expect(repeated).toEqual({ status: 'already_purchased', transactionRef: 'tx-recovered', amountIn: 30000000n, receivedTokenAmount: 990n });
     expect(store.records.get(request.settledBatchId)?.transactionRef).toBe('tx-recovered');
     expect(adapter.submissions).toBe(1);
   });
@@ -172,7 +201,7 @@ describe('runReviewBuyback', () => {
     adapter.quote = (execution) => ({ ...makeQuote(execution), validUntilMs: 1_000_010 });
     const store = new MemoryStore();
     let clockReads = 0;
-    const deps = { config, adapter, store, now: () => ++clockReads === 1 ? 1_000_000 : 1_000_011 };
+    const deps = { ...dependencies(adapter, store).deps, now: () => ++clockReads <= 2 ? 1_000_000 : 1_000_011 };
     const result = await runReviewBuyback({ ...request, settledBatchId: 'expires-at-submit' }, deps);
     expect(result).toMatchObject({ status: 'blocked', reasons: ['stale_or_expired_quote'] });
     expect(store.records.get('expires-at-submit')?.status).toBe('cancelled');
@@ -185,9 +214,22 @@ describe('runReviewBuyback', () => {
   test('rejects a quote that becomes stale while the durable reservation is saved', async () => {
     const { deps, adapter, store } = dependencies();
     let reads = 0;
-    const result = await runReviewBuyback({ ...request, settledBatchId: 'stale-during-save' }, { ...deps, now: () => ++reads === 1 ? 1_000_000 : 1_030_001 });
+    const result = await runReviewBuyback({ ...request, settledBatchId: 'stale-during-save' }, { ...deps, now: () => ++reads <= 2 ? 1_000_000 : 1_030_001 });
     expect(result).toMatchObject({ status: 'blocked', reasons: ['stale_or_expired_quote'] });
     expect(store.records.get('stale-during-save')?.status).toBe('cancelled');
+    expect(adapter.submissions).toBe(0);
+  });
+
+  test('cancels before submission when the approved operating budget expires during persistence', async () => {
+    const { deps, adapter, store } = dependencies();
+    let reads = 0;
+    adapter.quote = (execution) => ({ ...makeQuote(execution), quotedAtMs: 86_400_000, validUntilMs: 86_430_000 });
+    const boundary = await runReviewBuyback(request, { ...deps,
+      now: () => ++reads <= 2 ? 86_400_000 : 86_400_001,
+      loadOperatingBudget: async () => ({ budgetId: 'test-budget', asOfMs: 0, uncoveredDailyOperatingCost: 1_000_000n, retainedOperatingReserve: 0n }),
+    });
+    expect(boundary).toMatchObject({ status: 'blocked', reasons: ['operating_budget_unavailable'] });
+    expect(store.records.get(request.settledBatchId)?.status).toBe('cancelled');
     expect(adapter.submissions).toBe(0);
   });
 
@@ -228,8 +270,8 @@ describe('runReviewBuyback', () => {
 
   test('caps requested amount at eligible review funds and marks purchased only after matching confirmed receipt', async () => {
     const adapter = new MockAdapter();
-    adapter.funds = { ...adapter.funds, usdgBalance: 50_000n, attributableReviewFunds: 50_000n };
-    const tooMuch = await runReviewBuyback({ ...request, settledBatchId: 'over-cap', requestedAmount: 12_001n }, dependencies(adapter).deps);
+    adapter.funds = { ...adapter.funds, usdgBalance: 150000000n, attributableReviewFunds: 150000000n };
+    const tooMuch = await runReviewBuyback({ ...request, settledBatchId: 'over-cap', requestedAmount: 36003000n }, dependencies(adapter).deps);
     expect(tooMuch.status).toBe('blocked');
     expect(adapter.submissions).toBe(0);
 
@@ -249,7 +291,7 @@ describe('runReviewBuyback', () => {
     } satisfies BuybackReceipt };
     const successful = dependencies(confirmed);
     const result = await runReviewBuyback(request, successful.deps);
-    expect(result).toEqual({ status: 'purchased', transactionRef: 'tx-1', amountIn: 10_000n, receivedTokenAmount: 990n });
+    expect(result).toEqual({ status: 'purchased', transactionRef: 'tx-1', amountIn: 30000000n, receivedTokenAmount: 990n });
     expect(successful.store.records.get(request.settledBatchId)?.status).toBe('purchased');
     expect(successful.store.records.get(request.settledBatchId)?.execution.minAmountOut).toBe(990n);
     expect(successful.store.records.get(request.settledBatchId)?.execution.deadlineMs).toBe(1_120_000);
@@ -304,7 +346,7 @@ describe('runReviewBuyback', () => {
   test('conflicting retry inputs cannot reuse an already claimed batch ID', async () => {
     const { deps, adapter } = dependencies();
     await runReviewBuyback(request, deps);
-    const conflict = await runReviewBuyback({ ...request, requestedAmount: 9_999n }, deps);
+    const conflict = await runReviewBuyback({ ...request, requestedAmount: 29997000n }, deps);
     expect(conflict).toEqual({ status: 'blocked', reasons: ['batch_id_conflict'] });
     expect(adapter.submissions).toBe(1);
     const changedRoute = await runReviewBuyback(request, { ...deps, config: { ...config, routerAddress: address('6') } });
@@ -321,6 +363,6 @@ describe('runReviewBuyback', () => {
     expect(first.status).toBe('submitted');
     expect(second.status).toBe('blocked');
     expect(adapter.submissions).toBe(1);
-    expect(await store.reservedAmount(config.reviewTreasuryAddress!)).toBe(10_000n);
+    expect(await store.reservedAmount(config.reviewTreasuryAddress!)).toBe(30000000n);
   });
 });

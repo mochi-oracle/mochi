@@ -1,0 +1,10 @@
+{
+  "enabled": false,
+  "databasePath": "./review-accounting.sqlite",
+  "rpcUrl": "https://replace-with-approved-rpc.invalid",
+  "chainId": "0",
+  "startBlock": "0",
+  "escrowAddress": "TEAM_CONFIG_REQUIRED",
+  "usdgAddress": "CHAIN_CONFIG_REQUIRED",
+  "recipientAddress": "REVIEW_TREASURY_REQUIRED"
+}

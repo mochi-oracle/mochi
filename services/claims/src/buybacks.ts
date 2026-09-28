@@ -1,4 +1,5 @@
 import { planReviewRevenue, type RevenueObligations, type RevenuePlanBlockReason, type ReviewRevenuePlan } from './revenue.ts';
+import { evaluateOperatingPolicy, MINIMUM_PURCHASE, USDG_UNITS, type OperatingBudget, type OperatingPolicy } from './operating-policy.ts';
 
 const MAX_SLIPPAGE_BPS = 1_000;
 const MAX_QUOTE_AGE_MS = 30_000;
@@ -9,6 +10,8 @@ export type BuybackConfig = {
   enabled?: boolean;
   /** Human-auditable policy approval identifier; execution stays blocked without it. */
   reviewedPolicyId?: string;
+  /** Approved cost-accounting version. A fresh snapshot is loaded under the treasury lock. */
+  operatingBudgetId?: string;
   /** Explicit team confirmation that tokenAddress is the intended MOCHI contract. */
   teamConfirmedTokenAddress?: boolean;
   chainId?: bigint;
@@ -100,6 +103,7 @@ export interface BuybackAdapter {
 }
 
 export type PersistedBuyback = {
+  operatingPolicy?: OperatingPolicy;
   settledBatchId: string;
   /** Immutable gross settled-review allocation, required by durable stores. */
   grossReviewRevenue?: bigint;
@@ -139,7 +143,10 @@ export type BuybackBlockedReason =
   | 'invalid_quote'
   | 'stale_or_expired_quote'
   | 'invalid_deadline'
-  | 'batch_id_conflict';
+  | 'batch_id_conflict'
+  | 'operating_budget_unavailable'
+  | 'reserve_top_up_mismatch'
+  | 'below_minimum_batch';
 
 export type BuybackResult =
   | { status: 'disabled'; reason: 'disabled' }
@@ -155,6 +162,8 @@ export type BuybackDependencies = {
   adapter: BuybackAdapter;
   store: BuybackStore;
   now?: () => number;
+  /** Trusted accounting reader, separate from the caller-supplied purchase request. */
+  loadOperatingBudget?: () => Promise<OperatingBudget>;
 };
 
 /**
@@ -183,6 +192,13 @@ export async function runReviewBuyback(request: BuybackRequest, deps: BuybackDep
       return reconcileExisting(record, deps.store, deps.adapter);
     }
 
+    const budget = await deps.loadOperatingBudget?.().catch(() => undefined);
+    const operatingPolicy = evaluateOperatingPolicy(budget, config.operatingBudgetId!, now());
+    if (!operatingPolicy) return { status: 'blocked', reasons: ['operating_budget_unavailable'] };
+    if (request.usdgUnitsPerUsd !== USDG_UNITS) return { status: 'blocked', reasons: ['invalid_request'] };
+    if (request.obligations.reserves !== operatingPolicy.requiredTopUp) return { status: 'blocked', reasons: ['reserve_top_up_mismatch'] };
+    if (request.requestedAmount < MINIMUM_PURCHASE) return { status: 'blocked', reasons: ['below_minimum_batch'] };
+
     const funds = await deps.adapter.readTreasuryFunds({ chainId: config.chainId!, treasuryAddress: config.reviewTreasuryAddress!, usdgAddress: config.usdgAddress! }).catch(() => null);
     if (!funds || funds.chainId !== config.chainId || !sameAddress(funds.treasuryAddress, config.reviewTreasuryAddress!)
       || !sameAddress(funds.usdgAddress, config.usdgAddress!) || funds.attributableReviewFunds === null) {
@@ -194,7 +210,9 @@ export async function runReviewBuyback(request: BuybackRequest, deps: BuybackDep
     if (reservations < 0n) return { status: 'blocked', reasons: ['incomplete_review_fund_attribution'] };
     const unreservedBalance = maxZero(funds.usdgBalance - reservations);
     const unreservedReviewFunds = maxZero(funds.attributableReviewFunds - reservations);
-    const actualAvailable = min(unreservedBalance, unreservedReviewFunds);
+    // Existing earmarked funds stay outside the spendable pool. Only the missing
+    // reserve top-up is deducted from this batch, avoiding a second cost charge.
+    const actualAvailable = maxZero(min(unreservedBalance, unreservedReviewFunds) - operatingPolicy.retainedReserve);
     const revenuePlan = planReviewRevenue({
       grossReviewRevenue: request.grossReviewRevenue,
       availableReviewFunds: actualAvailable,
@@ -234,8 +252,12 @@ export async function runReviewBuyback(request: BuybackRequest, deps: BuybackDep
     execution.deadlineMs = deadlineMs;
 
     // Persist before adapter submission. If submit times out/crashes, retries reconcile this marker and never resubmit blindly.
-    await deps.store.begin({ settledBatchId: batchId, grossReviewRevenue: request.grossReviewRevenue, requestFingerprint, status: 'submitting', execution });
+    await deps.store.begin({ operatingPolicy, settledBatchId: batchId, grossReviewRevenue: request.grossReviewRevenue, requestFingerprint, status: 'submitting', execution });
     const submitAt = now();
+    if (!evaluateOperatingPolicy(budget, config.operatingBudgetId!, submitAt)) {
+      await deps.store.markCancelled(batchId);
+      return { status: 'blocked', reasons: ['operating_budget_unavailable'], revenuePlan };
+    }
     if (!Number.isSafeInteger(submitAt) || submitAt < quote.quotedAtMs || submitAt - quote.quotedAtMs > MAX_QUOTE_AGE_MS || submitAt >= deadlineMs || submitAt >= quote.validUntilMs) {
       await deps.store.markCancelled(batchId);
       return { status: 'blocked', reasons: ['stale_or_expired_quote'], revenuePlan };
@@ -286,7 +308,8 @@ async function reconcileExisting(
 }
 
 function validConfig(config: BuybackConfig): boolean {
-  return typeof config.reviewedPolicyId === 'string' && config.reviewedPolicyId.trim().length > 0
+  return typeof config.operatingBudgetId === 'string' && config.operatingBudgetId.trim().length > 0
+    && typeof config.reviewedPolicyId === 'string' && config.reviewedPolicyId.trim().length > 0
     && config.teamConfirmedTokenAddress === true
     && typeof config.chainId === 'bigint' && config.chainId > 0n
     && isAddress(config.tokenAddress) && isAddress(config.usdgAddress)
@@ -347,6 +370,7 @@ function fingerprint(request: BuybackRequest, config: BuybackConfig): string {
       routerAddress: config.routerAddress!.toLowerCase(),
       maxSlippageBps: config.maxSlippageBps,
       reviewedPolicyId: config.reviewedPolicyId,
+      operatingBudgetId: config.operatingBudgetId,
       teamConfirmedTokenAddress: config.teamConfirmedTokenAddress,
     },
   });

@@ -172,30 +172,31 @@ describe('SqliteBuybackStore', () => {
 
   test('reopened in-flight uncertain submission reconciles to confirmed without a second submit', async () => {
     const { path } = setup();
-    const config: BuybackConfig = { enabled: true, reviewedPolicyId: 'test-only-policy', teamConfirmedTokenAddress: true, chainId: 4663n,
+    const config: BuybackConfig = { enabled: true, reviewedPolicyId: 'test-only-policy', operatingBudgetId: 'test-budget', teamConfirmedTokenAddress: true, chainId: 4663n,
       tokenAddress: '0x5555555555555555555555555555555555555555', usdgAddress: '0x4444444444444444444444444444444444444444',
       reviewTreasuryAddress: '0x2222222222222222222222222222222222222222', tokenRecipientAddress: '0x3333333333333333333333333333333333333333',
       routerAddress: '0x1111111111111111111111111111111111111111', maxSlippageBps: 100 };
-    const request: BuybackRequest = { settledBatchId: 'persistent-pending', grossReviewRevenue: 100n, usdgUnitsPerUsd: 1_000n,
-      obligations: { modelLiabilities: 0n, infrastructureLiabilities: 0n, refunds: 0n, reserves: 0n }, requestedAmount: 10n };
+    const request: BuybackRequest = { settledBatchId: 'persistent-pending', grossReviewRevenue: 100_000_000n, usdgUnitsPerUsd: 1_000_000n,
+      obligations: { modelLiabilities: 0n, infrastructureLiabilities: 0n, refunds: 0n, reserves: 0n }, requestedAmount: 25_000_000n };
     let submissions = 0;
     let reconciled: Reconciliation = { status: 'unknown' };
     const adapter: BuybackAdapter = {
-      async readTreasuryFunds() { return { chainId: 4663n, treasuryAddress: config.reviewTreasuryAddress!, usdgAddress: config.usdgAddress!, usdgBalance: 100n, attributableReviewFunds: 100n }; },
+      async readTreasuryFunds() { return { chainId: 4663n, treasuryAddress: config.reviewTreasuryAddress!, usdgAddress: config.usdgAddress!, usdgBalance: 100_000_000n, attributableReviewFunds: 100_000_000n }; },
       async quoteExactInput(input: BuybackExecution): Promise<BuybackQuote> { return { chainId: input.chainId, routerAddress: input.routerAddress, treasuryAddress: input.treasuryAddress, senderAddress: input.senderAddress, inputToken: input.inputToken, outputToken: input.outputToken, recipient: input.recipient, amountIn: input.amountIn, amountOut: 10n, quotedAtMs: 1_000, validUntilMs: 50_000 }; },
       async submitExactInput() { submissions++; throw new Error('submission outcome ambiguous'); },
       async reconcile() { return reconciled; },
     };
     let store = new SqliteBuybackStore(path);
     registerBatch(store, request.settledBatchId, request.grossReviewRevenue);
-    const first = await runReviewBuyback(request, { config, adapter, store, now: () => 1_000 });
+    const loadOperatingBudget = async () => ({ budgetId: 'test-budget', asOfMs: 1_000, uncoveredDailyOperatingCost: 0n, retainedOperatingReserve: 0n });
+    const first = await runReviewBuyback(request, { config, adapter, store, now: () => 1_000, loadOperatingBudget });
     expect(first.status).toBe('pending_reconciliation');
     store.close();
 
-    reconciled = { status: 'confirmed', receipt: { chainId: 4663n, transactionRef: 'recovered-tx', routerAddress: config.routerAddress!, treasuryAddress: config.reviewTreasuryAddress!, senderAddress: config.reviewTreasuryAddress!, recipient: config.tokenRecipientAddress!, inputToken: config.usdgAddress!, outputToken: config.tokenAddress!, amountIn: 10n, receivedTokenAmount: 9n } };
+    reconciled = { status: 'confirmed', receipt: { chainId: 4663n, transactionRef: 'recovered-tx', routerAddress: config.routerAddress!, treasuryAddress: config.reviewTreasuryAddress!, senderAddress: config.reviewTreasuryAddress!, recipient: config.tokenRecipientAddress!, inputToken: config.usdgAddress!, outputToken: config.tokenAddress!, amountIn: 25_000_000n, receivedTokenAmount: 9n } };
     store = new SqliteBuybackStore(path);
-    const recovered = await runReviewBuyback(request, { config, adapter, store, now: () => 1_000 });
-    expect(recovered).toMatchObject({ status: 'purchased', transactionRef: 'recovered-tx', amountIn: 10n, receivedTokenAmount: 9n });
+    const recovered = await runReviewBuyback(request, { config, adapter, store, now: () => 1_000, loadOperatingBudget });
+    expect(recovered).toMatchObject({ status: 'purchased', transactionRef: 'recovered-tx', amountIn: 25_000_000n, receivedTokenAmount: 9n });
     expect(submissions).toBe(1);
     store.close();
   });
