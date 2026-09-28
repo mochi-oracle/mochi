@@ -124,7 +124,7 @@ struct Verdict { bytes32 queryId; uint8 round; bytes32 docCommit; uint32 schemaI
 - Pricing: `quote(schemaId, n, tokensK)` = Σ over the class mix of `(classBase[c] + classPerK[c] · tokensK)` + `protocolFee` (= max(minProtocolFee, jurorFees · protocolFeeBps / 10000)). Class prices are set by governor from measured GPU-TEE cost + margin. The "from $0.05" headline applies to short documents (issuer notices) at N=3.
 - Paths: `openWithUSDG`, `openShielded` (via `IShieldedPayments.spend`, payerCommit only; refunds go to a payer-chosen `refundTo`), `openWithVoucher` (Anonyma EIP-712 voucher bound to docCommit; draws from Anonyma's prepaid USDG float in the escrow, which `anonyma-settle` tops up weekly, so jurors are always paid from real USDG; NYMA tier is recorded, and the discount is Anonyma's to absorb), `openFeed` (FEED_RUNNER, from `feedBudget`).
 - Lifecycle: `open* → seal → (settle | expand → seal → settle | expire)`; `reseal` if the blockhash window passed; `expire` after `deadline` refunds everything unspent.
-- Settlement waterfall (`settle`, only `MochiVerdicts`): answering jurors are credited 100% of their class fee (claimable by operator); timed-out seats refunded; on VERDICT the protocol fee splits `panelReserveBps` → panel pool, remainder → `MochiStaking.notifyReward`; on HUNG the protocol fee is refunded.
+- Settlement waterfall (`settle`, only `MochiVerdicts`): answering jurors are credited 100% of their class fee (claimable by operator); timed-out seats refunded; on VERDICT the protocol fee splits `panelReserveBps` → panel pool, remainder → `MochiStaking.notifyReward` by default. A governor-only optional review-protocol recipient can receive only that post-panel VERDICT remainder; zero leaves the existing staking path unchanged. The hook remains unset in deployment/default configuration, does not change panel allocation, and does not route HUNG, timeout-seat, expiry, or unspent-deposit refunds. A final reserve policy and review accounting approval are still required before anyone configures it.
 - Guardian pause stops new `open*` only; unpausing is governor-only (timelocked).
 
 ### 4.4 `MochiVerdicts.sol`
@@ -137,7 +137,7 @@ struct Verdict { bytes32 queryId; uint8 round; bytes32 docCommit; uint32 schemaI
 Evaluators stake USDG (min 2,500). `escalate(queryId)` (payer or feed runner; pays panel fee; public or `allowPanelDisclosure`) → 3 evaluators from `IRandomness`. Commit-reveal of `(answerHash, payloadHash)`; 2-of-3 match → `MochiVerdicts.postPanelOutcome` (escalated = true). No majority → HUNG final. `appeal` within 24h → second panel; first-panel evaluators on the losing side of the final majority are slashed 10%. Majority evaluators split the fee.
 
 ### 4.7 `MochiStaking.sol`
-Stake/unstake $MOCHI (7-day cooldown); `notifyReward(usdg)` from escrow and feeds treasury; reward-per-token accumulator; `claim`. Receives only the protocol-fee residual, after jurors and the panel reserve are paid.
+Stake/unstake $MOCHI (7-day cooldown); `notifyReward(usdg)` from escrow and feeds treasury; reward-per-token accumulator; `claim`. Receives the protocol-fee residual after jurors and panel reserve are paid when QueryEscrow's optional governor-controlled review recipient is zero.
 
 ### 4.8 `MochiToken.sol`
 ERC20 + ERC20Permit, 18 decimals, fixed supply minted once to the distribution address. The display name/symbol can be changed only through the timelock (`setMetadata`); balances and the permit domain never change.

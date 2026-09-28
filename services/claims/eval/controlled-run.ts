@@ -3,7 +3,8 @@ import { AsyncLocalStorage } from 'node:async_hooks';
 import { createAciJuror } from '../src/aci-provider.ts';
 import type { Assessment, Juror } from '../src/types.ts';
 import { createClaimChatRequest, type ChatJurorTelemetry } from '../src/providers.ts';
-import { controlledEvaluationFixtures, type ControlledFixture } from './controlled-fixtures.ts';
+import { controlledEvaluationFixtures } from './controlled-fixtures.ts';
+import { representativeEvaluationFixtures, type RepresentativeFixture } from './representative-fixtures.ts';
 import { evaluateClaims, type ClaimEvaluationReport } from './index.ts';
 
 export const CONTROLLED_MODELS = [
@@ -29,33 +30,46 @@ const PRICE_NANODOLLARS: Record<(typeof CONTROLLED_MODELS)[number], { input: num
   'google/gemma-4-31b-it': { input: 150, output: 460 },
 };
 
-export interface ControlledOptions { live: boolean; maxCases: number; caseId?: string; help: boolean }
+export interface ControlledOptions { live: boolean; maxCases: number; caseId?: string; suite: 'controlled' | 'representative'; details: boolean; help: boolean }
 export function parseControlledArgs(args: string[]): ControlledOptions {
-  let live = false, maxCases = controlledEvaluationFixtures.length, help = false;
+  let live = false, maxCases = controlledEvaluationFixtures.length, help = false, details = false;
+  let suite: 'controlled' | 'representative' = 'controlled';
+  let suiteSeen = false;
   let maxCasesSeen = false;
   let caseId: string | undefined;
   for (let index = 0; index < args.length; index++) {
     const arg = args[index]!;
     if (arg === '--live' && !live) live = true;
+    else if (arg === '--details' && !details) details = true;
     else if ((arg === '--help' || arg === '-h') && !help) help = true;
+    else if (arg === '--suite') {
+      if (suiteSeen) throw new Error('Duplicate --suite flag.');
+      suiteSeen = true;
+      const value = args[++index];
+      if (value !== 'controlled' && value !== 'representative') throw new Error('--suite must be controlled or representative.');
+      suite = value;
+      if (!maxCasesSeen) maxCases = suite === 'controlled' ? controlledEvaluationFixtures.length : representativeEvaluationFixtures.length;
+    }
     else if (arg === '--max-cases') {
       if (maxCasesSeen) throw new Error('Duplicate --max-cases flag.');
       maxCasesSeen = true;
       const raw = args[++index];
       if (!raw || !/^[1-9]\d*$/u.test(raw)) throw new Error('--max-cases requires a positive integer.');
       maxCases = Number(raw);
-      if (!Number.isSafeInteger(maxCases) || maxCases > controlledEvaluationFixtures.length) throw new Error(`--max-cases must be between 1 and ${controlledEvaluationFixtures.length}.`);
+      const suiteFixtures = suite === 'controlled' ? controlledEvaluationFixtures : representativeEvaluationFixtures;
+      if (!Number.isSafeInteger(maxCases) || maxCases > suiteFixtures.length) throw new Error(`--max-cases must be between 1 and ${suiteFixtures.length}.`);
     } else if (arg === '--case') {
       if (caseId !== undefined) throw new Error('Duplicate --case flag.');
       if (maxCasesSeen) throw new Error('--case cannot be combined with --max-cases.');
       const raw = args[++index];
-      if (!raw || !controlledEvaluationFixtures.some((item) => item.id === raw)) throw new Error('Unknown controlled case ID.');
+      const suiteFixtures = suite === 'controlled' ? controlledEvaluationFixtures : representativeEvaluationFixtures;
+      if (!raw || !suiteFixtures.some((item) => item.id === raw)) throw new Error('Unknown case ID for the selected suite.');
       caseId = raw;
     } else throw new Error('Unknown or duplicate argument. Supported flags are --live, --max-cases N, and --help.');
   }
   if (caseId !== undefined && maxCasesSeen) throw new Error('--case cannot be combined with --max-cases.');
   if (help && args.some((arg) => arg !== '--help' && arg !== '-h')) throw new Error('--help cannot be combined with other flags.');
-  return { live, maxCases, ...(caseId ? { caseId } : {}), help };
+  return { live, maxCases, ...(caseId ? { caseId } : {}), suite, details, help };
 }
 
 type JurorFactory = (options: Parameters<typeof createAciJuror>[0]) => Juror;
@@ -122,10 +136,11 @@ export async function runControlled(args: string[], env: Record<string, string |
   let options: ControlledOptions;
   try { options = parseControlledArgs(args); }
   catch (error) { write(`${error instanceof Error ? error.message : 'Invalid arguments.'}\n`); return 2; }
-  if (options.help) { write('Usage: bun services/claims/eval/controlled-run.ts [--live] [--max-cases N | --case ID]\nOffline by default; live mode requires PHALA_AI_API_KEY and sends at most three assessments per evidence-bearing fictional case.\n'); return 0; }
+  if (options.help) { write('Usage: bun services/claims/eval/controlled-run.ts [--suite controlled|representative] [--live] [--max-cases N | --case ID] [--details]\nDefault suite is the original synthetic controlled harness. Representative live mode requires PHALA_AI_API_KEY; --details prints private juror explanations and cited passages.\n'); return 0; }
+  const suiteFixtures = options.suite === 'controlled' ? controlledEvaluationFixtures : representativeEvaluationFixtures;
   const fixtures = options.caseId
-    ? controlledEvaluationFixtures.filter((item) => item.id === options.caseId)
-    : controlledEvaluationFixtures.slice(0, options.maxCases);
+    ? suiteFixtures.filter((item) => item.id === options.caseId)
+    : suiteFixtures.slice(0, options.maxCases);
   if (options.live && !env.PHALA_AI_API_KEY) { write('Live mode requires PHALA_AI_API_KEY.\n'); return 2; }
   if (options.live && fixtures.some((item) => CONTROLLED_MODELS.some((model) => {
     try { return new TextEncoder().encode(createClaimChatRequest(model, item.bundle, CONTROLLED_MAX_OUTPUT_TOKENS, { aciVerified: true })).length > MAX_REQUEST_BYTES; }
@@ -138,27 +153,33 @@ export async function runControlled(args: string[], env: Record<string, string |
   let jurors: Juror[] | undefined;
   if (options.live) jurors = createBoundedControlledJurors(env.PHALA_AI_API_KEY!, telemetry, dependencies.jurorFactory ?? createAciJuror, attempts);
   let report: ClaimEvaluationReport;
-  try { report = await (dependencies.evaluate ?? evaluateClaims)({ mode: options.live ? 'live' : 'offline', allowLiveJurors: options.live, jurors, fixtures, now: () => new Date('2026-09-28T00:00:00.000Z') }); }
+  try { report = await (dependencies.evaluate ?? evaluateClaims)({ mode: options.live ? 'live' : 'offline', allowLiveJurors: options.live, jurors, fixtures, includeDetails: options.details }); }
   catch { write('Evaluation failed. Raw provider errors and response data are suppressed.\n'); return 1; }
-  const accepted = new Map(fixtures.map((item) => [item.id, new Set<Assessment>([item.expected, ...((item as ControlledFixture).acceptedOutcomes ?? [])])]));
+  const accepted = new Map(fixtures.map((item) => [item.id, new Set<Assessment>([item.expected, ...((item as RepresentativeFixture).acceptedOutcomes ?? [])])]));
   const cases = report.cases.map((item) => ({ id: item.id, expected: item.expected, acceptedOutcomes: [...(accepted.get(item.id) ?? [])], actual: item.actual,
     acceptedOutcomeMatched: item.actual !== null && (accepted.get(item.id)?.has(item.actual) ?? false), status: item.status,
-    citationCount: item.citationCount, validCitationCount: item.validCitationCount, citationValidity: item.citationCount ? item.validCitationCount / item.citationCount : null,
+    citationCount: item.citationCount, validCitationCount: item.validCitationCount, citationTextMatch: item.citationCount ? item.validCitationCount / item.citationCount : null, semanticCitationReview: 'not_automated',
     rejectedCitationFindings: item.rejectedCitationFindings, failureCount: item.failureCount, elapsedMs: item.elapsedMs }));
   const acceptedCorrect = cases.filter((item) => item.acceptedOutcomeMatched).length;
   const expectedCalls = fixtures.filter((item) => item.bundle.sources.length > 0).length * 3;
-  write(`${JSON.stringify({ mode: report.mode, evaluationLabel: 'Controlled synthetic fictional cases; not an accuracy benchmark.', fixtureCount: report.fixtureCount,
+  write(`${JSON.stringify({ mode: report.mode, evaluationLabel: options.suite === 'representative' ? 'Small human-adjudicated source-backed cases; not a representative accuracy benchmark.' : 'Synthetic deterministic harness fixtures; not an accuracy benchmark.', fixtureCount: report.fixtureCount,
     metrics: { ...report.metrics, acceptedOutcomeCorrectCount: acceptedCorrect, acceptedOutcomeAccuracyAmongResolved: report.metrics.resolvedCount ? acceptedCorrect / report.metrics.resolvedCount : null },
     cases: cases.map((item) => ({ ...item, findingCount: report.cases.find((result) => result.id === item.id)?.findingCount ?? 0,
       agreementCount: report.cases.find((result) => result.id === item.id)?.agreementCount ?? 0,
       findingErrorCodes: report.cases.find((result) => result.id === item.id)?.failureCodes ?? [],
+      ...(options.details ? { details: report.cases.find((result) => result.id === item.id)?.details ?? null } : {}),
       ...(options.live ? { providerFailures: telemetry.filter((event) => event.fixtureId === item.id && event.outcome === 'failure').map(({ model, stage, errorCode }) => ({ model, stage, errorCode })) } : {}) })),
     ...(options.live ? { models: CONTROLLED_MODELS, baseUrl: CONTROLLED_BASE_URL, maximumCalls: CONTROLLED_MAX_CALLS, expectedCalls,
       preRequestReservationAllowanceUsd: CONTROLLED_SPEND_CAP_USD, providerConfiguredSpendLimitUsd: CONTROLLED_SPEND_CAP_USD,
       requestedMaxOutputTokensPerCall: CONTROLLED_MAX_OUTPUT_TOKENS,
       reservationNote: 'The pre-request reservation is an estimate; provider-reported output usage can exceed the requested output token value.',
       providerUsage: usageSummary(telemetry, attempts), estimatedCost: estimatedCost(telemetry, attempts) } : {}),
-    limitations: report.limitations,
+    ...(options.suite === 'representative' ? { semanticCitationRubric: 'Manual reviewer checks each cited passage in context for entailment of the specific claim, scope, time, and qualifiers; exact quote matching alone is not semantic support.' } : {}),
+    offlineAnswersDeterministic: !options.live,
+    scoreInterpretation: options.live ? 'Descriptive results for this fixed small set and these configured models; not an expected launch accuracy estimate.' : 'Expected fixture labels are echoed by deterministic offline stubs; these counts verify the runner only and say nothing about model quality.',
+    limitations: options.suite === 'representative'
+      ? [...report.limitations.filter((note) => !note.startsWith('Fixtures are synthetic') && !note.startsWith('A production quality estimate') && !note.startsWith('The conflicting-source fixture')), 'Twelve hand-selected cases are not sampled to estimate launch-wide accuracy. Citation entailment is not scored automatically; use --details for manual review.']
+      : report.limitations,
   }, null, 2)}\n`);
   return 0;
 }

@@ -17,7 +17,8 @@ import {MochiTypes} from "../libraries/MochiTypes.sol";
 /// Settlement (called by MochiVerdicts for the current round; only seats added THIS round are paid):
 ///   - each new seat that answered: claimable[operatorOf(juror)] += seatFee
 ///   - each new seat that timed out: seatFee refunded
-///   - VERDICT: protocolFee → panelReserveBps to panelPool (transfer), remainder to staking via notifyReward
+///   - VERDICT: protocolFee → panelReserveBps to panelPool (transfer), remainder to staking via notifyReward by default;
+///               an opt-in governor-configured recipient may receive only that post-panel remainder
 ///   - HUNG: protocolFee refunded
 /// Refund routing by pay path: USDG / SHIELDED → transfer to refundTo; ANONYMA → back into anonymaFloat;
 ///   FEED → back into feedBudget.

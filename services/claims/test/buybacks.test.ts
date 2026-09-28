@@ -15,6 +15,8 @@ import {
 const address = (n: string) => `0x${n.repeat(40)}`;
 const config: BuybackConfig = {
   enabled: true,
+  reviewedPolicyId: 'test-only-reviewed-policy',
+  teamConfirmedTokenAddress: true,
   chainId: 4663n,
   tokenAddress: address('1'),
   usdgAddress: address('2'),
@@ -117,6 +119,10 @@ describe('runReviewBuyback', () => {
     expect(adapter.submissions).toBe(0);
     const invalid = await runReviewBuyback(request, { ...deps, config: { ...config, tokenAddress: address('0') } });
     expect(invalid).toEqual({ status: 'blocked', reasons: ['invalid_configuration'] });
+    const unreviewed = await runReviewBuyback(request, { ...deps, config: { ...config, reviewedPolicyId: undefined } });
+    expect(unreviewed).toEqual({ status: 'blocked', reasons: ['invalid_configuration'] });
+    const unconfirmedToken = await runReviewBuyback(request, { ...deps, config: { ...config, teamConfirmedTokenAddress: false } });
+    expect(unconfirmedToken).toEqual({ status: 'blocked', reasons: ['invalid_configuration'] });
   });
 
   test('serializes duplicate concurrent batches and does not submit twice', async () => {

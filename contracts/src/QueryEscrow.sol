@@ -31,6 +31,8 @@ contract QueryEscrow is IQueryEscrow, EIP712, AccessControl, Pausable, Reentranc
     address public verdicts;
     address public panel;
     address public anonymaSigner;
+    /// @notice Optional governance-configured recipient for the VERDICT protocol remainder; zero keeps staking route.
+    address public reviewProtocolRecipient;
 
     mapping(uint8 => uint256) public classBase;
     mapping(uint8 => uint256) public classPerK;
@@ -55,6 +57,8 @@ contract QueryEscrow is IQueryEscrow, EIP712, AccessControl, Pausable, Reentranc
     event StakingSet(address indexed staking);
     event ShieldedSet(address indexed shielded);
     event AnonymaSignerSet(address indexed signer);
+    event ReviewProtocolRecipientSet(address indexed previousRecipient, address indexed newRecipient);
+    event ReviewProtocolRevenueSettled(bytes32 indexed queryId, address indexed recipient, uint256 amount);
 
     error InvalidBps(uint16 bps);
     error ShieldedShortfall();
@@ -125,6 +129,14 @@ contract QueryEscrow is IQueryEscrow, EIP712, AccessControl, Pausable, Reentranc
     function setStaking(IMochiStaking account) external onlyRole(MochiRoles.GOVERNOR_ROLE) {
         staking = account;
         emit StakingSet(address(account));
+    }
+
+    /// @notice Optional integration hook for the VERDICT protocol-fee remainder. Zero preserves staking rewards.
+    /// @dev This changes routing only; it does not transfer any token other than already-escrowed USDG settlement fees.
+    function setReviewProtocolRecipient(address recipient) external onlyRole(MochiRoles.GOVERNOR_ROLE) {
+        address previous = reviewProtocolRecipient;
+        reviewProtocolRecipient = recipient;
+        emit ReviewProtocolRecipientSet(previous, recipient);
     }
 
     /// @notice Sets the shielded payment adapter.
@@ -443,9 +455,15 @@ contract QueryEscrow is IQueryEscrow, EIP712, AccessControl, Pausable, Reentranc
             uint256 rest = protocol - panelCut;
             if (panelCut != 0) usdg.safeTransfer(panel, panelCut);
             if (rest != 0) {
-                usdg.forceApprove(address(staking), rest);
-                staking.notifyReward(rest);
-                usdg.forceApprove(address(staking), 0);
+                address recipient = reviewProtocolRecipient;
+                if (recipient == address(0)) {
+                    usdg.forceApprove(address(staking), rest);
+                    staking.notifyReward(rest);
+                    usdg.forceApprove(address(staking), 0);
+                } else {
+                    usdg.safeTransfer(recipient, rest);
+                    emit ReviewProtocolRevenueSettled(queryId, recipient, rest);
+                }
             }
         } else {
             q.status = MochiTypes.QueryStatus.HUNG;

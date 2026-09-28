@@ -5,7 +5,7 @@ export interface EvaluationFixture {
   description: string;
   bundle: EvidenceBundle;
   expected: Assessment;
-  synthetic: true;
+  synthetic: boolean;
 }
 
 const source = (id: string, title: string, text: string) => ({

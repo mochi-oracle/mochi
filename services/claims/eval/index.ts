@@ -16,6 +16,7 @@ export interface EvaluationCaseResult {
   findingCount: number;
   agreementCount: number;
   elapsedMs: number;
+  details?: { claim: string; sources: Array<{ id: string; url: string; title: string; text: string }>; findings: ClaimReview['findings'] };
 }
 
 export interface ClaimEvaluationReport {
@@ -47,6 +48,7 @@ export interface EvaluationOptions {
   jurors?: Juror[];
   fixtures?: EvaluationFixture[];
   now?: () => Date;
+  includeDetails?: boolean;
 }
 
 const normalize = (text: string) => text.replace(/\s+/gu, ' ').trim();
@@ -96,7 +98,8 @@ export async function evaluateClaims(options: EvaluationOptions = {}): Promise<C
       correct: review.assessment === fixture.expected, citationCount: citations.length, validCitationCount,
       rejectedCitationFindings: review.failures.filter((failure) => failure.code === 'INVALID_CITATION').length,
       failureCount: review.failures.length, failureCodes: review.failures.map((failure) => failure.code),
-      findingCount: review.findings.length, agreementCount: review.agreement.count, elapsedMs });
+      findingCount: review.findings.length, agreementCount: review.agreement.count, elapsedMs,
+      ...(options.includeDetails ? { details: { claim: fixture.bundle.claim, sources: fixture.bundle.sources.map(({ id, url, title, text }) => ({ id, url, title, text })), findings: review.findings } } : {}) });
   }
   const resolved = cases.filter((item) => item.actual !== null);
   const unresolvedCount = cases.filter((item) => item.status === 'unresolved').length;

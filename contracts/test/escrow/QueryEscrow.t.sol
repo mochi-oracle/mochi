@@ -18,6 +18,8 @@ import {MockRandomness} from "./mocks/MockRandomness.sol";
 import {MockStaking} from "./mocks/MockStaking.sol";
 
 contract QueryEscrowTest is Test {
+    event ReviewProtocolRecipientSet(address indexed previousRecipient, address indexed newRecipient);
+    event ReviewProtocolRevenueSettled(bytes32 indexed queryId, address indexed recipient, uint256 amount);
     uint256 constant INTAKE_PK = 0xA11CE;
     uint256 constant ANONYMA_PK = 0xB0B;
     address intake;
@@ -145,6 +147,7 @@ contract QueryEscrowTest is Test {
     }
 
     function testOpenSealVerdictSettlementAndClaim() public {
+        assertEq(escrow.reviewProtocolRecipient(), address(0));
         bytes32 id = _open(3, 1, MochiTypes.PayPath.USDG);
         uint256 starting = token.balanceOf(address(escrow));
         assertEq(starting, _quoteTotal(3, 2));
@@ -167,6 +170,92 @@ contract QueryEscrowTest is Test {
         escrow.claim();
         assertEq(token.balanceOf(OP0), fee0);
         assertEq(escrow.claimable(OP0), 0);
+    }
+
+    function testReviewProtocolRecipientIsGovernorControlledAndCanBeReset() public {
+        address recipient = address(0x300);
+        vm.expectRevert(abi.encodeWithSelector(IAccessControl.AccessControlUnauthorizedAccount.selector, OP0, MochiRoles.GOVERNOR_ROLE));
+        vm.prank(OP0);
+        escrow.setReviewProtocolRecipient(recipient);
+
+        vm.expectEmit(true, true, false, true, address(escrow));
+        emit ReviewProtocolRecipientSet(address(0), recipient);
+        escrow.setReviewProtocolRecipient(recipient);
+        assertEq(escrow.reviewProtocolRecipient(), recipient);
+
+        vm.expectEmit(true, true, false, true, address(escrow));
+        emit ReviewProtocolRecipientSet(recipient, address(0));
+        escrow.setReviewProtocolRecipient(address(0));
+        assertEq(escrow.reviewProtocolRecipient(), address(0));
+    }
+
+    function testOptInRoutesOnlyVerdictRemainderAndPreservesTimeoutRefundAndPanelCut() public {
+        address recipient = address(0x300);
+        escrow.setReviewProtocolRecipient(recipient);
+        bytes32 id = _open(3, 101, MochiTypes.PayPath.USDG);
+        _seal(id);
+        MochiTypes.Query memory q = escrow.getQuery(id);
+        uint256 protocol = q.protocolFee;
+        uint256 panelCut = protocol * 2500 / 10_000;
+        uint256 routed = protocol - panelCut;
+        uint256 timeoutRefund = escrow.seatFeeOf(id, 2);
+        uint256 payerBefore = token.balanceOf(address(this));
+
+        vm.expectEmit(true, true, false, true, address(escrow));
+        emit ReviewProtocolRevenueSettled(id, recipient, routed);
+        escrow.settle(id, 0, MochiTypes.VerdictStatus.VERDICT, 4);
+
+        assertEq(token.balanceOf(recipient), routed);
+        assertEq(token.balanceOf(PANEL), panelCut);
+        assertEq(token.balanceOf(address(this)) - payerBefore, timeoutRefund);
+        assertEq(staking.notified(), 0);
+        assertEq(escrow.claimable(OP0), escrow.seatFeeOf(id, 0));
+        assertEq(escrow.claimable(OP1), escrow.seatFeeOf(id, 1));
+        assertEq(escrow.claimable(OP2), 0);
+        assertEq(token.balanceOf(address(escrow)), escrow.seatFeeOf(id, 0) + escrow.seatFeeOf(id, 1));
+        assertEq(token.balanceOf(recipient) + token.balanceOf(PANEL) + timeoutRefund
+            + token.balanceOf(address(escrow)), q.paid);
+    }
+
+    function testOptInDoesNotRouteHungProtocolOrTimeoutRefunds() public {
+        address recipient = address(0x300);
+        escrow.setReviewProtocolRecipient(recipient);
+        bytes32 id = _open(3, 102, MochiTypes.PayPath.USDG);
+        _seal(id);
+        MochiTypes.Query memory q = escrow.getQuery(id);
+        uint256 timeoutRefund = escrow.seatFeeOf(id, 2);
+        uint256 payerBefore = token.balanceOf(address(this));
+        escrow.settle(id, 0, MochiTypes.VerdictStatus.HUNG, 4);
+        assertEq(token.balanceOf(address(this)) - payerBefore, q.protocolFee + timeoutRefund);
+        assertEq(token.balanceOf(recipient), 0);
+        assertEq(token.balanceOf(PANEL), 0);
+        assertEq(staking.notified(), 0);
+        assertEq(escrow.claimable(OP0), escrow.seatFeeOf(id, 0));
+        assertEq(escrow.claimable(OP1), escrow.seatFeeOf(id, 1));
+        assertEq(token.balanceOf(address(escrow)), escrow.seatFeeOf(id, 0) + escrow.seatFeeOf(id, 1));
+    }
+
+    function testOptInDoesNotRouteExpiryRefundsAndResetUsesDefaultStakingPath() public {
+        address recipient = address(0x300);
+        escrow.setReviewProtocolRecipient(recipient);
+        bytes32 expiring = _open(3, 103, MochiTypes.PayPath.USDG);
+        uint256 expirePaid = escrow.getQuery(expiring).paid;
+        uint256 payerBefore = token.balanceOf(address(this));
+        vm.warp(escrow.getQuery(expiring).deadline + 1);
+        escrow.expire(expiring);
+        assertEq(token.balanceOf(address(this)) - payerBefore, expirePaid);
+        assertEq(token.balanceOf(recipient), 0);
+        assertEq(staking.notified(), 0);
+
+        escrow.setReviewProtocolRecipient(address(0));
+        bytes32 verdict = _open(3, 104, MochiTypes.PayPath.USDG);
+        _seal(verdict);
+        uint256 protocol = escrow.getQuery(verdict).protocolFee;
+        uint256 panelCut = protocol * 2500 / 10_000;
+        escrow.settle(verdict, 0, MochiTypes.VerdictStatus.VERDICT, 0);
+        assertEq(staking.notified(), protocol - panelCut);
+        assertEq(token.balanceOf(PANEL), panelCut);
+        assertEq(token.balanceOf(recipient), 0);
     }
 
     function testDuplicateSettlementAndClaimCannotPayTwice() public {
@@ -238,6 +327,7 @@ contract QueryEscrowTest is Test {
     }
 
     function testVoucherAndFeedOpenAndRefundBudgets() public {
+        escrow.setReviewProtocolRecipient(address(0x300));
         uint256 cost = _quoteTotal(3, 2);
         token.approve(address(escrow), type(uint256).max);
         escrow.fundAnonymaFloat(cost);
@@ -264,6 +354,8 @@ contract QueryEscrowTest is Test {
         escrow.settle(feedId, 0, MochiTypes.VerdictStatus.HUNG, 0);
         (, uint256 feedProtocol) = escrow.quote(1, 3, 2);
         assertEq(escrow.feedBudget(), feedProtocol);
+        assertEq(token.balanceOf(address(0x300)), 0);
+        assertEq(staking.notified(), 0);
     }
 
     function testPauseBlocksOnlyOpen() public {
@@ -444,6 +536,7 @@ contract QueryEscrowTest is Test {
     }
 
     function testVoucherExpansionAndPathRoutedExpiration() public {
+        escrow.setReviewProtocolRecipient(address(0x300));
         uint256 initialCost = _quoteTotal(3, 2);
         escrow.fundAnonymaFloat(initialCost);
         MochiTypes.Provenance memory p = _prov(bytes32(uint256(77)), 2, 0);
@@ -471,6 +564,8 @@ contract QueryEscrowTest is Test {
         vm.warp(escrow.getQuery(expireId).deadline + 1);
         escrow.expire(expireId);
         assertEq(escrow.anonymaFloat(), floatBefore + cost2);
+        assertEq(token.balanceOf(address(0x300)), 0);
+        assertEq(staking.notified(), 0);
     }
 
     function testFuzzSettlementConservesEscrow(uint8 sizeSeed, uint32 tokenSeed, uint256 priceSeed, uint32 maskSeed)

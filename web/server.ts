@@ -1,6 +1,7 @@
 import { resolve, sep } from 'node:path';
 import { realpath, stat } from 'node:fs/promises';
 import { PcsCollateralSource } from '../packages/tee/src/dcap/pcs.ts';
+import { createClaimsProxy } from './claims-proxy.ts';
 import { createClaimsRuntime } from '../services/claims/src/runtime.ts';
 
 // Only this reviewed public shape reaches the browser. Service URLs and RPC credentials stay server-side.
@@ -86,7 +87,7 @@ export function createWebHandler(options: {config?: unknown; dist: string; gatew
 if(import.meta.main) {
   const config=process.env.MOCHI_WEB_CONFIG?await Bun.file(process.env.MOCHI_WEB_CONFIG).json():{enabled:false};
   const handler=createWebHandler({config,dist:new URL('./site/dist',import.meta.url).pathname,
-    gateway:process.env.MOCHI_GATEWAY_URL,indexer:process.env.MOCHI_INDEXER_URL,rpc:process.env.RPC_URL,claims:createClaimsRuntime()});
+    gateway:process.env.MOCHI_GATEWAY_URL,indexer:process.env.MOCHI_INDEXER_URL,rpc:process.env.RPC_URL,claims:process.env.MOCHI_CLAIMS_UPSTREAM?createClaimsProxy(process.env.MOCHI_CLAIMS_UPSTREAM):createClaimsRuntime()});
   const server=Bun.serve({hostname:process.env.HOST??'127.0.0.1',port:Number(process.env.PORT??4321),idleTimeout:60,fetch:handler});
   console.log(`Mochi website listening on port ${server.port}; deployment ${publicConfig(config).enabled?'configured':'pending'}`);
 }

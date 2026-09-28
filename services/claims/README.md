@@ -26,7 +26,7 @@ Configuration example with placeholders to replace:
 
 Choose models with different training lineages where feasible. Distinct configured model strings do not prove independent training or endpoints. The adapter expects JSON-object chat-completion responses; verify compatibility with each provider and test actual costs. No models or paid subscriptions are provisioned automatically.
 
-For Phala, `transport: "phala-aci"` uses the existing ACI verifier to check fresh gateway attestation and signed confidential inference receipts, requires UpToDate TCB status, and rejects debug TDs even if a shared-service debug override is set. Failed verification fails the juror rather than falling back to ordinary inference. This verifies the provider request path only: source retrieval, research sessions and aggregation still run outside a TEE on Railway, so results remain `unattested_research`. It does not activate the confidential document protocol or chain settlement.
+For Phala, `transport: "phala-aci"` uses the existing ACI verifier to check fresh gateway attestation and signed confidential inference receipts, requires UpToDate TCB status, and rejects debug TDs even if a shared-service debug override is set. Failed verification fails the juror rather than falling back to ordinary inference. This verifies the provider request path only: the local mode runs research on the website server, while the optional Phala backend moves it into the existing CVM. The Railway proxy still sees plaintext requests and the browser does not verify this entire execution path, so results remain `unattested_research`. It does not activate the confidential document protocol or chain settlement.
 
 ## Data and access
 
@@ -64,3 +64,7 @@ Research and review requests send `x-mochi-access-token`; sharing additionally s
 `packages/sdk/src/claims.ts` adapts supplied claim evidence into the existing private protocol. The browser client in `web/site/src/claim-protocol-client.js` uses that same framing and the existing attested-intake/wallet lifecycle. Supplied URLs are metadata, not proof that a source was fetched or authenticated. Deployment must be configured and verified before payment is offered; an unpaid research result cannot settle an escrow query.
 
 `src/revenue.ts` computes eligible residual review revenue after known costs, refunds and reserves. `src/buybacks.ts` is a disabled-by-default orchestration boundary for a future approved chain adapter and durable accounting store. It is not a running purchase service: no router, signing wallet, settlement ledger or production store is supplied. Developer/creator fees are outside this boundary. The team's future token address is required before activation; this project never creates that token. Purchases and manual burns are separate actions.
+
+## Hosted invitation mode
+
+`deploy/phala/claims-service/README.md` documents the existing-CVM backend, persistent usage/share storage and fixed-destination Railway proxy. It offers unpaid research without the future token CA. Paid protocol configuration remains separately disabled; hosting research in a CVM does not turn the pilot into a verified private checkout.

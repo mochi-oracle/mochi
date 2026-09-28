@@ -15,7 +15,7 @@ COPY --from=build /app/packages ./packages
 COPY --from=build /app/services/claims ./services/claims
 COPY --from=build /app/services/juror/src/phala-dcap.ts ./services/juror/src/phala-dcap.ts
 COPY --from=build /app/web/site/dist ./web/site/dist
-COPY web/server.ts ./web/server.ts
+COPY web/server.ts web/claims-proxy.ts ./web/
 ENV HOST=0.0.0.0 PORT=8080
 USER bun
 EXPOSE 8080

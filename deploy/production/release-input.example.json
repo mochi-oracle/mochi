@@ -1,0 +1,25 @@
+{
+  "chainId": 4663,
+  "rpcUrl": "https://rpc.mainnet.chain.robinhood.com",
+  "mochiToken": null,
+  "usdg": null,
+  "roles": {
+    "owner": null,
+    "guardian": null,
+    "tokenRecipient": null,
+    "feeTreasury": null,
+    "attestor": null,
+    "feedRunner": null,
+    "orchestrator": null,
+    "indexer": null,
+    "postman": null
+  },
+  "timelockDelaySeconds": 86400,
+  "jurorCount": 9,
+  "jurorClassCounts": [2, 2, 2, 1, 2],
+  "minimumJurorBondMochi": 25000,
+  "initialFeedBudgetUsdg": null,
+  "deploymentFile": null,
+  "identitiesFile": null,
+  "salt": null
+}

@@ -7,6 +7,10 @@ const MAX_DEADLINE_MS = 120_000;
 export type BuybackConfig = {
   /** Omitted/false means the future purchase path stays disabled. */
   enabled?: boolean;
+  /** Human-auditable policy approval identifier; execution stays blocked without it. */
+  reviewedPolicyId?: string;
+  /** Explicit team confirmation that tokenAddress is the intended MOCHI contract. */
+  teamConfirmedTokenAddress?: boolean;
   chainId?: bigint;
   /** Team-issued MOCHI token; this project must not deploy or guess it. */
   tokenAddress?: string;
@@ -97,6 +101,8 @@ export interface BuybackAdapter {
 
 export type PersistedBuyback = {
   settledBatchId: string;
+  /** Immutable gross settled-review allocation, required by durable stores. */
+  grossReviewRevenue?: bigint;
   requestFingerprint: string;
   status: 'submitting' | 'submitted' | 'purchased' | 'failed' | 'cancelled';
   execution: BuybackExecution;
@@ -228,7 +234,7 @@ export async function runReviewBuyback(request: BuybackRequest, deps: BuybackDep
     execution.deadlineMs = deadlineMs;
 
     // Persist before adapter submission. If submit times out/crashes, retries reconcile this marker and never resubmit blindly.
-    await deps.store.begin({ settledBatchId: batchId, requestFingerprint, status: 'submitting', execution });
+    await deps.store.begin({ settledBatchId: batchId, grossReviewRevenue: request.grossReviewRevenue, requestFingerprint, status: 'submitting', execution });
     const submitAt = now();
     if (!Number.isSafeInteger(submitAt) || submitAt < quote.quotedAtMs || submitAt - quote.quotedAtMs > MAX_QUOTE_AGE_MS || submitAt >= deadlineMs || submitAt >= quote.validUntilMs) {
       await deps.store.markCancelled(batchId);
@@ -280,7 +286,9 @@ async function reconcileExisting(
 }
 
 function validConfig(config: BuybackConfig): boolean {
-  return typeof config.chainId === 'bigint' && config.chainId > 0n
+  return typeof config.reviewedPolicyId === 'string' && config.reviewedPolicyId.trim().length > 0
+    && config.teamConfirmedTokenAddress === true
+    && typeof config.chainId === 'bigint' && config.chainId > 0n
     && isAddress(config.tokenAddress) && isAddress(config.usdgAddress)
     && isAddress(config.reviewTreasuryAddress) && isAddress(config.tokenRecipientAddress)
     && isAddress(config.routerAddress)
@@ -338,6 +346,8 @@ function fingerprint(request: BuybackRequest, config: BuybackConfig): string {
       tokenRecipientAddress: config.tokenRecipientAddress!.toLowerCase(),
       routerAddress: config.routerAddress!.toLowerCase(),
       maxSlippageBps: config.maxSlippageBps,
+      reviewedPolicyId: config.reviewedPolicyId,
+      teamConfirmedTokenAddress: config.teamConfirmedTokenAddress,
     },
   });
 }

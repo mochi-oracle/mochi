@@ -1,0 +1,4 @@
+{
+  "extends": "../../../tsconfig.base.json",
+  "include": ["*.ts", "../../../scripts/phala-claims-service.ts", "../../../web/claims-proxy.ts"]
+}
