@@ -40,6 +40,58 @@ export interface ReadOnlyReader {
   feedBudget(escrow: Address): Promise<bigint>;
   paused(escrow: Address): Promise<boolean>;
 }
+export interface TimelockStatusReader {
+  chainId(): Promise<number>;
+  blockTimestamp(): Promise<bigint>;
+  operationTimestamp(timelock: Address, operationId: Hex): Promise<bigint>;
+}
+
+export type TimelockOperationObservation = {
+  phase: "configure" | "activate";
+  operationId: Hex;
+  status: "unscheduled" | "pending" | "ready" | "done" | "read-failed";
+  chainId: number | null;
+  blockTimestamp: string | null;
+  scheduledTimestamp: string | null;
+  nextAction: string;
+  detail: string;
+};
+
+/** Observe OpenZeppelin TimelockController timestamps. This reports chain state only. */
+export async function readTimelockOperationStatus(
+  deployment: ProductionDeployment,
+  batches: { configure: { operationId: Hex }; activation: { operationId: Hex } },
+  reader: TimelockStatusReader,
+): Promise<TimelockOperationObservation[]> {
+  const timelock = deployment.contracts.timelock;
+  const phases = [
+    ["configure", batches.configure.operationId],
+    ["activate", batches.activation.operationId],
+  ] as const;
+  let actualChainId: number;
+  try { actualChainId = await reader.chainId(); }
+  catch {
+    return phases.map(([phase, operationId]) => ({ phase, operationId, status: "read-failed", chainId: null, blockTimestamp: null, scheduledTimestamp: null, nextAction: "Retry the public read-only chain ID check; do not infer readiness from unavailable data.", detail: "RPC chain ID read failed; provider details suppressed" }));
+  }
+  if (actualChainId !== 4663 || actualChainId !== deployment.chainId) {
+    return phases.map(([phase, operationId]) => ({ phase, operationId, status: "read-failed", chainId: actualChainId, blockTimestamp: null, scheduledTimestamp: null, nextAction: "Use the Robinhood Chain mainnet RPC (chain ID 4663) matching the deployment and repeat the read-only check.", detail: `RPC chain ID=${actualChainId}; deployment=${deployment.chainId}; expected=4663` }));
+  }
+  let now: bigint;
+  try { now = await reader.blockTimestamp(); }
+  catch {
+    return phases.map(([phase, operationId]) => ({ phase, operationId, status: "read-failed", chainId: actualChainId, blockTimestamp: null, scheduledTimestamp: null, nextAction: "Retry the public read-only timelock status check; do not infer readiness from unavailable data.", detail: "block timestamp read failed; provider details suppressed" }));
+  }
+  return Promise.all(phases.map(async ([phase, operationId]): Promise<TimelockOperationObservation> => {
+    if (!timelock) return { phase, operationId, status: "read-failed", chainId: actualChainId, blockTimestamp: now.toString(), scheduledTimestamp: null, nextAction: "Supply the deployed timelock address and rerun the public read-only status check.", detail: "deployment has no timelock address" };
+    let timestamp: bigint;
+    try { timestamp = await reader.operationTimestamp(timelock, operationId); }
+    catch { return { phase, operationId, status: "read-failed", chainId: actualChainId, blockTimestamp: now.toString(), scheduledTimestamp: null, nextAction: "Retry the public read-only timelock status check; do not infer readiness from unavailable data.", detail: "operation timestamp read failed; provider details suppressed" }; }
+    if (timestamp === 0n) return { phase, operationId, status: "unscheduled", chainId: actualChainId, blockTimestamp: now.toString(), scheduledTimestamp: null, nextAction: phase === "configure" ? "After deployment and identity review, have the approved multisig schedule the configure batch." : "After configure execution, enrollment, service checks, and activation readiness review, have the approved multisig schedule the separate activation batch.", detail: "timelock operation is not scheduled" };
+    if (timestamp === 1n) return { phase, operationId, status: "done", chainId: actualChainId, blockTimestamp: now.toString(), scheduledTimestamp: null, nextAction: phase === "configure" ? "Proceed to enrollment and verify identities, funding, and service readiness while QueryEscrow remains paused." : "The activation operation is done; review release evidence and the bounded paid smoke-test gate before offering paid access.", detail: "timelock operation is done" };
+    if (timestamp > now) return { phase, operationId, status: "pending", chainId: actualChainId, blockTimestamp: now.toString(), scheduledTimestamp: timestamp.toString(), nextAction: `Wait until Unix timestamp ${timestamp.toString()} (the full timelock delay), then repeat readiness checks before approved-multisig execution.`, detail: `operation is pending until ${timestamp.toString()}` };
+    return { phase, operationId, status: "ready", chainId: actualChainId, blockTimestamp: now.toString(), scheduledTimestamp: timestamp.toString(), nextAction: "The timelock delay has elapsed; repeat all phase prerequisites and off-chain readiness checks, then have the approved multisig execute this operation.", detail: `operation is ready by timestamp (scheduled=${timestamp.toString()}, current=${now.toString()})` };
+  }));
+}
 
 function address(value: unknown, field: string, missing: string[], errors: string[]): void {
   if (value == null || value === "") { missing.push(field); return; }
@@ -138,7 +190,7 @@ export async function runReadOnlyPreflight(deployment: ProductionDeployment, inp
   return { checked: checks.length, passed: checks.filter((x) => x.ok).length, failed: checks.filter((x) => !x.ok).length, checks, checksPassed: checks.length > 0 && checks.every((x) => x.ok), status: "read-only-checks-only" as const };
 }
 
-export function buildProductionRelease(input: ReleaseInput, options: { deployment?: ProductionDeployment; identities?: IdentityInput; preflight?: Awaited<ReturnType<typeof runReadOnlyPreflight>> } = {}) {
+export function buildProductionRelease(input: ReleaseInput, options: { deployment?: ProductionDeployment; identities?: IdentityInput; preflight?: Awaited<ReturnType<typeof runReadOnlyPreflight>>; timelockOperations?: TimelockOperationObservation[] } = {}) {
   const deployment = options.deployment;
   const identities = options.identities;
   const roles = {
@@ -187,6 +239,7 @@ export function buildProductionRelease(input: ReleaseInput, options: { deploymen
         const full = { ...identities, salt } as IdentityInput;
         batches = {
           configure: buildPhalaBatch(deployment, full, "schedule", "configure"),
+          configurationExecution: buildPhalaBatch(deployment, full, "execute", "configure"),
           activation: buildPhalaBatch(deployment, full, "schedule", "activate"),
           activationExecute: buildPhalaBatch(deployment, full, "execute", "activate"),
         };
@@ -221,11 +274,13 @@ export function buildProductionRelease(input: ReleaseInput, options: { deploymen
     preflight: options.preflight ?? { status: "not-run", note: "Supply --check-rpc to perform public read-only checks; no keys or writes are used." },
     status: blockers.length ? "blocked-on-operational-inputs" : "review-required",
     blockers,
+    timelockOperations: options.timelockOperations ?? { status: "not-checked", note: "Supply --check-timelock to observe timelock operation timestamps; these observations do not establish readiness." },
     reviewPayloads: batches ? {
-      configuration: { status: "built-offline-not-scheduled", ...batches.configure as object },
-      activation: { status: "built-offline-not-ready-to-schedule", readiness: { caAddressAndDecimalsChecked, readOnlyChainChecksPassed: preflightPassed, offchainServiceChecksRequired: true, readyToSchedule: false }, ...batches.activation as object },
+      configuration: { status: "built-offline-not-scheduled", ...(options.timelockOperations?.find((x) => x.phase === "configure") ? { timelockObservation: options.timelockOperations.find((x) => x.phase === "configure") } : {}), ...batches.configure as object },
+      activation: { status: "built-offline-not-ready-to-schedule", ...(options.timelockOperations?.find((x) => x.phase === "activate") ? { timelockObservation: options.timelockOperations.find((x) => x.phase === "activate") } : {}), readiness: { caAddressAndDecimalsChecked, readOnlyChainChecksPassed: preflightPassed, offchainServiceChecksRequired: true, readyToSchedule: false }, ...batches.activation as object },
+      configurationExecution: { status: "review-only-do-not-submit", ...batches.configurationExecution as object },
       activationExecution: { status: "review-only-do-not-submit", ...batches.activationExecute as object },
-    } : { configuration: null, activation: null, activationExecution: null },
+    } : { configuration: null, configurationExecution: null, activation: null, activationExecution: null },
     phases: [
       { id: "validate", order: 1, action: "Read-only verify RPC chain, deployment, token metadata, roles and configured funding." },
       { id: deployment ? "deploy-already-present" : "deploy-paused", order: 2, action: deployment ? "Review supplied deployment and confirm QueryEscrow is paused on chain." : "Deploy production contracts paused and hand governance to reviewed multisig-backed timelock.", ...(deployment ? {} : { commandTemplate: "bun scripts/deploy-local.ts --mainnet --rpc <HTTPS_RPC> --key-file <PROTECTED_DEPLOYER_KEY_FILE> --owner <TIMELOCK_MULTISIG> --guardian <GUARDIAN> --usdg <USDG_CA> --mochi-token <TEAM_MOCHI_CA> --shielded privacy-pools --randomness drand --out deployments/mainnet.json" }), requires: ["phase validate complete"] },
@@ -242,14 +297,17 @@ function readJson<T>(path: string): T { return JSON.parse(readFileSync(resolve(p
 async function main() {
   const argv = process.argv.slice(2);
   const inputPath = argv[0];
-  if (!inputPath || argv.some((x) => ["--execute", "--yes"].includes(x))) throw new Error("usage: bun scripts/production-release.ts <public-release-input.json> [--check-rpc] [--out <plan.json>]; execution flags are unsupported");
-  const allowed = new Set([inputPath, "--check-rpc", "--out"]);
+  if (!inputPath || argv.some((x) => ["--execute", "--yes"].includes(x))) throw new Error("usage: bun scripts/production-release.ts <public-release-input.json> [--check-rpc] [--check-timelock] [--out <plan.json>]; execution flags are unsupported");
+  const allowed = new Set([inputPath, "--check-rpc", "--check-timelock", "--out"]);
   for (let i = 1; i < argv.length; i++) { if (argv[i] === "--out") { if (!argv[i + 1]) throw new Error("--out requires a path"); allowed.add(argv[++i]!); } else if (!allowed.has(argv[i]!)) throw new Error(`unknown argument: ${argv[i]}`); }
   const input = readJson<ReleaseInput>(inputPath);
   const deployment = input.deploymentFile ? readJson<ProductionDeployment>(input.deploymentFile) : undefined;
   const identities = input.identitiesFile ? readJson<IdentityInput>(input.identitiesFile) : undefined;
+  // Run all pure input/deployment/identity validation before opening the RPC transport.
+  buildProductionRelease(input, { deployment, identities });
   let preflight: Awaited<ReturnType<typeof runReadOnlyPreflight>> | undefined;
-  if (argv.includes("--check-rpc")) {
+  let timelockOperations: TimelockOperationObservation[] | undefined;
+  if (argv.includes("--check-rpc") || argv.includes("--check-timelock")) {
     if (!deployment) throw new Error("--check-rpc requires deploymentFile");
     const rpcUrl = input.rpcUrl ?? deployment.rpcUrl;
     if (!rpcUrl) throw new Error("--check-rpc requires rpcUrl in release input or deployment");
@@ -270,9 +328,24 @@ async function main() {
       feedBudget: (escrow) => client.readContract({ address: escrow, abi: escrowBudgetAbi, functionName: "feedBudget" }),
       paused: (escrow) => client.readContract({ address: escrow, abi: pauseAbi, functionName: "paused" }),
     };
-    preflight = await runReadOnlyPreflight(deployment, input, reader, identities);
+    const batchInput = deployment && identities ? (() => {
+      const salt = (input.salt ?? identities.salt) as Hex | undefined;
+      if (!salt) return undefined;
+      const full = { ...identities, salt } as IdentityInput;
+      return { configure: buildPhalaBatch(deployment, full, "schedule", "configure"), activation: buildPhalaBatch(deployment, full, "schedule", "activate") };
+    })() : undefined;
+    if (argv.includes("--check-rpc")) preflight = await runReadOnlyPreflight(deployment, input, reader, identities);
+    if (argv.includes("--check-timelock")) {
+      if (!batchInput) throw new Error("--check-timelock requires deploymentFile, identitiesFile, and a valid salt");
+      const timestampAbi = parseAbi(["function getTimestamp(bytes32 id) view returns (uint256)"]);
+      timelockOperations = await readTimelockOperationStatus(deployment, batchInput, {
+        chainId: () => client.getChainId(),
+        blockTimestamp: async () => BigInt((await client.getBlock({ blockTag: "latest" })).timestamp),
+        operationTimestamp: (timelock, operationId) => client.readContract({ address: timelock, abi: timestampAbi, functionName: "getTimestamp", args: [operationId] }),
+      });
+    }
   }
-  const plan = buildProductionRelease(input, { deployment, identities, preflight });
+  const plan = buildProductionRelease(input, { deployment, identities, preflight, timelockOperations });
   const output = JSON.stringify(plan, null, 2) + "\n";
   const outIndex = argv.indexOf("--out");
   if (outIndex >= 0) writeFileSync(resolve(argv[outIndex + 1]!), output, { mode: 0o600 });

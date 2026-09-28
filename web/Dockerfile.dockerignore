@@ -9,6 +9,7 @@
 !web
 !web/server.ts
 !web/claims-proxy.ts
+!web/deployment-config.ts
 !web/Dockerfile
 !web/site
 !web/site/**

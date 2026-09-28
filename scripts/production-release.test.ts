@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { buildProductionRelease, runReadOnlyPreflight, type ProductionDeployment, type ReadOnlyReader, type ReleaseInput } from "./production-release.ts";
+import { buildProductionRelease, readTimelockOperationStatus, runReadOnlyPreflight, type ProductionDeployment, type ReadOnlyReader, type ReleaseInput } from "./production-release.ts";
 import type { Input } from "./phala-batch.ts";
 import type { Address, Hex } from "viem";
 import { decodeFunctionData, encodeFunctionData, parseAbi } from "viem";
@@ -73,8 +73,12 @@ test("offline no-CA fixture creates separate configure and activation review pay
   expect((plan.reviewPayloads.configuration as unknown as { operationId: string }).operationId).not.toBe((plan.reviewPayloads.activation as unknown as { operationId: string }).operationId);
   const configure = plan.reviewPayloads.configuration as unknown as { callCount: number; payloads: Hex[]; targets: Address[]; delaySeconds: number };
   const activate = plan.reviewPayloads.activation as unknown as { callCount: number; payloads: Hex[]; targets: Address[]; delaySeconds: number };
+  const configureExecution = plan.reviewPayloads.configurationExecution as unknown as { operationId: Hex; action: string };
   expect(configure.callCount).toBeGreaterThan(1);
   expect(configure.delaySeconds).toBe(86400);
+  expect(configureExecution).toBeTruthy();
+  expect(configureExecution.action).toBe("execute");
+  expect(configureExecution.operationId).toBe((plan.reviewPayloads.configuration as unknown as { operationId: Hex }).operationId);
   expect(configure.payloads).not.toContain(encodeFunctionData({ abi: parseAbi(["function unpause()"]), functionName: "unpause" }));
   expect(activate.callCount).toBe(1);
   expect(activate.delaySeconds).toBe(86400);
@@ -162,4 +166,52 @@ test("CA address/decimals check requires successful chain, code and precision re
   const wrongChain = { ...preflight, checks: preflight.checks.map((x) => x.id === "chain-id" ? { ...x, ok: false } : x) };
   const blocked = buildProductionRelease(input, { deployment, identities: identitiesFixture(), preflight: wrongChain });
   expect(blocked.reviewPayloads.activation).toMatchObject({ readiness: { caAddressAndDecimalsChecked: false } });
+});
+
+test("timelock observations classify unscheduled, pending, ready, and done at timestamp boundaries", async () => {
+  const batches = { configure: { operationId: `0x${"11".repeat(32)}` as Hex }, activation: { operationId: `0x${"22".repeat(32)}` as Hex } };
+  const times = new Map<Hex, bigint>([[batches.configure.operationId, 0n], [batches.activation.operationId, 100n]]);
+  const reader = { async chainId() { return 4663; }, async blockTimestamp() { return 100n; }, async operationTimestamp(_timelock: Address, id: Hex) { return times.get(id)!; } };
+  const first = await readTimelockOperationStatus(deploymentFixture(), batches, reader);
+  expect(first.map((x) => x.status)).toEqual(["unscheduled", "ready"]);
+  expect(first[0]).toMatchObject({ blockTimestamp: "100", scheduledTimestamp: null });
+  times.set(batches.configure.operationId, 101n);
+  times.set(batches.activation.operationId, 1n);
+  const second = await readTimelockOperationStatus(deploymentFixture(), batches, reader);
+  expect(second.map((x) => x.status)).toEqual(["pending", "done"]);
+  expect(second[0]?.nextAction).toContain("101");
+  expect(second[1]?.nextAction).toContain("smoke-test");
+});
+
+test("timelock read failure is explicit and cannot change activation readiness", async () => {
+  const deployment = deploymentFixture();
+  const identities = identitiesFixture();
+  const batches = { configure: { operationId: `0x${"11".repeat(32)}` as Hex }, activation: { operationId: `0x${"22".repeat(32)}` as Hex } };
+  const observations = await readTimelockOperationStatus(deployment, batches, {
+    async chainId() { return 4663; }, async blockTimestamp() { return 100n; }, async operationTimestamp() { throw new Error("provider credential should not leak"); },
+  });
+  expect(observations.map((x) => x.status)).toEqual(["read-failed", "read-failed"]);
+  expect(JSON.stringify(observations)).not.toContain("credential");
+  const plan = buildProductionRelease({ ...valid(), usdg: addr(31), deploymentFile: "fixture", identitiesFile: "fixture", roles: { owner: addr(2), guardian: addr(3) } }, { deployment, identities, timelockOperations: observations });
+  expect(plan.reviewPayloads.activation).toMatchObject({ status: "built-offline-not-ready-to-schedule", readiness: { readyToSchedule: false }, timelockObservation: { status: "read-failed" } });
+});
+
+test("timelock check requires the expected RPC chain before reading operation status", async () => {
+  let timestampReads = 0;
+  const batches = { configure: { operationId: `0x${"11".repeat(32)}` as Hex }, activation: { operationId: `0x${"22".repeat(32)}` as Hex } };
+  const observations = await readTimelockOperationStatus(deploymentFixture(), batches, {
+    async chainId() { return 1; }, async blockTimestamp() { return 100n; }, async operationTimestamp() { timestampReads++; return 1n; },
+  });
+  expect(observations.map((x) => x.status)).toEqual(["read-failed", "read-failed"]);
+  expect(observations[0]).toMatchObject({ chainId: 1, blockTimestamp: null });
+  expect(timestampReads).toBe(0);
+});
+
+test("timelock block timestamp read failure returns unknown statuses", async () => {
+  const batches = { configure: { operationId: `0x${"11".repeat(32)}` as Hex }, activation: { operationId: `0x${"22".repeat(32)}` as Hex } };
+  const observations = await readTimelockOperationStatus(deploymentFixture(), batches, {
+    async chainId() { return 4663; }, async blockTimestamp() { throw new Error("provider failure"); }, async operationTimestamp() { return 1n; },
+  });
+  expect(observations.map((x) => x.status)).toEqual(["read-failed", "read-failed"]);
+  expect(observations[0]).toMatchObject({ chainId: 4663, blockTimestamp: null });
 });

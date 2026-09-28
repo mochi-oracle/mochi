@@ -4,7 +4,7 @@ import { verifyStyles } from '../site/scripts/verify-build';
 
 test('deployment refuses the missing CSS build configs that broke production', () => {
   expect(() => validateWebBuildFiles([...requiredWebBuildFiles])).not.toThrow();
-  for (const file of ['web/site/postcss.config.js', 'web/site/tailwind.config.js']) {
+  for (const file of ['web/site/postcss.config.js', 'web/site/tailwind.config.js', 'web/deployment-config.ts']) {
     expect(() => validateWebBuildFiles(requiredWebBuildFiles.filter(path => path !== file))).toThrow(file);
   }
 });

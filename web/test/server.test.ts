@@ -21,7 +21,8 @@ test('only successful public assets are cached; HTML and API responses stay priv
  } finally {await rm(fixture,{recursive:true,force:true})}
 });
 test('public config never forwards RPC or service secrets',()=>{
- const value=publicConfig({enabled:true,chainId:4663,contracts:{queryEscrow:'0x123',privateKey:'secret'},rpcUrl:'https://private/key',apiKey:'secret',jurySizes:[3]});
+ const addr='0x'+'11'.repeat(20), key='0x'+'22'.repeat(32);
+ const value=publicConfig({enabled:true,chainId:4663,contracts:{queryEscrow:addr,jurorRegistry:addr,verdicts:addr,usdg:addr,receiptAnchor:addr,privateKey:'secret'},intakeAddress:addr,intakeMeasurement:key,receiptPublicKey:key,rpcUrl:'https://private/key',apiKey:'secret',jurySizes:[3]});
  expect(JSON.stringify(value)).not.toContain('secret');expect(JSON.stringify(value)).not.toContain('private/key');expect(value.rpcUrl).toBe('/rpc');
 });
 test('claim routes use their own handler and inherit website security headers',async()=>{
