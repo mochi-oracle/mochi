@@ -1,3 +1,5 @@
+import { boundedHttpsFetch } from "./http.ts";
+export { boundedHttpsFetch } from "./http.ts";
 import { docCommit, docHash, ZERO32 } from "@mochi/core";
 import { aad, AttestationDocSchema, IntakeResultSchema } from "@mochi/protocol";
 import { DcapQuoteVerifier, PcsCollateralSource, keyBinding, parseTdxQuote, parseTdxReportData, recoverProvenance, seal, tdxMeasurement, type Quote } from "@mochi/tee";
@@ -8,7 +10,7 @@ const REHEARSAL_ESCROW = `0x${"00".repeat(20)}` as const;
 const FIXTURE = "Synthetic hardware rehearsal document. It contains no user or production data.";
 const encode = (value: unknown) => new TextEncoder().encode(JSON.stringify(value));
 const fail = (message: string): never => { throw new Error(message); };
-const MAX_RESPONSE = 2 * 1024 * 1024;
+
 
 function assertLocalOrTls(raw: string): URL {
   const url = new URL(raw);
@@ -42,36 +44,6 @@ export function parseVerifyArgs(args: string[]): { baseUrl: string; measurement:
   return { baseUrl, measurement };
 }
 
-async function boundedHttpsFetch(input: string | URL | Request, init?: RequestInit): Promise<Response> {
-  const url = new URL(typeof input === "string" || input instanceof URL ? input.toString() : input.url);
-  if (url.protocol !== "https:" || url.username || url.password || url.hash) throw new Error("HTTPS request rejected");
-  const host = url.hostname.toLowerCase();
-  const pcsHost = host === "api.trustedservices.intel.com" && /^\/(?:tdx|sgx)\/certification\/v4\//u.test(url.pathname);
-  const rootHost = host === "certificates.trustedservices.intel.com" && url.pathname === "/IntelSGXRootCA.der";
-  if (!pcsHost && !rootHost) throw new Error("Collateral host rejected");
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 15_000);
-  try {
-    const response = await fetch(url, { ...init, redirect: "error", signal: controller.signal });
-    if (!response.ok || response.redirected || !response.body) throw new Error("Collateral fetch failed");
-    const declared = Number(response.headers.get("content-length") ?? "0");
-    if (Number.isFinite(declared) && declared > MAX_RESPONSE) throw new Error("Collateral response too large");
-    const reader = response.body.getReader();
-    const chunks: Uint8Array[] = [];
-    let total = 0;
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      total += value.byteLength;
-      if (total > MAX_RESPONSE) { await reader.cancel(); throw new Error("Collateral response too large"); }
-      chunks.push(value);
-    }
-    const bytes = new Uint8Array(total);
-    let offset = 0;
-    for (const chunk of chunks) { bytes.set(chunk, offset); offset += chunk.byteLength; }
-    return new Response(bytes, { status: response.status, headers: response.headers });
-  } finally { clearTimeout(timer); }
-}
 
 async function boundedEndpointFetch(url: URL, init?: RequestInit): Promise<Response> {
   const local = ["localhost", "127.0.0.1", "::1", "[::1]"].includes(url.hostname);
