@@ -42,6 +42,8 @@ export interface ClaimReview {
   integrityHash: string;
   execution: 'unattested_research';
 }
+export interface ClaimCorrection { note: string; createdAt: string }
+export interface PublicClaimRecord { review: ClaimReview; corrections: ClaimCorrection[] }
 export interface ResearchInput { claim: string; sourceUrls?: string[] }
 export type Researcher = (input: ResearchInput) => Promise<EvidenceBundle>;
 export interface Juror { id: string; model: string; assess(bundle: EvidenceBundle, signal?: AbortSignal): Promise<unknown> }

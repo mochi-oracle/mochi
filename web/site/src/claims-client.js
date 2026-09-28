@@ -49,5 +49,7 @@ export const claimsApi = {
   research: (body, { token, signal } = {}) => request('/research', { method: 'POST', body: JSON.stringify(body), token, signal }),
   review: (body, { token, signal } = {}) => request('/reviews', { method: 'POST', body: JSON.stringify(body), token, signal }),
   share: (id, body, { token, reviewToken, signal } = {}) => request(`/reviews/${encodeURIComponent(id)}/share`, { method: 'POST', body: JSON.stringify(body), token, reviewToken, signal }),
+  correct: (id, note, { token, reviewToken, signal } = {}) => request(`/shared/${encodeURIComponent(id)}/corrections`, { method: 'POST', body: JSON.stringify({ note, consent: true }), token, reviewToken, signal }),
+  unpublish: (id, { token, reviewToken, signal } = {}) => request(`/shared/${encodeURIComponent(id)}/unpublish`, { method: 'POST', body: JSON.stringify({ confirm: true }), token, reviewToken, signal }),
   shared: (id, { signal } = {}) => request(`/shared/${encodeURIComponent(id)}`, { signal }),
 };

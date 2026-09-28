@@ -4,6 +4,18 @@
 
 `buyback-sqlite-store.ts` is a durable local persistence implementation, not a production treasury service. It stores serialized bigint values exactly, keeps in-flight reservations active, and takes SQLite-backed process-shared locks around a batch and treasury. Lock waiting is bounded; only a definitely dead PID is reclaimed. A possibly reused/live PID is left locked. An ambiguous submission remains `submitting`; the orchestration layer must reconcile it by the stable batch id and must never submit it again blindly. Records with changed request/config fingerprints conflict in `runReviewBuyback`.
 
+## SQLite recovery
+
+Use `bun scripts/claims-sqlite-backup.ts` for an online consistent snapshot of a claims or accounting SQLite file. The command includes committed WAL data, runs SQLite integrity checks, uses mode `0600` for new files, refuses existing destinations, and reports only table names and row counts. Start with a synthetic/local fixture; never copy production accounting data into a test fixture or public artifact.
+
+```sh
+bun scripts/claims-sqlite-backup.ts backup ./accounting.sqlite ./accounting-backup.sqlite
+bun scripts/claims-sqlite-backup.ts verify ./accounting-backup.sqlite
+bun scripts/claims-sqlite-backup.ts restore ./accounting-backup.sqlite ./accounting-restored.sqlite
+```
+
+Keep backups in access-restricted storage and transfer them only through the team's approved encrypted backup process. This repository does not schedule backups or configure offsite retention. For an operational restore, stop all writers, restore to a new path, verify integrity and row counts, preserve the current database under a recovery name, and reconcile records against chain settlement evidence before using the ledger for any treasury decision.
+
 The settlement ledger API accepts only events typed as `settled_customer_review`. Exact event replay is a no-op; replay with changed fields is rejected. Each batch has one immutable allocation, and an event cannot be allocated into another batch. Durable buyback reservations require that allocation and require its gross amount to match the buyback request. Settlement ingestion and allocation must be fed from an authoritative, independently reconciled source. Do not count customer deposits, creator/developer fees, or unconfirmed amounts as review revenue.
 
 ## Safe use today

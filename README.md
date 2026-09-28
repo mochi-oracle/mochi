@@ -12,12 +12,12 @@
 
 Mochi helps people inspect claims in crypto and AI posts, articles, and announcements. Give it one exact claim and, if you have them, links to sources. It gathers bounded public evidence, asks three independently configured models to read that same evidence, and lays out their findings, cited passages, limitations, and disagreements. The point is to make the reasoning easier to examine—not to ask you to trust a single confident-sounding answer.
 
-**[Preview the claim research interface](https://web-production-fb1a0.up.railway.app/check/)** · Live model reviews are currently disabled while provider configuration is pending.
+**[Open the claim research preview](https://web-production-fb1a0.up.railway.app/check/)** · Live pilot access is invitation-only; provide public source links. The pilot is unpaid.
 
 ## How it works
 
-1. **Choose a claim.** Submit a short, exact statement and optionally up to five HTTPS source URLs. Mochi asks for consent before external research.
-2. **Gather evidence.** It retrieves a limited amount of public HTML or plain text, checks supplied sources, and can use web search when that provider is configured. It shows when external discovery is unavailable.
+1. **Choose a claim.** Submit a short, exact statement and public HTTPS source URLs. Mochi asks for consent before external research.
+2. **Gather evidence.** It retrieves a limited amount of public HTML or plain text from the supplied links. General web search is not configured for the current invitation pilot.
 3. **Compare readings.** Three separately configured models receive the same evidence. Mochi checks that cited passages match the retrieved text and displays each reading, along with uncertainty and disagreement. A split or lack of useful evidence stays unresolved; it is not turned into a majority-backed verdict.
 4. **Decide what to do.** Review the evidence and limitations yourself. Sharing a result is a separate, explicit choice.
 
@@ -25,7 +25,7 @@ This first pilot is for researching one claim at a time. It does not extract eve
 
 ## Current status
 
-The interface is built, tested, and deployed as a research preview. **Real model reviews are not enabled yet.** Synthetic browser fixtures and a successful public-source retrieval exercise check parts of the implementation; they do not establish model accuracy. The pilot does not take payments. The discussed five-cent target is not a price charged by the current service.
+The interface is live as an invitation-only research pilot with real model reviews. Its small hand-selected evaluation does not establish model accuracy. The pilot does not take payments. The discussed five-cent target is not a price charged by the current service.
 
 Confidential document review is a separate protocol and is not activated here. This pilot does not run in a trusted execution environment (TEE), publish a chain receipt, or settle anything on-chain. See the [claim research implementation notes](services/claims/README.md) for configuration, data handling, limits, and the checks completed so far.
 
@@ -43,7 +43,7 @@ cd ../..
 bun web/server.ts
 ```
 
-Then open `http://localhost:4321/check/` (or the local URL printed by the server). The interface remains in its disabled state unless server-side pilot settings and providers are configured. Keep provider credentials out of the browser and repository; use the hosting environment as described in the [configuration guide](services/claims/README.md). Local browser fixtures use synthetic findings and are not a quality benchmark.
+Then open `http://localhost:4321/check/` (or the local URL printed by the server). The local interface remains disabled unless server-side pilot settings and providers are configured. Keep provider credentials out of the browser and repository; use the hosting environment as described in the [configuration guide](services/claims/README.md). Local browser fixtures use synthetic findings and are not a quality benchmark.
 
 ## Project notes
 

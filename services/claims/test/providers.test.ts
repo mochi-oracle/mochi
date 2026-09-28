@@ -73,6 +73,20 @@ describe('createChatJuror', () => {
     const malformed = createChatJuror({ id: 'j', model: 'm', baseUrl: 'https://provider.test', fetcher: async () => response('not json') });
     await expect(malformed.assess(bundle)).rejects.toThrow('Provider request unavailable');
   });
+  test('provider transport failures produce one request, safe telemetry, and no retry', async () => {
+    let calls = 0;
+    const events: unknown[] = [];
+    const juror = createChatJuror({ id: 'j', model: 'm', baseUrl: 'https://provider.test', onTelemetry: (event) => events.push(event), fetcher: async () => {
+      calls++;
+      throw new Error('private upstream body and credential');
+    } });
+    await expect(juror.assess(bundle)).rejects.toThrow('Provider request unavailable');
+    expect(calls).toBe(1);
+    expect(events).toHaveLength(1);
+    expect(events[0]).toMatchObject({ outcome: 'failure', id: 'j', model: 'm' });
+    expect(JSON.stringify(events)).not.toContain('private upstream');
+    expect(JSON.stringify(events)).not.toContain('credential');
+  });
   test('reports only safe provider usage counts and basic request metadata', async () => {
     const events: unknown[] = [];
     const juror = createChatJuror({ id: 'juror-id', model: 'model-name', baseUrl: 'https://provider.test', onTelemetry: (event) => events.push(event), fetcher: async () => response('{"assessment":"supported"}', 200, { prompt_tokens: 13, completion_tokens: 5, total_tokens: 18 }) });
@@ -113,8 +127,17 @@ describe('createChatJuror', () => {
     const juror = createChatJuror({ id: 'j', model: 'm', baseUrl: 'https://provider.test', fetcher: async () => response('x'.repeat(40_000)) });
     await expect(juror.assess(hugeBundle)).rejects.toThrow('Provider request unavailable');
     await expect(juror.assess(bundle)).rejects.toThrow('Provider request unavailable');
-    const timeout = createChatJuror({ id: 'j', model: 'm', baseUrl: 'https://provider.test', timeoutMs: 5, fetcher: (_input, init) => new Promise((_resolve, reject) => init?.signal?.addEventListener('abort', () => reject(new Error('aborted')))) });
+    let timeoutCalls = 0;
+    const timeoutEvents: unknown[] = [];
+    const timeout = createChatJuror({ id: 'j', model: 'm', baseUrl: 'https://provider.test', timeoutMs: 5, onTelemetry: event => timeoutEvents.push(event), fetcher: (_input, init) => {
+      timeoutCalls++;
+      return new Promise((_resolve, reject) => init?.signal?.addEventListener('abort', () => reject(new Error('aborted'))));
+    } });
     await expect(timeout.assess(bundle)).rejects.toThrow('Provider request unavailable');
+    expect(timeoutCalls).toBe(1);
+    expect(timeoutEvents).toHaveLength(1);
+    expect(timeoutEvents[0]).toMatchObject({ outcome: 'failure' });
+    expect(JSON.stringify(timeoutEvents)).not.toContain('aborted');
   });
   test('engine abort signal cancels provider fetch and redirects are rejected', async () => {
     let receivedSignal: AbortSignal | undefined;

@@ -6,9 +6,11 @@ import type { PublicClaimStore } from './store.ts';
 const key = () => randomBytes(32).toString('hex');
 const digest = (value: string) => createHash('sha256').update(value).digest();
 const matches = (actual: string, expected: string) => timingSafeEqual(digest(actual), digest(expected));
+const matchesHash = (actual: string, expectedHex: string) => /^[a-f0-9]{64}$/.test(expectedHex) && timingSafeEqual(digest(actual), Buffer.from(expectedHex, 'hex'));
 const researchSchema = z.object({ claim: z.string().trim().min(8).max(4000), sourceUrls: z.array(z.string().url().max(2048)).max(5).default([]), consent: z.literal(true) }).strict();
 const reviewSchema = z.object({ researchToken: z.string().regex(/^[a-f0-9]{64}$/), consent: z.literal(true) }).strict();
 const shareSchema = z.object({ consent: z.literal(true) }).strict();
+const correctionSchema = z.object({ note: z.string().trim().min(1).max(1000), consent: z.literal(true) }).strict();
 const TOKEN_TTL = 30 * 60_000;
 const RESULT_TTL = 60 * 60_000;
 interface ReviewEntry { review: ClaimReview; reviewToken: string; expires: number; shareId?: string }
@@ -68,9 +70,10 @@ export function createClaimsHandler(options: ClaimsOptions) {
       const shared = /^\/api\/claims\/shared\/([a-f0-9]{64})$/.exec(path);
       if (shared && request.method === 'GET') {
         const review = options.store.shared(shared[1]!);
-        return review ? Response.json({ review }) : fail('NOT_FOUND', 'Shared review not found.', 404);
+        return review ? Response.json(review) : fail('NOT_FOUND', 'Shared review not found.', 404);
       }
-      if (!['/api/claims/research', '/api/claims/reviews'].includes(path) && !/^\/api\/claims\/reviews\/[^/]+\/share$/.test(path)) return fail('NOT_FOUND', 'Not found.', 404);
+      const ownerAction = /^\/api\/claims\/shared\/([a-f0-9]{64})\/(corrections|unpublish)$/.exec(path);
+      if (!['/api/claims/research', '/api/claims/reviews'].includes(path) && !/^\/api\/claims\/reviews\/[^/]+\/share$/.test(path) && !ownerAction) return fail('NOT_FOUND', 'Not found.', 404);
       if (request.method !== 'POST') return fail('METHOD', 'Method not allowed.', 405);
       if (!enabled) return fail('UNAVAILABLE', 'Claim research is not configured yet.', 503);
       if (!matches(request.headers.get('x-mochi-access-token') ?? '', options.accessToken!)) return fail('ACCESS', 'Enter a valid pilot access token.', 401);
@@ -107,6 +110,22 @@ export function createClaimsHandler(options: ClaimsOptions) {
         entry.pending = pending;
         try { response = fullReview(await pending); }
         finally { active--; entry.pending = undefined; }
+      } else if (ownerAction) {
+        const id = ownerAction[1]!;
+        const supplied = request.headers.get('x-mochi-review-token') ?? '';
+        const savedHash = options.store.ownerHash(id);
+        if (!savedHash || !/^[a-f0-9]{64}$/.test(supplied) || !matchesHash(supplied, savedHash)) return fail('NOT_FOUND', 'Published review not found or owner token invalid.', 404);
+        if (ownerAction[2] === 'corrections') {
+          const parsed = correctionSchema.safeParse(value);
+          if (!parsed.success) return fail('INVALID_REQUEST', 'Provide correction consent and a note of at most 1,000 characters.', 400);
+          if (!options.store.correct(id, { note: parsed.data.note, createdAt: new Date(now()).toISOString() })) return fail('CORRECTION_LIMIT', 'The published review is unavailable or has reached its correction limit.', 409);
+          response = Response.json(options.store.shared(id));
+        } else {
+          if (!z.object({ confirm: z.literal(true) }).strict().safeParse(value).success) return fail('CONFIRMATION', 'Confirm that the public review should be unpublished.', 400);
+          if (!options.store.unpublish(id)) return fail('NOT_FOUND', 'Published review not found.', 404);
+          for (const entry of reviews.values()) if (entry.shareId === id) entry.shareId = undefined;
+          response = Response.json({ unpublished: true });
+        }
       } else {
         if (!shareSchema.safeParse(value).success) return fail('CONSENT', 'Explicit consent is required to publish a review.', 400);
         const id = /^\/api\/claims\/reviews\/([^/]+)\/share$/.exec(path)![1]!;
@@ -116,7 +135,7 @@ export function createClaimsHandler(options: ClaimsOptions) {
           const shareId = key();
           // Source text is private research material. Publish only the passages cited by jurors.
           const publishable: ClaimReview = { ...entry.review, sources: entry.review.sources.map(source => ({ ...source, text: '' })) };
-          options.store.publish(shareId, publishable); entry.shareId = shareId;
+          options.store.publish(shareId, publishable, digest(entry.reviewToken).toString('hex')); entry.shareId = shareId;
         }
         response = Response.json({ shareId: entry.shareId, url: `/check/?share=${entry.shareId}` });
       }

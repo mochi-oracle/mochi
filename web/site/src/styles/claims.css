@@ -21,3 +21,10 @@
 .claim-protocol { border-top:6px solid #e50083; }.claim-protocol-source { display:grid; gap:.7rem; margin:1rem 0; padding:1rem; border:1px solid #bbb; }.claim-protocol-source legend { padding:0 .5rem; font-weight:650; }.claim-protocol-source label { display:block; }.claim-protocol-quote,.claim-protocol-result { margin-top:2rem; padding:1.5rem; background:#f4edf5; overflow-wrap:anywhere; }.claim-protocol code { font-size:1rem; }
 :focus-visible { outline:3px solid #e94f0b; outline-offset:3px; }
 @media (max-width:700px) { .claim-shell { padding:1.2rem; }.claim-main { padding-top:4rem; }.claim-notice,.claim-source div,.claim-finding-top { flex-direction:column; gap:.5rem; }.claim-source div span { text-align:left; }.claim-form,.claim-section { padding:1.2rem; }.claim-section-top,.claim-footer { gap:1rem; flex-direction:column; }.claim-main h1 { font-size:5.3rem; }.claim-intro { font-size:1.7rem; } }
+.claim-share .claim-text-button { margin-right:1.6rem; }
+.claim-share label,.claim-manage label { display:block; margin:1.4rem 0 .6rem; }
+.claim-share textarea,.claim-manage textarea,.claim-manage input:not([type=checkbox]) { display:block; width:100%; max-width:100%; margin:.6rem 0; padding:1rem; border:1px solid #777; background:#fff; color:#111; font:inherit; }
+.claim-share textarea,.claim-manage textarea { min-height:9rem; resize:vertical; }
+.claim-share input[type=checkbox],.claim-manage input[type=checkbox] { display:inline-block; width:auto; margin-right:.7rem; accent-color:#e50083; }
+.claim-manage summary { cursor:pointer; font-weight:650; }
+.claim-text-button:disabled { opacity:.45; cursor:not-allowed; }

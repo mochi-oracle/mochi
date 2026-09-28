@@ -1,0 +1,12 @@
+{
+  "totalReviews": 0,
+  "completedReviews": 0,
+  "costsUsd": {
+    "inferenceIncludingFailuresAndRetries": null,
+    "searchIncludingFailedRequests": null,
+    "settlementGas": null,
+    "hostingAllocation": null,
+    "otherUncovered": null
+  },
+  "verifiedProductFundingUsd": null
+}

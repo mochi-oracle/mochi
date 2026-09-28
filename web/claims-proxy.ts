@@ -4,7 +4,7 @@ export function createClaimsProxy(base: string, fetcher: typeof fetch = fetch) {
   if (origin.protocol !== 'https:' || origin.username || origin.password || origin.search || origin.hash || origin.pathname !== '/') throw new Error('Claims upstream must be an HTTPS origin');
   const allowed = (path: string, method: string) => method === 'GET'
     ? path === '/api/claims/config' || /^\/api\/claims\/shared\/[a-f0-9]{64}$/.test(path)
-    : method === 'POST' && (['/api/claims/research', '/api/claims/reviews'].includes(path) || /^\/api\/claims\/reviews\/[a-f0-9-]{1,80}\/share$/.test(path));
+    : method === 'POST' && (['/api/claims/research', '/api/claims/reviews'].includes(path) || /^\/api\/claims\/reviews\/[a-f0-9-]{1,80}\/share$/.test(path) || /^\/api\/claims\/shared\/[a-f0-9]{64}\/(?:corrections|unpublish)$/.test(path));
   const fail = (status: number) => Response.json({ error: { code: 'UNAVAILABLE', message: 'Research service is unavailable. No payment was collected.' } }, { status, headers: { 'cache-control': 'no-store' } });
   return async (request: Request): Promise<Response> => {
     const url = new URL(request.url);

@@ -23,3 +23,15 @@ test('proxy bounds upstream data and suppresses non-JSON provider errors',async(
  for(const upstream of [()=>new Response('private stack trace'),()=>Response.json({data:'x'.repeat(2*1024*1024)})]){
  const proxy=createClaimsProxy('https://service.example',async()=>upstream());const response=await proxy(req());expect(response.status).toBe(502);expect(await response.text()).not.toContain('private stack');}
 });
+test('publication controls use exact routes and retain owner authorization without browser credentials',async()=>{
+ const share='a'.repeat(64);let calls=0;
+ const proxy=createClaimsProxy('https://service.example',async(input,init)=>{
+  calls++;expect(String(input)).toMatch(new RegExp(`/shared/${share}/(corrections|unpublish)$`));
+  const h=new Headers(init?.headers);expect(h.get('x-mochi-review-token')).toBe('owner');expect(h.has('cookie')).toBe(false);
+  return Response.json({ok:true});
+ });
+ for(const operation of ['corrections','unpublish'])expect((await proxy(req(`/api/claims/shared/${share}/${operation}`))).status).toBe(200);
+ expect((await proxy(req(`/api/claims/shared/${share}/delete-all`))).status).toBe(404);
+ expect((await proxy(req(`/api/claims/shared/${share}/unpublish?token=owner`))).status).toBe(404);
+ expect(calls).toBe(2);
+});

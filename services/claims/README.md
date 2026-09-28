@@ -1,6 +1,6 @@
 # Mochi claim research pilot
 
-Standalone claim research at `/check/`, sharing the existing website server. The pilot researches one exact claim, retrieves bounded sources, runs three independently configured models, validates source quotes, and displays agreement separately from the assessment. It collects no customer payment and produces no TEE attestation or chain receipt.
+Standalone claim research at `/check/`, sharing the existing website server. The live hosted pilot is invitation-only and unpaid. It researches one exact claim from linked public sources, runs three configured models, validates source quotes, and displays agreement separately from the assessment. It collects no customer payment and produces no TEE attestation or chain receipt.
 
 ## Configuration
 
@@ -11,7 +11,7 @@ The default is disabled. Configure server-side variables through the hosting pro
 - `MOCHI_CLAIMS_DATABASE`: a writable SQLite path on a persistent volume, for example `/data/claims.sqlite`. Use one server replica; private research sessions remain in process memory.
 - `MOCHI_CLAIMS_JURORS`: JSON configuration for exactly three distinct IDs and model names. Each entry has `id`, `model`, `baseUrl` (HTTPS chat-completions-compatible API base), optional `transport` (`chat-completions`, the default, or `phala-aci`), and optional `apiKeyEnv` naming the server environment variable holding that provider's key. The `phala-aci` transport requires a named key. No actual secret belongs in this JSON.
 - Provider keys: set only the explicitly named `apiKeyEnv` variables in the hosting service. Keys are neither returned to clients nor persisted by this service.
-- `MOCHI_CLAIMS_SEARCH_KEY`: optional Brave Search API key. Without it, research uses only user-provided URLs and prominently reports that external discovery is unavailable. Configure it for the proposed general claim-research experience.
+- `MOCHI_CLAIMS_SEARCH_KEY`: optional Brave Search API key. The current hosted invitation pilot does not have general web discovery configured; participants should provide source URLs. Without the key, research uses only user-provided URLs and prominently reports that external discovery is unavailable.
 - `MOCHI_CLAIMS_DAILY_ACTIONS`: default 100, maximum 1000. Both research and new jury runs reserve one action, including failed attempts. This limits request volume, not dollar cost. Set provider-side spending caps separately before launch.
 
 Configuration example with placeholders to replace:
@@ -39,7 +39,7 @@ For Phala, `transport: "phala-aci"` uses the existing ACI verifier to check fres
 - Reviews require three of three valid matching findings. Two of three remains unresolved. No usable evidence produces deterministic insufficiency without running models. Malformed output and invalid quotes are failures, never supporting votes.
 - A quote matching a retrieved passage establishes a textual match; it does not independently prove semantic entailment, source authenticity or factual truth.
 
-The first pilot supports explicit public sharing, not publication deletion or a correction-history UI. Do not submit confidential material: external search and model providers receive the claim/evidence under the consent shown in the interface. The confidential document-review protocol is a separate integration.
+Do not submit confidential material: configured model providers receive the claim/evidence under the consent shown in the interface. The confidential document-review protocol is a separate integration.
 
 ## Local operation and verification
 
@@ -47,7 +47,7 @@ Build with `cd web/site && bun run build`; serve from the root with `bun web/ser
 
 Focused gate: `bun test services/claims/test web/test`. Project typecheck: `bun run typecheck`.
 
-Browser checks use a separate localhost fixture server with clearly identified synthetic model findings. They establish UI behavior, not model accuracy. A separate actual IANA source fetch passed. Before paid or open public use, evaluate independently reviewed claims using the configured real models, benchmark complete costs and latency, verify provider spending limits, and implement and test production payment settlement. The five-cent short-review target is not a live price charged by this pilot.
+Browser checks use a separate localhost fixture server with clearly identified synthetic model findings. They establish UI behavior, not model accuracy. A separate actual IANA source fetch passed. Before paid or open public use, evaluate independently reviewed claims using the configured real models, benchmark complete costs and latency, verify provider spending limits, and complete production payment activation and settlement reconciliation. The five-cent short-review target is not a live price charged by this pilot.
 
 ## Bounded evaluation
 
@@ -61,7 +61,7 @@ Research and review requests send `x-mochi-access-token`; sharing additionally s
 
 ## Separate confidential checkout and review revenue
 
-`packages/sdk/src/claims.ts` adapts supplied claim evidence into the existing private protocol. The browser client in `web/site/src/claim-protocol-client.js` uses that same framing and the existing attested-intake/wallet lifecycle. Supplied URLs are metadata, not proof that a source was fetched or authenticated. Deployment must be configured and verified before payment is offered; an unpaid research result cannot settle an escrow query.
+`packages/sdk/src/claims.ts` adapts supplied claim evidence into the existing private protocol. The browser client in `web/site/src/claim-protocol-client.js` uses that same framing and the existing attested-intake/wallet lifecycle. Supplied URLs are metadata, not proof that a source was fetched or authenticated. The bridge and hardware intake rehearsal exist; production paid activation, complete settlement/refund reconciliation, provider spending limits, and cost/quality gates remain pending. An unpaid research result cannot settle an escrow query.
 
 `src/revenue-worker.ts` connects the durable settlement ledger, reserve policy, purchase engine and receipt-verified public report. `src/uniswap-buyback-adapter.ts` supplies an explicitly configured V3/Router02 route with private durable submission recovery. Execution defaults to disabled; the team's token address, actual liquidity route, operating budget and funded authorized signer are launch inputs. Developer fees remain separate, and purchases never burn automatically. See [revenue operations](REVENUE-OPERATIONS.md) for commands, hosting and activation requirements.
 

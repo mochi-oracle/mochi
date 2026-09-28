@@ -2,17 +2,15 @@
 
 ## Actual model calls
 
-Three distinct models ran through the Phala ACI adapter with verified confidential model receipts and an UpToDate, non-debug TDX policy: DeepSeek V4 Flash, Qwen 3.8 27B, and Gemma 4 31B IT. These calls used fictional controlled evidence, not private documents.
+The initial validation record was superseded by the September 28 source-quality audit. That audit's paid evaluation run covered 12 hand-selected cases and 36 inference requests (including the invalid fixture), using Llama 3.3 70B, Nemotron 3.5 Lightning, and Gemma 4 31B through the configured Phala inference endpoint. It resolved eight cases correctly and left four unresolved; three provider inference calls failed. The separate corrected-context case used three more calls and remained unresolved. These are descriptive results for controlled source-backed cases, not a representative accuracy benchmark. See `docs/CLAIMS-LAUNCH-PACKAGE.md` for the launch-safe interpretation. The detailed private audit evidence is maintained outside this public export.
 
-The initial five-case test made 12 model requests. Supported and contradicted examples each resolved correctly at 3/3, with matching source quotes. Their review latencies were approximately 6.1s and 29.6s. The no-evidence case abstained without a model call. Conflicting sources remained unresolved after one Qwen request exceeded the 45-second limit; the remaining responses were not promoted into a unanimous verdict. The instruction-injection fixture produced valid but disagreeing responses and also remained unresolved.
-
-The system prompt was then strengthened to distinguish source assertions from embedded commands. One focused live retest of the injection fixture made three additional requests: all three returned the expected supported assessment, with matching quotes, in 12.3s. This single retest is not proof of general resistance to prompt injection. The full initial suite was not repeated against the revised prompt.
+In the audited 12-case run, eight cases resolved correctly and four remained unresolved. The corrected GPT-5 qualifier case remained unresolved: two models treated the shortened claim as supported while one identified the omitted “when thinking” condition. A three-of-three pilot rule withheld the result. The audit's manual semantic review was authored by the engineering operator, not an independent adjudicator. Exact quote matching did not establish truth, source authenticity, or entailment beyond that manual review.
 
 ## Measured charges
 
-Phala's usage dashboard showed the first simple review's three individual model charges as $0.000222, $0.000676 and $0.000071 (sum $0.000969). The second showed $0.000261, $0.000856 and $0.000074 (sum $0.001191). These are displayed rounded provider charges for tiny synthetic examples, not estimates of all-in production cost. The timed-out request did not yet have a matching spend record at inspection; its eventual charge remains unknown.
+The audited 12-case run reports a partial token-price estimate of $0.01586906 for calls with prompt and completion usage telemetry. Three failed calls lacked usage, so their eventual cost is unknown; the reported value is neither actual billed cost nor an estimate for all 36 attempts. The additional corrected-context case has a separate reported-token estimate of $0.00169547 for its three calls and no actual billing total. Earlier dashboard examples in the original record showed two tiny synthetic reviews at $0.000969 and $0.001191 in individual model charges; these are individual observed examples, not per-review predictions. Search, failed-request, hosting, gas/settlement, and amortized operating costs are not fully measured. Missing costs must remain unknown, not be treated as zero.
 
-The approved starting price remains $0.05 for a short three-juror review. This small sample supports further testing of that price; hosting, retrieval, gas, refunds, longer evidence and escalation still require a measured allowance. Do not advertise the difference as an assured buyback amount.
+The proposed starting tariff remains $0.05 for the short N3 mix at `tokensK=1`; it is a contract quote configuration, not an active pilot price. This small sample cannot validate all-in economics. Hosting, retrieval, network gas, retries, refunds, and longer evidence still require measured allowances. Do not advertise a margin or an assured buyback amount.
 
 ## Implementation status
 
@@ -30,7 +28,7 @@ Model attestation does not attest local research orchestration. Hardware intake 
 
 The reviewed release candidate passed 80 focused ACI, SDK, claims and deployment-token-policy tests (377 assertions), project TypeScript checking, and the production website build. The new SDK fixture exercises encrypted preparation and sealed-result decryption through the actual SDK with a mocked gateway. These checks are separate from production wallet settlement.
 
-The subsequent browser/revenue integration candidate passed 107 SDK, claims and website tests (487 assertions), project TypeScript checking and the production website build. Payment one-shot/recovery, invalid verdict rejection, uncertain purchase reconciliation and treasury reservation behavior are tested with mock adapters; no production wallet transfer is implied.
+The subsequent browser/revenue integration candidate passed 107 SDK, claims and website tests (487 assertions), project TypeScript checking and the production website build. Payment one-shot/recovery, invalid verdict rejection, uncertain purchase reconciliation and treasury reservation behavior are tested with mock adapters; no production wallet transfer is implied. This is implementation evidence, not a paid production acceptance result.
 
 ## Hardware intake verification on the existing Phala VM
 

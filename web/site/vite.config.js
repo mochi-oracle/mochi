@@ -17,5 +17,5 @@ const mochiCssLast = {
 
 export default defineConfig({
   plugins: [mochiCssLast],
-  build: {rollupOptions: {input: Object.fromEntries(['', 'about', 'how-it-works', 'case-study', 'roadmap', 'docs', 'dashboard', 'check', 'tokenomics'].map(r => [r || 'home', resolve(r, 'index.html')]))}},
+  build: {rollupOptions: {input: Object.fromEntries(['', 'about', 'how-it-works', 'case-study', 'roadmap', 'docs', 'dashboard', 'check', 'tokenomics', 'guide'].map(r => [r || 'home', resolve(r, 'index.html')]))}},
 });

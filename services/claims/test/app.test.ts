@@ -1,7 +1,9 @@
+import { Database } from 'bun:sqlite';
 import { afterEach, expect, test } from 'bun:test';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { createHash } from 'node:crypto';
 import { createClaimsHandler } from '../src/app.ts';
 import { SqlitePublicClaimStore } from '../src/store.ts';
 import { createResearcher } from '../src/research.ts';
@@ -54,8 +56,22 @@ test('private review stays private; duplicate concurrent approvals run models on
   expect(published.review.sources[0].text).toBe('');
   expect(JSON.stringify(published)).not.toContain('Unquoted private research material');
   expect(computeReviewIntegrityHash(published.review)).toBe(first.review.integrityHash);
+  const correctionPath = `shared/${shared.shareId}/corrections`;
+  expect((await handler(post(correctionPath, { note: 'Owner correction', consent: true }))).status).toBe(404);
+  expect((await handler(post(correctionPath, { note: 'Owner correction' }, { 'x-mochi-review-token': first.reviewToken }))).status).toBe(400);
+  expect((await handler(post(correctionPath, { note: 'Owner correction', consent: true }, { 'x-mochi-review-token': first.reviewToken, 'x-mochi-access-token': 'wrong' }))).status).toBe(401);
+  const corrected: any = await (await handler(post(correctionPath, { note: 'Owner correction', consent: true }, { 'x-mochi-review-token': first.reviewToken }))).json();
+  expect(corrected.review).toEqual(published.review);
+  expect(computeReviewIntegrityHash(corrected.review)).toBe(first.review.integrityHash);
+  expect(corrected.corrections).toEqual([{ note: 'Owner correction', createdAt: expect.any(String) }]);
+  expect(JSON.stringify(corrected)).not.toContain(first.reviewToken);
+  expect((await handler(post(`shared/${shared.shareId}/unpublish`, { confirm: true }))).status).toBe(404);
+  const unpublished = await handler(post(`shared/${shared.shareId}/unpublish`, { confirm: true }, { 'x-mochi-review-token': first.reviewToken }));
+  expect(unpublished.status).toBe(200);
+  expect((await handler(new Request(`https://mochi.test/api/claims/shared/${shared.shareId}`))).status).toBe(404);
   const again: any = await (await handler(post(sharePath, { consent: true }, { 'x-mochi-review-token': first.reviewToken }))).json();
-  expect(again.shareId).toBe(shared.shareId);
+  expect(again.shareId).not.toBe(shared.shareId);
+  expect((await handler(new Request(`https://mochi.test/api/claims/shared/${again.shareId}`))).status).toBe(200);
 });
 
 test('expiry and daily limits prevent repeat expensive requests without losing published records', async () => {
@@ -71,10 +87,21 @@ test('durable store preserves public results and budgets across restarts', async
   const dir = await mkdtemp(join(tmpdir(), 'mochi-claims-store-'));
   const path = join(dir, 'public.sqlite');
   const review = await reviewBundle(bundle, jurors);
+  const publicationId = 'd'.repeat(64);
   const store = new SqlitePublicClaimStore(path);
-  store.publish('public', review); expect(store.reserve('2026-09-28', 1)).toBe(true); store.close();
+  const recovery = 'c'.repeat(64);
+  const recoveryHash = createHash('sha256').update(recovery).digest('hex');
+  store.publish(publicationId, review, recoveryHash); expect(store.reserve('2026-09-28', 1)).toBe(true); store.close();
   const reopened = new SqlitePublicClaimStore(path);
-  try { expect(reopened.shared('public')?.id).toBe(review.id); expect(reopened.reserve('2026-09-28', 1)).toBe(false); }
+  try {
+    expect(reopened.shared(publicationId)?.review.id).toBe(review.id); expect(reopened.ownerHash(publicationId)).toBe(recoveryHash);
+    const handler = createClaimsHandler({ store: reopened, accessToken: ACCESS, researcher: async () => bundle, reviewer: b => reviewBundle(b, jurors) });
+    const manage = (secret: string) => new Request(`https://mochi.test/api/claims/shared/${publicationId}/corrections`, { method: 'POST', headers: { 'content-type': 'application/json', 'x-mochi-access-token': ACCESS, 'x-mochi-review-token': secret }, body: JSON.stringify({ note: 'Restart correction', consent: true }) });
+    expect((await handler(manage('wrong'))).status).toBe(404);
+    expect((await handler(manage(recovery))).status).toBe(200);
+    expect(reopened.shared(publicationId)?.corrections).toHaveLength(1);
+    expect(reopened.reserve('2026-09-28', 1)).toBe(false);
+  }
   finally { reopened.close(); await rm(dir, { recursive: true, force: true }); }
 });
 
@@ -88,3 +115,20 @@ test('source retrieval through independent jury to public output integrates with
   expect(result.review.execution).toBe('unattested_research');
   expect(result.review.sources[0].contentHash).toHaveLength(64);
 });
+
+ test('legacy publications migrate without granting ownership and correction history is bounded', async () => {
+  const dir=await mkdtemp(join(tmpdir(),'mochi-legacy-')),path=join(dir,'legacy.sqlite');
+  const review=await reviewBundle(bundle,jurors);const id='e'.repeat(64),secret='f'.repeat(64);
+  const legacy=new Database(path);legacy.exec('CREATE TABLE claim_publications(id TEXT PRIMARY KEY,review TEXT NOT NULL)');
+  legacy.query('INSERT INTO claim_publications VALUES (?,?)').run(id,JSON.stringify(review));legacy.close();
+  const store=new SqlitePublicClaimStore(path);
+  try{
+    expect(store.shared(id)?.review.id).toBe(review.id);expect(store.ownerHash(id)).toBeNull();
+    const handler=createClaimsHandler({store,accessToken:ACCESS,researcher:async()=>bundle,reviewer:b=>reviewBundle(b,jurors)});
+    expect((await handler(post(`shared/${id}/unpublish`,{confirm:true},{'x-mochi-review-token':secret}))).status).toBe(404);
+    const owned='a'.repeat(64);store.publish(owned,review,createHash('sha256').update(secret).digest('hex'));
+    for(let i=0;i<100;i++)expect(store.correct(owned,{note:`note ${i}`,createdAt:'2026-09-28T00:00:00.000Z'})).toBe(true);
+    expect(store.correct(owned,{note:'overflow',createdAt:'2026-09-28T00:00:00.000Z'})).toBe(false);
+    expect(store.shared(owned)?.corrections).toHaveLength(100);
+  }finally{store.close();await rm(dir,{recursive:true,force:true});}
+ });
