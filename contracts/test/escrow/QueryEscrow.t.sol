@@ -169,6 +169,46 @@ contract QueryEscrowTest is Test {
         assertEq(escrow.claimable(OP0), 0);
     }
 
+    function testDuplicateSettlementAndClaimCannotPayTwice() public {
+        bytes32 id = _open(3, 11, MochiTypes.PayPath.USDG);
+        _seal(id);
+        uint256 protocol = escrow.getQuery(id).protocolFee;
+        uint256 payerBefore = token.balanceOf(address(this));
+
+        escrow.settle(id, 0, MochiTypes.VerdictStatus.HUNG, 0);
+        assertEq(token.balanceOf(address(this)) - payerBefore, protocol);
+        uint256 operatorCredit = escrow.claimable(OP0);
+        uint256 escrowBalance = token.balanceOf(address(escrow));
+        assertGt(operatorCredit, 0);
+
+        vm.expectRevert();
+        escrow.settle(id, 0, MochiTypes.VerdictStatus.HUNG, 0);
+        assertEq(token.balanceOf(address(this)) - payerBefore, protocol);
+        assertEq(escrow.claimable(OP0), operatorCredit);
+        assertEq(token.balanceOf(address(escrow)), escrowBalance);
+
+        vm.prank(OP0);
+        escrow.claim();
+        uint256 paidToOperator = token.balanceOf(OP0);
+        vm.prank(OP0);
+        escrow.claim();
+        assertEq(token.balanceOf(OP0), paidToOperator);
+        assertEq(escrow.claimable(OP0), 0);
+    }
+
+    function testDuplicateExpiryCannotRefundTwice() public {
+        bytes32 id = _open(3, 12, MochiTypes.PayPath.USDG);
+        uint256 paid = escrow.getQuery(id).paid;
+        uint256 payerBefore = token.balanceOf(address(this));
+        vm.warp(escrow.getQuery(id).deadline + 1);
+
+        escrow.expire(id);
+        assertEq(token.balanceOf(address(this)) - payerBefore, paid);
+        vm.expectRevert();
+        escrow.expire(id);
+        assertEq(token.balanceOf(address(this)) - payerBefore, paid);
+    }
+
     function testHUNGThenExpansionPaysOnlyNewSeats() public {
         bytes32 id = _open(3, 2, MochiTypes.PayPath.USDG);
         _seal(id);

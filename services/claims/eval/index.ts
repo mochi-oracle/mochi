@@ -12,6 +12,9 @@ export interface EvaluationCaseResult {
   validCitationCount: number;
   rejectedCitationFindings: number;
   failureCount: number;
+  failureCodes: string[];
+  findingCount: number;
+  agreementCount: number;
   elapsedMs: number;
 }
 
@@ -60,7 +63,7 @@ function offlineJurors(fixture: EvaluationFixture): Juror[] {
   return [0, 1, 2].map((seat) => ({
     id: `offline-${seat + 1}`, model: `offline-fixture-${seat + 1}`,
     async assess() {
-      if (fixture.expected === 'insufficient_evidence') throw new Error('No-evidence case should not call jurors');
+      if (fixture.bundle.sources.length === 0) throw new Error('No-evidence case should not call jurors');
       const cited = fixture.bundle.sources[0]!;
       const quote = fixture.id === 'synthetic-conflict' ? fixture.bundle.sources[seat % 2]!.text : cited.text;
       return {
@@ -92,7 +95,8 @@ export async function evaluateClaims(options: EvaluationOptions = {}): Promise<C
     cases.push({ id: fixture.id, expected: fixture.expected, actual: review.assessment, status: review.status,
       correct: review.assessment === fixture.expected, citationCount: citations.length, validCitationCount,
       rejectedCitationFindings: review.failures.filter((failure) => failure.code === 'INVALID_CITATION').length,
-      failureCount: review.failures.length, elapsedMs });
+      failureCount: review.failures.length, failureCodes: review.failures.map((failure) => failure.code),
+      findingCount: review.findings.length, agreementCount: review.agreement.count, elapsedMs });
   }
   const resolved = cases.filter((item) => item.actual !== null);
   const unresolvedCount = cases.filter((item) => item.status === 'unresolved').length;

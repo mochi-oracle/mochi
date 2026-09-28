@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test';
-import type { AciClient } from '@mochi/aci';
+import { AciVerificationError, type AciClient } from '@mochi/aci';
 import { createAciJuror } from '../src/aci-provider.ts';
 import type { EvidenceBundle } from '../src/types.ts';
 
@@ -33,28 +33,38 @@ describe('createAciJuror', () => {
 
   test('fails closed for non-UpToDate ACI status, invalid answer JSON, and oversized evidence', async () => {
     let calls = 0;
-    const stale = createAciJuror({ id: 'j', model: 'm', baseUrl: 'https://aci.test/v1', client: injected(async () => { calls++; return { json: response('{}'), established: { ...established, tcbStatus: 'OutOfDate' }, receipt: {} } as never; }) });
+    const events: unknown[] = [];
+    const stale = createAciJuror({ id: 'j', model: 'm', baseUrl: 'https://aci.test/v1', onTelemetry: (event) => events.push(event), client: injected(async () => { calls++; return { json: response('{}'), established: { ...established, tcbStatus: 'OutOfDate' }, receipt: {} } as never; }) });
     await expect(stale.assess(bundle)).rejects.toThrow('Provider request unavailable');
-    const invalid = createAciJuror({ id: 'j', model: 'm', baseUrl: 'https://aci.test/v1', client: injected(async () => ({ json: response('not-json'), established, receipt: {} } as never)) });
+    const invalid = createAciJuror({ id: 'j', model: 'm', baseUrl: 'https://aci.test/v1', onTelemetry: (event) => events.push(event), client: injected(async () => ({ json: response('not-json'), established, receipt: {} } as never)) });
     await expect(invalid.assess(bundle)).rejects.toThrow('Provider request unavailable');
+    const proofFailure = createAciJuror({ id: 'j', model: 'm', baseUrl: 'https://aci.test/v1', onTelemetry: (event) => events.push(event), client: injected(async () => { throw new AciVerificationError('receipt_signature'); }) });
+    await expect(proofFailure.assess(bundle)).rejects.toThrow('Provider request unavailable');
     const tooLarge = createAciJuror({ id: 'j', model: 'm', baseUrl: 'https://aci.test/v1', client: injected(async () => { calls++; return { json: response('{}'), established, receipt: {} } as never; }) });
     await expect(tooLarge.assess({ ...bundle, claim: 'x'.repeat(125_000) })).rejects.toThrow('Provider request unavailable');
     expect(calls).toBe(1);
+    expect(events[0]).toMatchObject({ stage: 'attestation', errorCode: 'TCB_STATUS_NOT_UP_TO_DATE' });
+    expect(events[1]).toMatchObject({ stage: 'response_parse', errorCode: 'RESPONSE_INVALID' });
+    expect(events[2]).toMatchObject({ stage: 'receipt', errorCode: 'ACI_RECEIPT_SIGNATURE' });
+    expect(JSON.stringify(events)).not.toContain('Provider request unavailable');
   });
 
   test('propagates cancellation to AciClient and isolates telemetry callback failures', async () => {
     let signal: AbortSignal | undefined;
+    let telemetryEvent: unknown;
     const client = injected(async (_body, options) => {
       signal = options?.signal;
       return new Promise<never>((_resolve, reject) => signal?.addEventListener('abort', () => reject(new Error('aborted')), { once: true }));
     });
-    const juror = createAciJuror({ id: 'j', model: 'm', baseUrl: 'https://aci.test/v1', client, onTelemetry: async () => { throw new Error('private data'); } });
+    const juror = createAciJuror({ id: 'j', model: 'm', baseUrl: 'https://aci.test/v1', client, onTelemetry: async (event) => { telemetryEvent = event; throw new Error('private data'); } });
     const controller = new AbortController();
     const pending = juror.assess(bundle, controller.signal);
     await new Promise((resolve) => setTimeout(resolve, 0));
     controller.abort();
     await expect(pending).rejects.toThrow('Provider request unavailable');
     expect(signal?.aborted).toBe(true);
+    expect(telemetryEvent).toMatchObject({ stage: 'aci_exchange', errorCode: 'REQUEST_ABORTED' });
+    expect(JSON.stringify(telemetryEvent)).not.toContain('private data');
   });
 
   test('requires a key and HTTPS for production construction', () => {

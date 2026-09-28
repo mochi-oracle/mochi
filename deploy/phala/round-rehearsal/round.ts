@@ -16,7 +16,7 @@ const VERDICTS = `0x${"00".repeat(19)}01` as Address;
 const CHAIN_ID = 31337;
 const QUERY_ID = `0x${"91".repeat(32)}` as Hex;
 const SALT = `0x${"37".repeat(32)}` as Hex;
-const QUESTION = "Does the submitted synthetic record report the value 42?";
+const QUESTION = "What numeric value does the submitted synthetic record report? Return the value as a string.";
 const EVIDENCE = "Synthetic submitted evidence: the recorded value is 42.";
 const PARAMS = Object.freeze({ question: QUESTION, answer_type: "STRING" });
 const FIXTURE_BYTES = new TextEncoder().encode(EVIDENCE);
@@ -52,6 +52,7 @@ export interface RoundRehearsalOptions {
   quoteVerifier: QuoteVerifier;
   stores: { intake: SealedStore; consensus: SealedStore; jurors: readonly [SealedStore, SealedStore, SealedStore] };
   runners: readonly [ModelRunner, ModelRunner, ModelRunner];
+  passports?: readonly [{ modelId: string; lineage: string; weightsSha256: Hex; openWeights: boolean; provider: string; zdr: boolean }, { modelId: string; lineage: string; weightsSha256: Hex; openWeights: boolean; provider: string; zdr: boolean }, { modelId: string; lineage: string; weightsSha256: Hex; openWeights: boolean; provider: string; zdr: boolean }];
   clock: JurorClock;
 }
 
@@ -118,7 +119,7 @@ export function createRoundRehearsal(options: RoundRehearsalOptions) {
     },
   };
   const jurors = options.tees.jurors.map((tee, i) => new JurorEnclave({
-    tee, jurorClass: [0, 2, 4][i]!, passport: { modelId: `synthetic-runner-${i + 1}`, lineage: "synthetic-fixture", openWeights: false, provider: "rehearsal-only", zdr: true, weightsSha256: (`0x${String(i + 1).repeat(64)}`) as Hex },
+    tee, jurorClass: [0, 2, 4][i]!, passport: options.passports?.[i] ?? { modelId: `synthetic-runner-${i + 1}`, lineage: "synthetic-fixture", openWeights: false, provider: "rehearsal-only", zdr: true, weightsSha256: (`0x${String(i + 1).repeat(64)}`) as Hex },
     runner: options.runners[i]!, chain: jurorChain, store: options.stores.jurors[i]!, quoteVerifier: options.quoteVerifier,
     http, chainId: CHAIN_ID, verdictsAddress: VERDICTS, clock,
   }));

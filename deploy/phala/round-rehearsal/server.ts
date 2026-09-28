@@ -1,13 +1,19 @@
 import { join } from 'node:path';
-import { DcapQuoteVerifier, DstackQuoteSource, FileSealedStore, PcsCollateralSource, TdxTeeProvider, tdxQuoteMeasurement, type QuoteVerifier } from '@mochi/tee';
-import type { ModelRunner } from '../../../services/juror/src/runner.ts';
+import { DcapQuoteVerifier, DstackQuoteSource, FileSealedStore, PcsCollateralSource, TdxTeeProvider, tdxQuoteMeasurement, type QuoteVerifier, parseTdxQuote, pemChain, verifyTdxQuote } from '@mochi/tee';
+import { PhalaAciRunner, type ModelRunner } from '../../../services/juror/src/runner.ts';
 import { boundedHttpsFetch } from '../rehearsal/http.ts';
 import { createRoundHandler } from './app.ts';
 import { createRoundRehearsal, ROUND_REHEARSAL_FIXTURE, ROUND_REHEARSAL_MODEL_OUTPUT, type RoundRehearsalInput } from './round.ts';
+import { AciClient } from '@mochi/aci';
+import { createInferenceCallBudget, loadRealModeConfig, REAL_MAX_INPUT_BYTES, REAL_MAX_OUTPUT_TOKENS, REAL_MODELS, REAL_ESTIMATED_COST_USD } from './real-mode.ts';
 
-// This entry point deliberately cannot run a production review or spend model credits.
-if (process.env.TEE_MODE !== 'dstack' || process.env.TEE_KEYS !== 'ephemeral' || process.env.MOCHI_ROUND_MODE !== 'synthetic-only') {
-  throw new Error('Round rehearsal requires dstack, ephemeral keys and explicit synthetic-only mode.');
+const realConfig = process.env.MOCHI_ROUND_MODE === 'real-phala-aci' ? loadRealModeConfig(process.env) : undefined;
+const REAL_PASSPORTS = REAL_MODELS.map((modelId) => ({ modelId, lineage: modelId.split('/')[0]!, weightsSha256: `0x${'00'.repeat(32)}` as `0x${string}`, openWeights: false, provider: 'phala-aci', zdr: false })) as unknown as NonNullable<Parameters<typeof createRoundRehearsal>[0]['passports']>;
+const realMode = process.env.MOCHI_ROUND_MODE === 'real-phala-aci';
+
+// Real mode spends credits only on the fixed public fixture under strict limits.
+if (process.env.TEE_MODE !== 'dstack' || process.env.TEE_KEYS !== 'ephemeral' || !['synthetic-only', 'real-phala-aci'].includes(process.env.MOCHI_ROUND_MODE ?? '')) {
+  throw new Error('Round rehearsal requires dstack, ephemeral keys and an explicit supported mode.');
 }
 const quoteSource = new DstackQuoteSource({ socketPath: process.env.DSTACK_SOCKET ?? '/var/run/dstack.sock' });
 const tees: TdxTeeProvider[] = [];
@@ -25,14 +31,41 @@ const quoteVerifier: QuoteVerifier = {
     return result;
   },
 };
-// Fixed outputs exercise the protocol handoffs, not model quality or model independence.
-const runner = (): ModelRunner => ({
+// Synthetic defaults exercise only protocol handoffs. Real mode accepts the
+// fixed public fixture and three explicitly pinned provider model identifiers.
+const callBudget = createInferenceCallBudget(3);
+const runner = (modelIndex: number): ModelRunner & { lastReceipt?: PhalaAciRunner['lastReceipt']; lastProviderReceipt?: PhalaAciRunner['lastProviderReceipt'] } => realMode ? (() => {
+  const aciRunner = new PhalaAciRunner({
+  client: new AciClient({
+    baseUrl: realConfig!.baseUrl, apiKey: realConfig!.apiKey,
+    dcap: async (raw) => {
+      const parsed = parseTdxQuote(raw), chain = pemChain(parsed.pckPem), leaf = chain[0], intermediate = chain[1];
+      if (!leaf?.sgx || !intermediate) return { ok: false, status: 'Invalid', reportData: new Uint8Array() };
+      const ca = intermediate.subjectCN === 'Intel SGX PCK Platform CA' ? 'platform' : intermediate.subjectCN === 'Intel SGX PCK Processor CA' ? 'processor' : undefined;
+      if (!ca) return { ok: false, status: 'Invalid', reportData: new Uint8Array() };
+      const collateral = await new PcsCollateralSource({ fetch: boundedHttpsFetch as typeof fetch }).get(Array.from(leaf.sgx.fmspc, b => b.toString(16).padStart(2, '0')).join('').toUpperCase(), ca);
+      const verified = verifyTdxQuote(raw, collateral, Math.floor(Date.now() / 1000));
+      const debug = (verified.td.tdAttributes[0]! & 1) !== 0;
+      return { ok: verified.status === 'UpToDate' && verified.advisoryIds.length === 0 && !debug, status: verified.status, reportType: 'tdx', reportData: verified.td.reportData, tdReport: verified.td };
+    },
+  }), model: REAL_MODELS[modelIndex]!, timeoutMs: 25_000, maxTokens: REAL_MAX_OUTPUT_TOKENS, maxInputBytes: REAL_MAX_INPUT_BYTES, compactReceiptMetadata: true,
+  });
+  return {
+    get lastReceipt() { return aciRunner.lastReceipt; },
+    get lastProviderReceipt() { return aciRunner.lastProviderReceipt; },
+    async run(input) {
+      if (!callBudget.reserve()) throw new Error('Real inference call budget exhausted.');
+      return aciRunner.run(input);
+    },
+  };
+})() : {
   async run(input) {
     if (input.document !== ROUND_REHEARSAL_FIXTURE.evidence) throw new Error('Synthetic runner accepts only the fixed fixture.');
     return ROUND_REHEARSAL_MODEL_OUTPUT;
   },
-});
+};
 const directory = process.env.SEALED_STORE_DIR ?? '/tmp/round';
+const runners = [runner(0), runner(1), runner(2)] as const;
 const service = createRoundRehearsal({
   tees: { intake, consensus, jurors: [one,two,three] }, quoteVerifier,
   stores: {
@@ -40,17 +73,30 @@ const service = createRoundRehearsal({
     consensus: new FileSealedStore(join(directory,'consensus'),consensus),
     jurors: [one,two,three].map((tee,i) => new FileSealedStore(join(directory,`juror-${i}`),tee)) as [FileSealedStore,FileSealedStore,FileSealedStore],
   },
-  runners: [runner(),runner(),runner()],
+  runners,
+  ...(realMode ? { passports: REAL_PASSPORTS } : {}),
   clock: { now: Date.now, sleep: ms => new Promise(resolve => setTimeout(resolve,ms)) },
 });
 const handler = createRoundHandler({
   attestations: () => service.attestations(),
-  run: input => service.run(input as RoundRehearsalInput),
-});
+  async run(input) {
+    const result = await service.run(input as RoundRehearsalInput);
+    if (!realMode) return result;
+    const receipts = runners.map((runner, i) => {
+      const receipt = runner.lastProviderReceipt;
+      return receipt && receipt.modelId === REAL_MODELS[i] ? {
+        ...receipt, seat: i, modelId: REAL_MODELS[i],
+        verification: 'ACI client verified provider signature and exact request/response body hashes in server process',
+      } : undefined;
+    });
+    if (receipts.some(receipt => !receipt)) throw new Error('Missing verified provider receipt.');
+    return { ...result, realInference: { provider: 'phala-aci', models: REAL_MODELS, receipts, estimatedCostUsd: REAL_ESTIMATED_COST_USD, costEstimateBasis: 'catalog token rates; requested max_tokens and input-byte reservation; actual provider usage may differ', receiptVerification: 'server-side ACI verification; response metadata is not an independent proof' } };
+  },
+}, { mode: realMode ? 'real-aci' : 'synthetic', ...(realMode ? { roundAuthSecret: realConfig!.roundAuthSecret } : {}) });
 const server = Bun.serve({
   hostname: process.env.HOST ?? '0.0.0.0', port: Number(process.env.PORT ?? '8080'),
   maxRequestBodySize: 24*1024, idleTimeout: 120, fetch: handler,
 });
 const timer = setTimeout(() => { server.stop(true); process.exit(0); },30*60*1000);
 timer.unref();
-console.info('Mochi synthetic confidential round rehearsal ready');
+console.info(`Mochi ${realMode ? 'real Phala ACI' : 'synthetic'} confidential round rehearsal ready`);

@@ -114,17 +114,21 @@ function fixture(raw: unknown = {
 }
 
 test("Phala verified answer is used and signed passport carries receipt metadata; verification failure sends no answer", async () => {
+  let aciOptions: { signal?: AbortSignal; requireUpToDate?: boolean; maxResponseBytes?: number } | undefined;
   const verifiedRunner = new PhalaAciRunner({ client: {
-    chat: async () => ({
+    chat: async (_body: unknown, options: typeof aciOptions) => { aciOptions = options; return ({
       json: { choices: [{ message: { content: JSON.stringify({ fields: { ticker: "ACME", ratio_num: "2", ratio_den: "1", effective_date: "June 1, 2026" }, evidence: { ticker: "Acme", ratio_num: "2", ratio_den: "1", effective_date: "June 1, 2026" }, confidence: {} }) } }] },
       receipt: { receiptId: "rcpt-123", sessionId: "session-456", workloadId: "phala-juror", modelId: "provider/model", provider: "phala-aci" },
       established: { workloadId: "phala-juror", tcbStatus: "UpToDate" },
-    }),
+    }); },
   } as never, model: "provider/model", timeoutMs: 1000 });
   const good = fixture(undefined, verifiedRunner);
   const result = await good.enclave.answer(await validReq());
   expect(result.vote.answerHash).toMatch(/^0x[0-9a-f]{64}$/);
   expect(good.state.sends).toHaveLength(1);
+  expect(aciOptions?.signal).toBeInstanceOf(AbortSignal);
+  expect(aciOptions?.requireUpToDate).toBe(true);
+  expect(aciOptions?.maxResponseBytes).toBe(256 * 1024);
   const passport = (await good.enclave.attestation()).passport;
   expect(passport.modelId).toContain("receipt=rcpt-123");
   expect(passport.modelId).toContain("session=session-456");
@@ -152,6 +156,32 @@ test("Phala TCB status outside TDX_ALLOWED_TCB_STATUSES produces no juror answer
     if (prior === undefined) delete process.env.TDX_ALLOWED_TCB_STATUSES;
     else process.env.TDX_ALLOWED_TCB_STATUSES = prior;
   }
+});
+
+test("Phala ACI runner enforces configured output and exact request-size bounds", async () => {
+  let calls = 0;
+  let body: Record<string, any> | undefined;
+  const runner = new PhalaAciRunner({ client: { chat: async (request: unknown) => {
+    calls++; body = request as Record<string, any>;
+    return { json: { choices: [{ message: { content: "{}" } }] }, receipt: { receiptId: "r", sessionId: "s", workloadId: "w", modelId: "provider/model" }, established: { workloadId: "w", tcbStatus: "UpToDate" } } as never;
+  } } as never, model: "provider/model", timeoutMs: 1000, maxTokens: 1024, maxInputBytes: 2048 });
+  await runner.run({ system: "s", user: "u", document: "d", jsonSchema: { type: "object" }, maxTokens: 4096 });
+  expect(body?.max_tokens).toBe(1024);
+  await expect(runner.run({ system: "s", user: "u", document: "d".repeat(3000), jsonSchema: {}, maxTokens: 1 })).rejects.toBeInstanceOf(RunnerError);
+  expect(calls).toBe(1);
+});
+
+test("Phala ACI runner keeps long provider receipt identifiers boundable in passports", async () => {
+  const rawReceipt = { receiptId: "r".repeat(64), sessionId: "s".repeat(64), workloadId: "w".repeat(64), modelId: "google/gemma-4-31b-it" };
+  const runner = new PhalaAciRunner({ client: { chat: async () => ({
+    json: { choices: [{ message: { content: "{}" } }] }, receipt: rawReceipt,
+    established: { workloadId: rawReceipt.workloadId, tcbStatus: "UpToDate" },
+  }) } as never, model: rawReceipt.modelId, timeoutMs: 1000, compactReceiptMetadata: true });
+  await runner.run({ system: "s", user: "u", document: "d", jsonSchema: {}, maxTokens: 4 });
+  expect(runner.lastProviderReceipt).toEqual(rawReceipt);
+  expect(runner.lastReceipt?.receiptId).toMatch(/^sha256:[0-9a-f]{32}$/u);
+  const passportModelId = `${runner.lastReceipt!.modelId} [receipt=${runner.lastReceipt!.receiptId};session=${runner.lastReceipt!.sessionId};workload=${runner.lastReceipt!.workloadId}]`;
+  expect(passportModelId.length).toBeLessThanOrEqual(200);
 });
 
 describe("OpenAI compatible runner", () => {

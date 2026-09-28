@@ -24,12 +24,13 @@ export async function buildRoundArtifact() {
   return {compressed,expandedBytes:expanded.byteLength,sha256:createHash('sha256').update(compressed).digest('hex')};
 }
 
-export function renderRemoteRoundCompose(revision:string,sha256:string) {
+export function renderRemoteRoundCompose(revision:string,sha256:string,mode:'synthetic-only'|'real-phala-aci'='synthetic-only') {
   if(!/^[0-9a-f]{40}$/u.test(revision)||!/^[0-9a-f]{64}$/u.test(sha256))throw new Error('Full immutable Git revision and SHA-256 are required.');
+  if(mode!=='synthetic-only'&&mode!=='real-phala-aci')throw new Error('Unsupported rehearsal mode.');
   const url=`https://raw.githubusercontent.com/mochi-oracle/mochi/${revision}/${ARTIFACT}`;
   const parsed=Bun.YAML.parse(renderCompose(Buffer.from('placeholder').toString('base64'))) as any;
   const service=parsed.services['hardware-rehearsal'];
-  service.environment={HOST:'0.0.0.0',PORT:'8080',TEE_MODE:'dstack',TEE_KEYS:'ephemeral',DSTACK_SOCKET:'/var/run/dstack.sock',SEALED_STORE_DIR:'/tmp/round',MOCHI_ROUND_MODE:'synthetic-only'};
+  service.environment={HOST:'0.0.0.0',PORT:'8080',TEE_MODE:'dstack',TEE_KEYS:'ephemeral',DSTACK_SOCKET:'/var/run/dstack.sock',SEALED_STORE_DIR:'/tmp/round',MOCHI_ROUND_MODE:mode,...(mode==='real-phala-aci'?{PHALA_API_KEY:'${PHALA_API_KEY:?set PHALA_API_KEY in the protected compose environment}',MOCHI_ROUND_AUTH_SECRET:'${MOCHI_ROUND_AUTH_SECRET:?set MOCHI_ROUND_AUTH_SECRET in the protected compose environment}'}:{})};
   // URL and expected digest are measured compose literals. No branch URL or mutable version is accepted.
   const bootstrap=[
     'import { brotliDecompressSync } from "node:zlib";',
@@ -54,7 +55,9 @@ if(import.meta.main){
  if(args.length===1&&args[0]==='--build-artifact'){
   const artifact=await buildRoundArtifact();const path=resolve(ROOT,ARTIFACT);mkdirSync(dirname(path),{recursive:true});writeFileSync(path,artifact.compressed);
   console.info(JSON.stringify({path:ARTIFACT,compressedBytes:artifact.compressed.length,expandedBytes:artifact.expandedBytes,sha256:artifact.sha256}));
- }else if(args.length===6&&args[0]==='--revision'&&args[2]==='--sha256'&&args[4]==='--out'){
-  const compose=renderRemoteRoundCompose(args[1]!,args[3]!);const path=resolve(args[5]!);mkdirSync(dirname(path),{recursive:true});writeFileSync(path,compose,{mode:0o600});console.info(`Rendered pinned round compose: ${Buffer.byteLength(compose)} bytes`);
- }else throw new Error('Use --build-artifact, or --revision <commit> --sha256 <digest> --out <path>.');
+ }else if((args.length===6||args.length===8)&&args[0]==='--revision'&&args[2]==='--sha256'&&args[4]==='--out'){
+  let mode:'synthetic-only'|'real-phala-aci'='synthetic-only';
+  if(args.length===8){if(args[6]!=='--mode'||args[7]!=='real-aci')throw new Error('--mode only accepts real-aci.');mode='real-phala-aci';}
+  const compose=renderRemoteRoundCompose(args[1]!,args[3]!,mode);const path=resolve(args[5]!);mkdirSync(dirname(path),{recursive:true});writeFileSync(path,compose,{mode:0o600});console.info(`Rendered pinned ${mode} round compose: ${Buffer.byteLength(compose)} bytes`);
+}else throw new Error('Use --build-artifact, or --revision <commit> --sha256 <digest> --out <path> [--mode real-aci].');
 }

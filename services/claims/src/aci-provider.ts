@@ -1,4 +1,4 @@
-import { AciClient } from '@mochi/aci';
+import { AciClient, AciVerificationError } from '@mochi/aci';
 import type { EvidenceBundle, Juror } from './types.ts';
 import { CLAIMS_MAX_RESPONSE_BYTES, createClaimChatRequest, parseClaimChatResponse, reportedClaimUsage, type ChatJurorTelemetry } from './providers.ts';
 import { phalaDcap } from '../../juror/src/phala-dcap.ts';
@@ -55,28 +55,51 @@ export function createAciJuror(options: AciJurorOptions): Juror {
     async assess(bundle: EvidenceBundle, parentSignal?: AbortSignal): Promise<unknown> {
       const startedAt = Date.now();
       let usage: ChatJurorTelemetry['usage'];
+      let stage: NonNullable<ChatJurorTelemetry['stage']> = 'request_build';
+      let errorCode: string | undefined;
       const report = (outcome: ChatJurorTelemetry['outcome']) => emit(options.onTelemetry, {
         id: options.id,
         model: options.model,
         elapsedMs: Math.max(0, Date.now() - startedAt),
         outcome,
+        stage: outcome === 'success' ? 'complete' : stage,
+        ...(errorCode ? { errorCode } : {}),
         ...(usage ? { usage } : {}),
       });
       const controller = new AbortController();
       const abortFromParent = () => controller.abort(parentSignal?.reason);
       if (parentSignal?.aborted) abortFromParent();
       else parentSignal?.addEventListener('abort', abortFromParent, { once: true });
-      const timer = setTimeout(() => controller.abort(), options.timeoutMs ?? DEFAULT_TIMEOUT_MS);
+      let timeoutTriggered = false;
+      const timer = setTimeout(() => { timeoutTriggered = true; controller.abort(); }, options.timeoutMs ?? DEFAULT_TIMEOUT_MS);
       try {
         const request = createClaimChatRequest(options.model, bundle, outputTokens);
-        if (controller.signal.aborted) throw new Error('Provider request unavailable');
+        if (controller.signal.aborted) { stage = 'aci_exchange'; errorCode = 'REQUEST_ABORTED'; throw new Error('Provider request unavailable'); }
+        stage = 'attestation';
         const result = await client.chat(JSON.parse(request), { signal: controller.signal, maxResponseBytes: CLAIMS_MAX_RESPONSE_BYTES, requireUpToDate: true });
-        if (result.established.tcbStatus !== 'UpToDate') throw new Error('Provider request unavailable');
+        if (result.established.tcbStatus !== 'UpToDate') { stage = 'attestation'; errorCode = 'TCB_STATUS_NOT_UP_TO_DATE'; throw new Error('Provider request unavailable'); }
+        stage = 'response_parse';
         usage = reportedClaimUsage(result.json);
         const answer = parseClaimChatResponse(result.json);
         report('success');
         return answer;
-      } catch {
+      } catch (error) {
+        if (!errorCode) {
+          if (timeoutTriggered) { stage = 'aci_exchange'; errorCode = 'ACI_TIMEOUT'; }
+          else if (controller.signal.aborted || (error instanceof Error && error.name === 'AbortError') || (error instanceof AciVerificationError && error.code === 'aborted')) {
+            stage = 'aci_exchange'; errorCode = 'REQUEST_ABORTED';
+          } else if (error instanceof AciVerificationError) {
+            const code = error.code;
+            if (/^(?:attestation_|report_|quote_|dcap_|compose_|workload_|tcb_status$)/u.test(code)) stage = 'attestation';
+            else if (/^inference_/u.test(code)) stage = 'inference';
+            else if (/^receipt_|^body_hash$|^upstream_/u.test(code)) stage = 'receipt';
+            else if (/^response_json$|^response_too_large$|^response_body$/u.test(code)) stage = 'response_parse';
+            else stage = 'aci_exchange';
+            errorCode = `ACI_${code.toUpperCase()}`;
+          } else if (stage === 'request_build') errorCode = 'REQUEST_BUILD_FAILED';
+          else if (stage === 'response_parse') errorCode = 'RESPONSE_INVALID';
+          else { stage = 'aci_exchange'; errorCode = 'ACI_EXCHANGE_FAILED'; }
+        }
         report('failure');
         throw new Error('Provider request unavailable');
       } finally {

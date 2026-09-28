@@ -1,5 +1,6 @@
 import { z } from 'zod';
 import { EnvelopeSchema } from '@mochi/protocol';
+import { createHash, timingSafeEqual } from 'node:crypto';
 
 const RequestSchema = z.object({
   envelope: EnvelopeSchema,
@@ -7,13 +8,15 @@ const RequestSchema = z.object({
 }).strict();
 const MAX_BODY = 24 * 1024;
 
-/** A bounded, synthetic-only rehearsal surface; it is not a production review API. */
+/** Bounded synthetic or real-ACI rehearsal surface; never a production review API. */
 export function createRoundHandler(service: {
   attestations(): Promise<unknown>;
   run(input: z.infer<typeof RequestSchema>): Promise<unknown>;
-}) {
+}, options: { mode?: 'synthetic' | 'real-aci'; roundAuthSecret?: string } = {}) {
+  const mode = options.mode ?? 'synthetic';
   let active = false;
   let attempts = 0;
+  const attemptLimit = mode === 'real-aci' ? 1 : 3;
   let attestations = 0;
   const json = (body: unknown, status = 200) => Response.json(body, {
     status, headers: { 'cache-control': 'no-store', 'x-content-type-options': 'nosniff' },
@@ -22,7 +25,7 @@ export function createRoundHandler(service: {
     const path = new URL(request.url).pathname;
     if (request.method === 'GET' && path === '/health') return json({
       ok: true, service: 'confidential_round_rehearsal', fixtureOnly: true,
-      chain: 'fixture', models: 'synthetic', roles: 'co-resident', payments: false,
+      chain: 'fixture', models: mode === 'synthetic' ? 'synthetic' : 'real-phala-aci', roles: 'co-resident', payments: false,
     });
     if (request.method === 'GET' && path === '/v1/attestations') {
       if (attestations++ >= 30) return json({ error: 'ATTESTATION_LIMIT' }, 429);
@@ -30,8 +33,16 @@ export function createRoundHandler(service: {
       catch { return json({ error: 'ATTESTATION_UNAVAILABLE' }, 503); }
     }
     if (request.method !== 'POST' || path !== '/v1/rehearsal/round') return json({ error: 'NOT_FOUND' }, 404);
+    if (mode === 'real-aci') {
+      const expected = options.roundAuthSecret;
+      const supplied = request.headers.get('authorization') ?? '';
+      const actual = supplied.startsWith('Bearer ') ? supplied.slice(7) : '';
+      const suppliedHash = createHash('sha256').update(actual).digest();
+      const expectedHash = createHash('sha256').update(expected ?? '').digest();
+      if (!expected || !actual || !timingSafeEqual(suppliedHash, expectedHash)) return json({ error: 'UNAUTHORIZED' }, 401);
+    }
     if (active) return json({ error: 'ROUND_BUSY' }, 429);
-    if (attempts >= 3) return json({ error: 'ROUND_LIMIT' }, 429);
+    if (attempts >= attemptLimit) return json({ error: 'ROUND_LIMIT' }, 429);
     // Reserve before any await: malformed/aborted requests also consume the finite budget.
     active = true;
     attempts++;

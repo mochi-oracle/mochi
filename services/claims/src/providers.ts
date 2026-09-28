@@ -24,6 +24,8 @@ export interface ChatJurorTelemetry {
   model: string;
   elapsedMs: number;
   outcome: 'success' | 'failure';
+  stage?: 'complete' | 'request_build' | 'attestation' | 'inference' | 'receipt' | 'aci_exchange' | 'response_parse';
+  errorCode?: string;
   usage?: {
     promptTokens?: number;
     completionTokens?: number;

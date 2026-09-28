@@ -1,3 +1,5 @@
+import { createHash } from "node:crypto";
+
 export interface ModelInput {
   system: string;
   user: string;
@@ -80,28 +82,40 @@ export class OpenAICompatibleRunner implements ModelRunner {
  * receipt and both exact wire body hashes have verified. */
 export class PhalaAciRunner implements ModelRunner {
   lastReceipt: { receiptId: string; sessionId: string; workloadId: string; modelId: string } | undefined;
-  constructor(private readonly options: { client: import("@mochi/aci").AciClient; model: string; timeoutMs: number }) {}
+  lastProviderReceipt: { receiptId: string; sessionId: string; workloadId: string; modelId: string } | undefined;
+  constructor(private readonly options: { client: import("@mochi/aci").AciClient; model: string; timeoutMs: number; maxTokens?: number; maxInputBytes?: number; compactReceiptMetadata?: boolean }) {}
   async run(input: ModelInput): Promise<unknown> {
+    const maxTokens = Math.min(input.maxTokens, this.options.maxTokens ?? input.maxTokens);
+    const requestBody = {
+      model: this.options.model,
+      messages: [
+        { role: "system", content: input.system },
+        { role: "user", content: `${input.user}\n\n<document>\n${input.document}\n</document>` },
+      ],
+      response_format: { type: "json_schema", json_schema: { name: "mochi_extraction", schema: input.jsonSchema, strict: true } },
+      temperature: 0,
+      seed: 0,
+      max_tokens: maxTokens,
+    };
+    if (this.options.maxInputBytes !== undefined && new TextEncoder().encode(JSON.stringify(requestBody)).byteLength > this.options.maxInputBytes) throw new RunnerError("model request exceeds the configured public bound");
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), this.options.timeoutMs);
     try {
-      const result = await this.options.client.chat({
-        model: this.options.model,
-        messages: [
-          { role: "system", content: input.system },
-          { role: "user", content: `${input.user}\n\n<document>\n${input.document}\n</document>` },
-        ],
-        response_format: { type: "json_schema", json_schema: { name: "mochi_extraction", schema: input.jsonSchema, strict: true } },
-        temperature: 0,
-        seed: 0,
-        max_tokens: input.maxTokens,
-      });
-      const allowedTcbStatuses = (process.env.TDX_ALLOWED_TCB_STATUSES ?? "UpToDate").split(",").map((status) => status.trim());
-      if (!allowedTcbStatuses.includes(result.established.tcbStatus)) throw new RunnerError("TDX TCB status is not allowed");
+      const result = await this.options.client.chat(requestBody, { signal: controller.signal, requireUpToDate: true, maxResponseBytes: 256 * 1024 });
+      // ACI checks UpToDate on the freshly attested workload before submitting
+      // chat when requireUpToDate is set. Keep this defense-in-depth check too.
+      if (result.established.tcbStatus !== "UpToDate") throw new RunnerError("TDX TCB status is not allowed");
       const choices = result.json?.choices;
       const message = Array.isArray(choices) ? choices[0]?.message : undefined;
       if (typeof message?.content !== "string") throw new RunnerError("model response has no JSON content");
-      this.lastReceipt = { ...result.receipt, workloadId: result.established.workloadId };
+      this.lastProviderReceipt = { ...result.receipt, workloadId: result.established.workloadId };
+      const digest = (value: string) => `sha256:${createHash("sha256").update(value).digest("hex").slice(0, 32)}`;
+      this.lastReceipt = this.options.compactReceiptMetadata ? {
+        modelId: result.receipt.modelId,
+        receiptId: digest(result.receipt.receiptId),
+        sessionId: digest(result.receipt.sessionId),
+        workloadId: digest(result.established.workloadId),
+      } : this.lastProviderReceipt;
       try { return JSON.parse(message.content) as unknown; }
       catch (error) { throw new RunnerError("model response content is invalid JSON", { cause: error }); }
     } catch (error) {

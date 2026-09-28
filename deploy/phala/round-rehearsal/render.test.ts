@@ -15,6 +15,16 @@ test('compose binds an immutable artifact and keeps the bounded existing VM poli
  expect(service.command[2]).toContain('redirect:"error"');
  expect(service.command[2]).not.toContain('${');
 });
+test('real mode maps protected host env references without serializing credential values',()=>{
+ const secretA='x'.repeat(40),secretB='y'.repeat(48);
+ const compose=renderRemoteRoundCompose('a'.repeat(40),'b'.repeat(64),'real-phala-aci');
+ const service=(Bun.YAML.parse(compose) as any).services['confidential-round-rehearsal'];
+ expect(service.environment.MOCHI_ROUND_MODE).toBe('real-phala-aci');
+ expect(service.environment.PHALA_API_KEY).toContain('PHALA_API_KEY');
+ expect(service.environment.MOCHI_ROUND_AUTH_SECRET).toContain('MOCHI_ROUND_AUTH_SECRET');
+ expect(compose).not.toContain(secretA);expect(compose).not.toContain(secretB);
+ expect(()=>renderRemoteRoundCompose('a'.repeat(40),'b'.repeat(64),'unsafe' as never)).toThrow();
+});
 test('actual bootstrap rejects altered artifact bytes before writing or executing code',async()=>{
  const service=(Bun.YAML.parse(renderRemoteRoundCompose('a'.repeat(40),'b'.repeat(64))) as any).services['confidential-round-rehearsal'];
  const fake=brotliCompressSync(Buffer.from('throw new Error("MUST_NOT_EXECUTE")')).toString('base64');

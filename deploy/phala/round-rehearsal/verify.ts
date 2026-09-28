@@ -1,10 +1,13 @@
+import { createHash } from "node:crypto";
 import { answerHash, canonicalJson, docCommit, docHash, verdictId, votesHash } from "@mochi/core";
 import { aad, AttestationDocSchema, JurorAttestationDocSchema, PrivateResultPlainSchema, type JurorVoteJson } from "@mochi/protocol";
 import { DcapQuoteVerifier, PcsCollateralSource, keyBinding, open, parseTdxQuote, parseTdxReportData, recoverProvenance, recoverJurorAnswer, recoverVerdictAttestation, seal, tdxMeasurement, type Quote } from "@mochi/tee";
-import { fromHex, keccak256, type Address, type Hex } from "viem";
+import { fromHex, keccak256, recoverMessageAddress, type Address, type Hex } from "viem";
+import { passportHash } from "@mochi/protocol";
 import { ROUND_REHEARSAL_FIXTURE, ROUND_REHEARSAL_MODEL_OUTPUT } from "./round.ts";
 import { normalizeParams, paramsHash, resolveSchema } from "@mochi/schemas";
 import { boundedHttpsFetch } from "../rehearsal/http.ts";
+import { REAL_MODELS, REAL_ESTIMATED_COST_USD } from "./real-mode.ts";
 
 const MAX_RESPONSE = 256 * 1024;
 const MAX_REQUEST = 32 * 1024;
@@ -22,17 +25,19 @@ function assertBaseUrl(raw: string): URL {
   return url;
 }
 
-export function parseRoundVerifyArgs(args: string[]): { baseUrl: string; measurement: Hex } {
+export function parseRoundVerifyArgs(args: string[]): { baseUrl: string; measurement: Hex; mode: "synthetic" | "real-aci" } {
   let baseUrl = "http://127.0.0.1:8080", baseSet = false;
   let measurement: string | undefined;
+  let mode: "synthetic" | "real-aci" = "synthetic";
   for (let i = 0; i < args.length; i++) {
     if (args[i] === "--base-url" && !baseSet) { const v = args[++i]; if (typeof v !== "string" || !v) fail("--base-url requires a value."); baseUrl = v as string; baseSet = true; }
     else if (args[i] === "--measurement" && !measurement) measurement = args[++i];
+    else if (args[i] === "--mode" && mode === "synthetic") { const v = args[++i]; if (v !== "real-aci") fail("--mode only accepts real-aci when specified."); mode = "real-aci"; }
     else fail("Unknown or duplicate verifier argument.");
   }
   if (!measurement || !/^0x[0-9a-fA-F]{64}$/u.test(measurement)) fail("--measurement must be explicitly pinned as bytes32.");
   assertBaseUrl(baseUrl);
-  return { baseUrl, measurement: measurement as Hex };
+  return { baseUrl, measurement: measurement as Hex, mode };
 }
 
 export function validatePinnedMeasurement(actual: string, expected: string): void {
@@ -108,7 +113,7 @@ async function checkAttestations(raw: unknown, pin: Hex, deps: RoundVerifyTestDe
   return { intake, consensus, jurors };
 }
 
-async function verifyRound(baseUrl: string, pin: Hex, deps: RoundVerifyTestDependencies): Promise<Record<string, unknown>> {
+async function verifyRound(baseUrl: string, pin: Hex, deps: RoundVerifyTestDependencies, mode: "synthetic" | "real-aci" = "synthetic", roundAuthSecret?: string): Promise<Record<string, unknown>> {
   const base = assertBaseUrl(baseUrl);
   // Fetch and fully verify all five real TDX identities before creating or submitting any fixture data.
   const attestRes = await boundedEndpointFetch(new URL("/v1/attestations", base), {}, deps.fetch, 40_000);
@@ -128,9 +133,20 @@ async function verifyRound(baseUrl: string, pin: Hex, deps: RoundVerifyTestDepen
   const envelope = seal(attestations.intake.encryptionPubKey as Hex, encode(upload), aad.intake());
   const body = JSON.stringify({ envelope, payerResultPubKey: payerPubHex });
   if (Buffer.byteLength(body) > MAX_REQUEST) fail("Synthetic round request exceeds the request limit.");
-  const response = await boundedEndpointFetch(new URL("/v1/rehearsal/round", base), { method: "POST", headers: { "content-type": "application/json" }, body }, deps.fetch, 120_000);
+  const response = await boundedEndpointFetch(new URL("/v1/rehearsal/round", base), { method: "POST", headers: { "content-type": "application/json", ...(mode === "real-aci" && roundAuthSecret ? { authorization: `Bearer ${roundAuthSecret}` } : {}) }, body }, deps.fetch, 120_000);
   if (!response.ok) fail("Encrypted private round did not return success.");
   const result = asRecord(await response.json()), intake = asRecord(result.intake), decision = asRecord(result.decision);
+  let reportedReceipts: unknown[] = [];
+  if (mode === "real-aci") {
+    if (!roundAuthSecret || !result.realInference || result.realInference.provider !== "phala-aci" || JSON.stringify(result.realInference.models) !== JSON.stringify(REAL_MODELS) || result.realInference.estimatedCostUsd !== REAL_ESTIMATED_COST_USD || result.realInference.costEstimateBasis !== "catalog token rates; requested max_tokens and input-byte reservation; actual provider usage may differ" || result.realInference.receiptVerification !== "server-side ACI verification; response metadata is not an independent proof") fail("Real inference metadata is missing or does not match the pinned run.");
+    const receipts = result.realInference.receipts;
+    if (!Array.isArray(receipts) || receipts.length !== 3) fail("Expected three real provider receipts.");
+    reportedReceipts = receipts;
+    for (let i = 0; i < 3; i++) {
+      const receipt = asRecord(receipts[i]);
+      if (receipt.seat !== i || receipt.modelId !== REAL_MODELS[i] || typeof receipt.receiptId !== "string" || !receipt.receiptId || typeof receipt.sessionId !== "string" || !receipt.sessionId || typeof receipt.workloadId !== "string" || !receipt.workloadId || receipt.verification !== "ACI client verified provider signature and exact request/response body hashes in server process") fail("Provider receipt metadata did not match the allowed model set.");
+    }
+  }
   if (intake.docCommit?.toLowerCase() !== expectedDocCommit.toLowerCase() || intake.paramsHash?.toLowerCase() !== expectedParamsHash.toLowerCase()) fail("Intake fixture commitment mismatch.");
   if (intake.identity?.toLowerCase() !== attestations.intake.address.toLowerCase()) fail("Intake provenance identity mismatch.");
   const provenance = asRecord(intake.provenance);
@@ -155,17 +171,34 @@ async function verifyRound(baseUrl: string, pin: Hex, deps: RoundVerifyTestDepen
   const recoveredConsensus = await recoverVerdictAttestation(fixture.chainId, fixture.verdictsAddress as Address, vi as never, votesDigest, decision.consensusSig as Hex);
   if (recoveredConsensus.toLowerCase() !== attestations.consensus.address.toLowerCase()) fail("Consensus decision signature mismatch.");
   const decisionHash = answerHash({ salt: fixture.salt as Hex, schemaId: fixture.schemaId as never, schemaVersion: fixture.schemaVersion, fields: EXPECTED_FIELDS as never });
-  if (vi.answerHash?.toLowerCase() !== decisionHash.toLowerCase() || votes.some((v: Record<string, any>) => v.answerHash?.toLowerCase() !== decisionHash.toLowerCase())) fail("Decision answer hash does not match the fixed synthetic result.");
+  if (vi.answerHash?.toLowerCase() !== decisionHash.toLowerCase() || votes.some((v: Record<string, any>) => v.answerHash?.toLowerCase() !== decisionHash.toLowerCase())) fail("Decision answer hash does not match the fixed fixture answer.");
   if (result.fixture?.chainId !== 31337 || result.fixture?.queryId !== fixture.queryId || result.fixture?.schemaId !== fixture.schemaId || result.fixture?.schemaVersion !== fixture.schemaVersion || result.fixture?.verdictsAddress?.toLowerCase() !== fixture.verdictsAddress.toLowerCase() || result.fixture?.sourceProvenance !== "SUBMITTED") fail("Response fixture identity mismatch.");
 
   const plainBytes = open(payerSecret, decision.privateResult, aad.result(id));
   const privateResult = PrivateResultPlainSchema.parse(JSON.parse(new TextDecoder().decode(plainBytes)));
-  if (privateResult.verdictId.toLowerCase() !== id.toLowerCase() || privateResult.salt.toLowerCase() !== fixture.salt.toLowerCase() || privateResult.answerJson !== canonicalJson({ salt: fixture.salt, schemaId: fixture.schemaId, schemaVersion: fixture.schemaVersion, fields: EXPECTED_FIELDS })) fail("Private result body mismatch.");
+  if (privateResult.verdictId.toLowerCase() !== id.toLowerCase() || privateResult.salt.toLowerCase() !== fixture.salt.toLowerCase()) fail("Private result body mismatch.");
   const parsedAnswer = JSON.parse(privateResult.answerJson);
   if (answerHash({ salt: parsedAnswer.salt, schemaId: parsedAnswer.schemaId, schemaVersion: parsedAnswer.schemaVersion, fields: parsedAnswer.fields }) !== vi.answerHash) fail("Private answer hash mismatch.");
   const field = privateResult.fields[0];
-  if (privateResult.fields.length !== 1 || field?.field !== "answer" || field.required !== true || field.agreeBps !== 10_000 || field.hung || JSON.stringify(field.value) !== JSON.stringify(EXPECTED_FIELDS.answer) || ROUND_REHEARSAL_MODEL_OUTPUT.fields.answer !== "42") fail("Private result does not contain the expected synthetic answer.");
+  if (privateResult.fields.length !== 1 || field?.field !== "answer" || field.required !== true || field.agreeBps !== 10_000 || field.hung) fail("Private result does not contain the expected answer.");
+  if (privateResult.answerJson !== canonicalJson({ salt: fixture.salt, schemaId: fixture.schemaId, schemaVersion: fixture.schemaVersion, fields: EXPECTED_FIELDS }) || JSON.stringify(field?.value) !== JSON.stringify(EXPECTED_FIELDS.answer) || ROUND_REHEARSAL_MODEL_OUTPUT.fields.answer !== "42") fail("Private result does not contain the expected fixed-fixture answer.");
   if (keccak256(privateResult.payload as Hex).toLowerCase() !== String(vi.payloadHash).toLowerCase()) fail("Private payload hash mismatch.");
+  let realModelPassports: unknown;
+  if (mode === "real-aci") {
+    const post = await boundedEndpointFetch(new URL("/v1/attestations", base), {}, deps.fetch, 40_000);
+    if (!post.ok) fail("Post-inference attestation endpoint did not return success.");
+    const postDocs = await checkAttestations(await post.json(), pin, deps);
+    realModelPassports = await Promise.all(postDocs.jurors.map(async (doc, index) => {
+      if (doc.passport.provider !== "phala-aci" || !doc.passport.modelId.includes(`${REAL_MODELS[index]} [receipt=`) || !doc.passport.modelId.includes(";session=") || !doc.passport.modelId.includes(";workload=")) fail("Post-inference signed model passport is missing expected receipt metadata.");
+      if ((doc.passport.weightsSha256 as string) !== `0x${"00".repeat(32)}` || doc.passport.openWeights !== false || doc.passport.zdr !== false) fail("Model passport contains unsupported provider or weights claims.");
+      const signer = await recoverMessageAddress({ message: { raw: passportHash(doc.passport) }, signature: doc.passportSig as Hex });
+      if (signer.toLowerCase() !== doc.address.toLowerCase()) fail("Post-inference model passport signature mismatch.");
+      const metadata = asRecord(reportedReceipts[index]);
+      const digest = (value: string) => `sha256:${createHash("sha256").update(value).digest("hex").slice(0, 32)}`;
+      if (typeof metadata.receiptId !== "string" || typeof metadata.sessionId !== "string" || typeof metadata.workloadId !== "string" || !doc.passport.modelId.includes(`${REAL_MODELS[index]} [receipt=${digest(metadata.receiptId)};session=${digest(metadata.sessionId)};workload=${digest(metadata.workloadId)}]`)) fail("Signed model passport does not bind to the returned receipt metadata.");
+      return { seat: index, modelId: doc.passport.modelId, weightsHash: "unavailable; all-zero sentinel", openWeights: "not claimed", zdr: "not claimed" };
+    }));
+  }
   return {
     ok: true,
     verifiedIdentities: 5,
@@ -175,23 +208,24 @@ async function verifyRound(baseUrl: string, pin: Hex, deps: RoundVerifyTestDepen
     enclaveTopology: "five identities share one pinned CVM measurement; co-resident keys, not independent enclaves",
     intakeCommitmentAndProvenance: "matched synthetic fixture and signature",
     jurorVotesAndConsensusSignature: "matched fixed query, schema, answer hash, and signer identities",
-    privateCiphertext: "decrypted by ephemeral payer key; answer hash and expected synthetic answer matched",
-    limitations: ["chainId 31337 with synthetic contract domains", "synthetic model output", "co-resident keys", "no production enrollment, payment, settlement, or model independence"],
+    privateCiphertext: mode === "synthetic" ? "decrypted by ephemeral payer key; answer hash and expected synthetic answer matched" : "decrypted by ephemeral payer key; model result was produced by the bounded real-ACI test",
+    ...(mode === "real-aci" ? { realInference: { models: REAL_MODELS, passports: realModelPassports, providerReceipts: "verified by server ACI client; client sees signed passport metadata but does not independently verify provider receipt proofs" } } : {}),
+    limitations: ["chainId 31337 with synthetic contract domains", mode === "synthetic" ? "synthetic model output" : "fixed public synthetic evidence; real provider inference; server-side receipt proof verification only", "co-resident keys", "no production enrollment, payment, settlement, or model independence"],
   };
 }
 
 /** Test-only injection seam. The CLI uses production dependencies directly and cannot enable this seam. */
-export function verifyRoundRehearsalWithTestDependencies(baseUrl: string, expectedMeasurement: Hex, deps: RoundVerifyTestDependencies): Promise<Record<string, unknown>> {
-  return verifyRound(baseUrl, expectedMeasurement, deps);
+export function verifyRoundRehearsalWithTestDependencies(baseUrl: string, expectedMeasurement: Hex, deps: RoundVerifyTestDependencies, mode: "synthetic" | "real-aci" = "synthetic", roundAuthSecret?: string): Promise<Record<string, unknown>> {
+  return verifyRound(baseUrl, expectedMeasurement, deps, mode, roundAuthSecret);
 }
-export function verifyRoundRehearsal(baseUrl: string, expectedMeasurement: Hex): Promise<Record<string, unknown>> {
-  return verifyRound(baseUrl, expectedMeasurement, createProductionDeps());
+export function verifyRoundRehearsal(baseUrl: string, expectedMeasurement: Hex, mode: "synthetic" | "real-aci" = "synthetic", roundAuthSecret?: string): Promise<Record<string, unknown>> {
+  return verifyRound(baseUrl, expectedMeasurement, createProductionDeps(), mode, roundAuthSecret);
 }
 
 if (import.meta.main) {
   let args: ReturnType<typeof parseRoundVerifyArgs> | undefined;
   try { args = parseRoundVerifyArgs(Bun.argv.slice(2)); }
   catch { process.stderr.write("Usage: bun deploy/phala/round-rehearsal/verify.ts --measurement 0x<64 hex> [--base-url https://HOST]\n"); process.exitCode = 2; }
-  if (args) try { process.stdout.write(`${JSON.stringify(await verifyRoundRehearsal(args.baseUrl, args.measurement), null, 2)}\n`); }
+  if (args) try { process.stdout.write(`${JSON.stringify(await verifyRoundRehearsal(args.baseUrl, args.measurement, args.mode, args.mode === "real-aci" ? process.env.MOCHI_ROUND_AUTH_SECRET : undefined), null, 2)}\n`); }
   catch { process.stderr.write("Confidential round rehearsal verification failed; response data is suppressed.\n"); process.exitCode = 1; }
 }
