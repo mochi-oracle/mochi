@@ -17,6 +17,9 @@ export function renderClaimsCompose(revision: string, digest: string) {
   service.environment = {
     MOCHI_CLAIMS_MODE: 'pilot', MOCHI_CLAIMS_DATABASE: '/data/claims.sqlite', MOCHI_CLAIMS_DAILY_ACTIONS: '40',
     MOCHI_CLAIMS_ACCESS_TOKEN: '${MOCHI_CLAIMS_ACCESS_TOKEN:?protected invitation token required}',
+    MOCHI_REVENUE_WORKER_MANIFEST: '${MOCHI_REVENUE_WORKER_MANIFEST:-}',
+    MOCHI_REVENUE_REPORT_FILE: '${MOCHI_REVENUE_REPORT_FILE:-}',
+    MOCHI_TOKEN_CONFIRMED: '${MOCHI_TOKEN_CONFIRMED:-false}',
     PHALA_API_KEY: '${PHALA_API_KEY:?protected provider key required}',
     MOCHI_CLAIMS_JURORS: JSON.stringify(REAL_MODELS.map((model, i) => ({ id: `juror-${i+1}`, model, transport: 'phala-aci', baseUrl: 'https://inference.phala.com/v1', apiKeyEnv: 'PHALA_API_KEY' }))),
   };

@@ -1,0 +1,71 @@
+{
+  "mode": "disabled",
+  "databasePath": "/data/revenue/accounting.sqlite",
+  "reportOutputPath": "/data/revenue/public-report.json",
+  "burnEvidenceFile": "/data/revenue/burns.json",
+  "rpcUrl": "https://replace-with-approved-rpc.invalid",
+  "ingestion": {
+    "chainId": "0",
+    "escrowAddress": "APPROVED_ESCROW_REQUIRED",
+    "usdgAddress": "APPROVED_USDG_REQUIRED",
+    "recipientAddress": "REVIEW_TREASURY_REQUIRED",
+    "startBlock": "0",
+    "chunkSize": 1000,
+    "maxChunks": 5
+  },
+  "report": {
+    "chainId": 0,
+    "rpcUrl": "https://replace-with-approved-rpc.invalid",
+    "settlementStreamId": "derived-by-worker",
+    "reviewEscrowAddress": "APPROVED_ESCROW_REQUIRED",
+    "usdgAddress": "APPROVED_USDG_REQUIRED",
+    "usdgDecimals": 6,
+    "mochiAddress": "TEAM_TOKEN_REQUIRED",
+    "mochiDecimals": 18,
+    "reviewTreasuryAddress": "REVIEW_TREASURY_REQUIRED",
+    "purchaseRecipientAddress": "MANUAL_BURN_CUSTODY_REQUIRED",
+    "minimumConfirmations": 12
+  },
+  "buyback": {
+    "enabled": false,
+    "teamConfirmedTokenAddress": false,
+    "reviewedPolicyId": "",
+    "operatingBudgetId": "",
+    "chainId": "0",
+    "tokenAddress": "TEAM_TOKEN_REQUIRED",
+    "usdgAddress": "APPROVED_USDG_REQUIRED",
+    "reviewTreasuryAddress": "REVIEW_TREASURY_REQUIRED",
+    "tokenRecipientAddress": "MANUAL_BURN_CUSTODY_REQUIRED",
+    "routerAddress": "APPROVED_ROUTER_REQUIRED",
+    "maxSlippageBps": 100
+  },
+  "approvedBudgetId": "",
+  "budget": {
+    "budgetId": "",
+    "asOfMs": 0,
+    "uncoveredDailyOperatingCost": null,
+    "retainedOperatingReserve": null
+  },
+  "obligations": {
+    "modelLiabilities": null,
+    "infrastructureLiabilities": null,
+    "refunds": null
+  },
+  "keyFile": "/data/revenue/signer.key",
+  "journalPath": "/data/revenue/signed-transactions.sqlite",
+  "route": {
+    "routerAddress": "APPROVED_ROUTER_REQUIRED",
+    "routerVariant": "router02",
+    "routerCodeHash": "REVIEWED_BYTECODE_HASH_REQUIRED",
+    "quoterAddress": "APPROVED_QUOTER_REQUIRED",
+    "quoterCodeHash": "REVIEWED_BYTECODE_HASH_REQUIRED",
+    "fee": 3000,
+    "maxGasCostWei": "0",
+    "nativeCurrency": {
+      "name": "APPROVED_NATIVE_ASSET",
+      "symbol": "REQUIRED",
+      "decimals": 18
+    },
+    "readAttributableReviewFundsSource": "settlement-ledger-v1"
+  }
+}

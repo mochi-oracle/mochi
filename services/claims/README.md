@@ -63,7 +63,7 @@ Research and review requests send `x-mochi-access-token`; sharing additionally s
 
 `packages/sdk/src/claims.ts` adapts supplied claim evidence into the existing private protocol. The browser client in `web/site/src/claim-protocol-client.js` uses that same framing and the existing attested-intake/wallet lifecycle. Supplied URLs are metadata, not proof that a source was fetched or authenticated. Deployment must be configured and verified before payment is offered; an unpaid research result cannot settle an escrow query.
 
-`src/revenue.ts` computes eligible residual review revenue after known costs, refunds and reserves. `src/buybacks.ts` is a disabled-by-default orchestration boundary for a future approved chain adapter and durable accounting store. It is not a running purchase service: no router, signing wallet, settlement ledger or production store is supplied. Developer/creator fees are outside this boundary. The team's future token address is required before activation; this project never creates that token. Purchases and manual burns are separate actions.
+`src/revenue-worker.ts` connects the durable settlement ledger, reserve policy, purchase engine and receipt-verified public report. `src/uniswap-buyback-adapter.ts` supplies an explicitly configured V3/Router02 route with private durable submission recovery. Execution defaults to disabled; the team's token address, actual liquidity route, operating budget and funded authorized signer are launch inputs. Developer fees remain separate, and purchases never burn automatically. See [revenue operations](REVENUE-OPERATIONS.md) for commands, hosting and activation requirements.
 
 ## Hosted invitation mode
 

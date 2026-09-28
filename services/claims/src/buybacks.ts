@@ -274,6 +274,26 @@ export async function runReviewBuyback(request: BuybackRequest, deps: BuybackDep
   }));
 }
 
+/** Recover an existing reservation without a new budget, quote, allocation or submission. */
+export async function reconcilePendingBuyback(batchId: string, deps: BuybackDependencies): Promise<BuybackResult> {
+  if (deps.config?.enabled !== true) return { status: 'disabled', reason: 'disabled' };
+  if (!validConfig(deps.config) || !batchId) return { status: 'blocked', reasons: ['invalid_configuration'] };
+  const config = deps.config;
+  return deps.store.withTreasuryLock(config.reviewTreasuryAddress!.toLowerCase(), () => deps.store.withBatchLock(batchId, async () => {
+    const record = await deps.store.get(batchId);
+    if (!record) return { status: 'blocked', reasons: ['invalid_request'] };
+    const x = record.execution;
+    if (x.chainId !== config.chainId || !sameAddress(x.routerAddress, config.routerAddress!)
+      || !sameAddress(x.treasuryAddress, config.reviewTreasuryAddress!) || !sameAddress(x.senderAddress, config.reviewTreasuryAddress!)
+      || !sameAddress(x.recipient, config.tokenRecipientAddress!) || !sameAddress(x.inputToken, config.usdgAddress!)
+      || !sameAddress(x.outputToken, config.tokenAddress!)) return { status: 'blocked', reasons: ['invalid_configuration'] };
+    if (record.status === 'purchased') return { status: 'already_purchased', transactionRef: record.transactionRef!, amountIn: x.amountIn, receivedTokenAmount: record.receivedTokenAmount! };
+    if (record.status === 'failed') return { status: 'failed', transactionRef: record.transactionRef! };
+    if (record.status === 'cancelled') return { status: 'blocked', reasons: ['stale_or_expired_quote'] };
+    return reconcileExisting(record, deps.store, deps.adapter);
+  }));
+}
+
 async function reconcileExisting(
   record: PersistedBuyback,
   store: BuybackStore,
