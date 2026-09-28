@@ -1,6 +1,24 @@
 import {test,expect} from 'bun:test';
 import {brotliCompressSync} from 'node:zlib';
-import {renderRemoteRoundCompose} from '../../../scripts/phala-round-rehearsal.ts';
+import {mkdtempSync,mkdirSync,writeFileSync,symlinkSync,rmSync} from 'node:fs';
+import {tmpdir} from 'node:os';
+import {join} from 'node:path';
+import {assertLocalRoundDependencies,renderRemoteRoundCompose} from '../../../scripts/phala-round-rehearsal.ts';
+
+test('artifact preflight rejects workspace links into another checkout',()=>{
+ const root=mkdtempSync(join(tmpdir(),'mochi-build-local-'));
+ try {
+  for(const [name,foreign] of [['local',false],['foreign',true]] as const) {
+   const checkout=join(root,name), own=join(checkout,'packages',name), other=join(root,'other',name);
+   mkdirSync(own,{recursive:true});mkdirSync(other,{recursive:true});mkdirSync(join(checkout,'node_modules','@mochi'),{recursive:true});
+   const manifest=JSON.stringify({name:`@mochi/${name}`,type:'module',exports:'./index.ts'});
+   for(const directory of [own,other]){writeFileSync(join(directory,'package.json'),manifest);writeFileSync(join(directory,'index.ts'),'export const revision=1;');}
+   symlinkSync(foreign?other:own,join(checkout,'node_modules','@mochi',name));
+   if(foreign)expect(()=>assertLocalRoundDependencies(checkout)).toThrow('outside this checkout');
+   else expect(()=>assertLocalRoundDependencies(checkout)).not.toThrow();
+  }
+ }finally{rmSync(root,{recursive:true,force:true});}
+});
 
 test('compose binds an immutable artifact and keeps the bounded existing VM policy',()=>{
  expect(()=>renderRemoteRoundCompose('main','a'.repeat(64))).toThrow();

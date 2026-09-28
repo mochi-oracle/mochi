@@ -1,14 +1,29 @@
 import { brotliCompressSync, constants } from 'node:zlib';
 import { createHash } from 'node:crypto';
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
-import { dirname, resolve } from 'node:path';
+import { existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, writeFileSync } from 'node:fs';
+import { dirname, resolve, sep } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { renderCompose } from './phala-rehearsal.ts';
 import { scanEntry } from './identity-guard.ts';
 
 const ROOT=resolve(import.meta.dir,'..');
 const ARTIFACT='deploy/phala/round-rehearsal/assets/round-service.br';
+export function assertLocalRoundDependencies(root=ROOT) {
+  for(const parent of ['packages','services']) {
+    const base=resolve(root,parent);
+    if(!existsSync(base))continue;
+    for(const child of readdirSync(base)) {
+      const directory=resolve(base,child), manifest=resolve(directory,'package.json');
+      if(!existsSync(manifest))continue;
+      const pkg=JSON.parse(readFileSync(manifest,'utf8'));
+      if(typeof pkg.name!=='string'||!pkg.name.startsWith('@mochi/')||!pkg.exports)continue;
+      const actual=realpathSync(Bun.resolveSync(pkg.name,root));
+      if(!actual.startsWith(realpathSync(directory)+sep))throw new Error('Workspace dependency resolves outside this checkout; install local dependencies before building.');
+    }
+  }
+}
 export async function buildRoundArtifact() {
+  assertLocalRoundDependencies();
   const build=await Bun.build({entrypoints:[resolve(ROOT,'deploy/phala/round-rehearsal/server.ts')],target:'bun',minify:true,sourcemap:'none'});
   if(!build.success || build.outputs.length!==1)throw new Error('Could not bundle the confidential round rehearsal.');
   const expanded=new Uint8Array(await build.outputs[0]!.arrayBuffer());

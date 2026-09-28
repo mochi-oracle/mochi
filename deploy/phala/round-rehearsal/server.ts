@@ -99,7 +99,7 @@ const handler = createRoundHandler({
         verification: 'ACI client verified provider signature and exact request/response body hashes in server process',
       } : undefined;
     });
-    if (receipts.some(receipt => !receipt)) { reportDiagnostic({ stage: 'juror_inference', causeCode: 'receipt_missing' }); throw new Error('Missing verified provider receipt.'); }
+    if (receipts.some(receipt => !receipt)) { reportDiagnostic({ stage: 'model_inference', causeCode: 'receipt_missing' }); throw new Error('Missing verified provider receipt.'); }
     return { ...result, realInference: { provider: 'phala-aci', models: REAL_MODELS, receipts, estimatedCostUsd: REAL_ESTIMATED_COST_USD, costEstimateBasis: 'catalog token rates; requested max_tokens and input-byte reservation; actual provider usage may differ', receiptVerification: 'server-side ACI verification; response metadata is not an independent proof' } };
   },
 }, { mode: realMode ? 'real-aci' : 'synthetic', ...(realMode ? { roundAuthSecret: realConfig!.roundAuthSecret } : {}), onDiagnostic: reportDiagnostic });
