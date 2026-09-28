@@ -5,7 +5,7 @@
   "type": "module",
   "scripts": {
     "dev": "vite --host 127.0.0.1 --port 4320",
-    "build": "vite build",
+    "build": "vite build && bun scripts/verify-build.ts",
     "preview": "vite preview --host 127.0.0.1 --port 4320"
   },
   "dependencies": {
