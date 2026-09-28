@@ -53,49 +53,12 @@ function setupLazyImages() {
   images.forEach(image => observer.observe(image));
 }
 
+// The frame is decorative; first paint must never wait for images or a splash timeline.
 function completeLoader() {
-  root.classList.add('is-loaded');
-  const loader = document.querySelector('[data-component="preloader"]');
-  if (!loader) {
-    root.classList.remove('is-loading');
-    root.classList.add('preloader-complete');
-    playVisibleReveals();
-    return;
-  }
-  if (reduced) {
-    elements('.preloader__layer-inset', loader).forEach(inset => { inset.style.display = 'none'; });
-    root.classList.remove('is-loading');
-    root.classList.add('preloader-complete');
-    loader.setAttribute('aria-hidden', 'true');
-    playVisibleReveals();
-    return;
-  }
-  const layers = elements('.preloader__layer', loader);
-  const insets = elements('.preloader__layer-inset', loader);
-  const words = elements('.preloader__word', loader);
-  gsap.set(words, { opacity: 1 });
-  const timeline = gsap.timeline({ defaults: { ease }, onComplete: () => {
-    root.classList.remove('is-loading');
-    root.classList.add('preloader-complete');
-    loader.setAttribute('aria-hidden', 'true');
-    gsap.set('[data-page-overlay]', { clearProps: 'clipPath' });
-    ScrollTrigger.refresh();
-    ScrollTrigger.update();
-    playVisibleReveals();
-  }});
-  timeline
-    .fromTo(layers[0], { xPercent: -100 }, { xPercent: 0, duration: 1.2 }, 0)
-    .fromTo(layers[1], { xPercent: -100 }, { xPercent: 0, duration: 1.2 }, .1)
-    .fromTo(layers[2], { xPercent: -100 }, { xPercent: 0, duration: 1.2 }, .2)
-    .call(() => root.classList.remove('is-loading'), [], 1.2)
-    .fromTo('main', { visibility: 'hidden', clipPath: 'inset(50% 50% 0 50%)' }, { visibility: 'visible', clipPath: 'inset(0)', duration: 1.5, ease: 'power3.inOut', clearProps: 'clipPath' }, 1.2)
-    .to(words, { opacity: 1, duration: .45, stagger: .1 }, .25)
-    .fromTo('[data-page-overlay]', { clipPath: 'inset(0 100% 0 0)' }, { clipPath: 'inset(0 0% 0 0)', duration: .9 }, '+=.2')
-    // Under the full overlay, the full-size colour fills go away. What stays of the layers is their
-    // :before/:after bars: the permanent lavender/orange frame with the M and O labels.
-    .set(insets, { display: 'none' })
-    .to('[data-page-overlay]', { clipPath: 'inset(0 0 0 100%)', duration: .9, ease }, '+=.1')
-    .add(() => gsap.set('[data-page-overlay]', { clearProps: 'clipPath' }));
+  root.classList.remove('is-loading');
+  root.classList.add('is-loaded', 'preloader-complete');
+  document.querySelector('[data-component="preloader"]')?.setAttribute('aria-hidden', 'true');
+  playVisibleReveals();
 }
 
 function splitWords(el) {
@@ -267,7 +230,17 @@ function setupReveals() {
     elements('[data-animation]').forEach(el => { el.style.opacity = '1'; el.style.visibility = 'visible'; el.style.clipPath = 'none'; el.style.transform = 'none'; });
     return;
   }
-  elements('[data-animation]').filter(el => !el.closest('[hidden]')).forEach(revealFromData);
+  elements('[data-animation]').filter(el => !el.closest('[hidden]')).forEach(el => {
+    const box = el.getBoundingClientRect();
+    const continuous = ['parallax', 'ambient-move'].includes(el.dataset.animation);
+    // Do not hide content the visitor has already seen while fonts and motion initialize.
+    if (!continuous && box.top < innerHeight && box.bottom > 0) {
+      el.classList.remove('scale-y-0', 'scale-x-0', 'scale-0');
+      el.classList.add('is-started', 'is-complete');
+      return;
+    }
+    revealFromData(el);
+  });
 }
 
 function setupMenu() {
@@ -530,8 +503,7 @@ function init() {
   setupAccordions();
   setupPopups();
   setupCursor();
-  if (reduced) completeLoader();
-  else window.addEventListener('load', completeLoader, { once: true });
+  completeLoader();
   window.addEventListener('load', () => ScrollTrigger.refresh(), { once: true });
 }
 

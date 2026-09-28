@@ -37,6 +37,7 @@ export function createWebHandler(options: {config?: unknown; dist: string; gatew
   }
   return async(request:Request):Promise<Response>=>{
     let response:Response;
+    let cacheControl='no-store';
     try {
       const url=new URL(request.url), path=url.pathname;
       const origin=request.headers.get('origin');
@@ -66,10 +67,16 @@ export function createWebHandler(options: {config?: unknown; dist: string; gatew
         else if((await stat(actual)).isDirectory()) {
           url.pathname=path+'/';
           response=new Response(null,{status:308,headers:{location:url.pathname+url.search}});
-        } else {const file=Bun.file(actual);response=new Response(request.method==='HEAD'?null:file,{headers:{'content-type':file.type}})}
+        } else {
+          const file=Bun.file(actual);
+          // Only public static assets may be cached; HTML, APIs and errors remain no-store.
+          if(/^\/assets\/[^/]+-[A-Za-z0-9_-]{8,}\.(?:js|css|woff2?)$/.test(decoded))cacheControl='public, max-age=31536000, immutable';
+          else if(decoded.startsWith('/assets/'))cacheControl='public, max-age=86400';
+          response=new Response(request.method==='HEAD'?null:file,{headers:{'content-type':file.type}});
+        }
       } else response=error('Method not allowed',405);
     } catch {response=error('Request could not be completed',502)}
-    response.headers.set('Cache-Control','no-store');
+    response.headers.set('Cache-Control',cacheControl);
     response.headers.set('X-Content-Type-Options','nosniff');
     response.headers.set('Referrer-Policy','no-referrer');
     response.headers.set('X-Frame-Options','DENY');

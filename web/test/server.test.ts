@@ -1,6 +1,25 @@
 import {test,expect} from 'bun:test';
 import {createWebHandler,publicConfig} from '../server.ts';
+import {mkdtemp, mkdir, writeFile, rm, realpath} from 'node:fs/promises';
+import {tmpdir} from 'node:os';
+import {join} from 'node:path';
 const dist=new URL('../site/dist',import.meta.url).pathname;
+test('only successful public assets are cached; HTML and API responses stay private',async()=>{
+ const fixture=await realpath(await mkdtemp(join(tmpdir(),'mochi-cache-')));
+ try {
+  await mkdir(join(fixture,'assets/brand'),{recursive:true});
+  for(const path of ['index.html','assets/site-12345678.js','assets/brand/logo.webp'])await writeFile(join(fixture,path),'fixture');
+  const handler=createWebHandler({dist:fixture,claims:async()=>Response.json({private:true},{headers:{'cache-control':'public'}})});
+  for(const method of ['GET','HEAD']) {
+   const response=await handler(new Request('http://localhost/assets/site-12345678.js',{method}));
+   expect(response.status).toBe(200);
+   expect(response.headers.get('cache-control')).toBe('public, max-age=31536000, immutable');
+  }
+  expect((await handler(new Request('http://localhost/assets/brand/logo.webp'))).headers.get('cache-control')).toBe('public, max-age=86400');
+  for(const path of ['/','/api/claims/config','/mochi-config.json','/assets/missing.js'])expect((await handler(new Request('http://localhost'+path))).headers.get('cache-control')).toBe('no-store');
+  expect((await handler(new Request('http://localhost/assets/site-12345678.js',{method:'POST'}))).headers.get('cache-control')).toBe('no-store');
+ } finally {await rm(fixture,{recursive:true,force:true})}
+});
 test('public config never forwards RPC or service secrets',()=>{
  const value=publicConfig({enabled:true,chainId:4663,contracts:{queryEscrow:'0x123',privateKey:'secret'},rpcUrl:'https://private/key',apiKey:'secret',jurySizes:[3]});
  expect(JSON.stringify(value)).not.toContain('secret');expect(JSON.stringify(value)).not.toContain('private/key');expect(value.rpcUrl).toBe('/rpc');

@@ -30,7 +30,7 @@ function updateLogoInk(){
   const y=rect.top+rect.height/2;
   const section=[...document.querySelectorAll('main section,footer')].find(el=>{const r=el.getBoundingClientRect();return r.top<=y&&r.bottom>y});
   const onLight=!expanded&&section?.classList.contains('bg-white');
-  const next=onLight?'/assets/brand/logo-pink.svg':'/assets/brand/logo-transparent.svg';
+  const next=onLight?'/assets/brand/logo-pink.webp':'/assets/brand/logo-transparent.webp';
   if(image.getAttribute('href')!==next)image.setAttribute('href',next);
  }
 }
