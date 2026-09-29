@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { EventEmitter } from "node:events";
-import { endpointRows, PRODUCTION_PORTS, startProductionRuntime, validateEnrollmentReadiness, validateLaunchConfig, watchChildLifecycle } from "./runtime.ts";
+import { endpointRows, PRODUCTION_PORTS, startProductionRuntime, startupFailureReason, validateEnrollmentReadiness, validateLaunchConfig, watchChildLifecycle } from "./runtime.ts";
 
 const a = (n: number) => `0x${n.toString(16).padStart(40, "0")}` as `0x${string}`;
 const h = (n: number) => `0x${n.toString(16).padStart(64, "0")}` as `0x${string}`;
@@ -88,6 +88,14 @@ describe("production runtime config", () => {
     expect(() => validateLaunchConfig(stub)).toThrow("reviewed Phala ACI model");
     const publicBind = config(); (publicBind as any).endpoints.intake = "http://0.0.0.0:3001";
     expect(() => validateLaunchConfig(publicBind)).toThrow("loopback");
+  });
+
+  test("startup failure reasons keep our message but drop credentials and key-like values", () => {
+    const reason = startupFailureReason(Object.assign(new Error(`connect postgres://user:pa55word@db:5432/x key 0x${"ab".repeat(32)} token ${"Z".repeat(40)}`), { code: "ECONNREFUSED" }));
+    expect(reason.startsWith("Error [ECONNREFUSED]: connect <url-credentials>@db:5432/x key <hex> token <redacted>")).toBe(true);
+    expect(reason).not.toContain("pa55word");
+    expect(startupFailureReason(new Error("x".repeat(500))).length).toBeLessThanOrEqual(230);
+    expect(startupFailureReason(undefined)).toBe("Error: ");
   });
 
   test("registers every enclave endpoint with a lowercase address the database accepts", () => {

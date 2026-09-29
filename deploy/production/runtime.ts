@@ -65,6 +65,20 @@ function nonzeroAddress(value: unknown, field: string): asserts value is Address
   if (typeof value !== "string" || !addressPattern.test(value) || /^0x0{40}$/i.test(value)) throw new Error(`${field} must be a nonzero address`);
 }
 
+/** Content-free startup failure reason for operator logs: our own messages, with key-like values and URL credentials removed. */
+export function startupFailureReason(error: unknown): string {
+  const e = error as { name?: unknown; message?: unknown; code?: unknown };
+  const name = typeof e?.name === "string" && /^[A-Za-z]{1,40}$/.test(e.name) ? e.name : "Error";
+  const code = typeof e?.code === "string" && /^[A-Za-z0-9_]{1,32}$/.test(e.code) ? ` [${e.code}]` : "";
+  const message = (typeof e?.message === "string" ? e.message : "")
+    .replace(/[a-z][a-z0-9+.-]*:\/\/[^\s/@]*@/gi, "<url-credentials>@")
+    .replace(/0x[0-9a-fA-F]{64,}/g, "<hex>")
+    .replace(/[A-Za-z0-9_-]{32,}/g, "<redacted>")
+    .replace(/\s+/g, " ")
+    .slice(0, 200);
+  return `${name}${code}: ${message}`;
+}
+
 /** Enclave endpoints to register (role 2 intake, 3 consensus, 1 juror). The endpoint table stores lowercase addresses. */
 export function endpointRows(config: ProductionLaunchConfig): Array<{ address: string; role: 1 | 2 | 3; url: string }> {
   return [config.identities.intake, config.identities.consensus, ...config.identities.jurors].map((identity, i) => ({
@@ -186,15 +200,15 @@ export function watchChildLifecycle(
 ): { stop(): void } {
   let stopping = false;
   let reported = false;
-  const fail = (code: number | null, signal: NodeJS.Signals | null, reason: "exit" | "error") => {
+  const fail = (code: number | null, signal: NodeJS.Signals | null, reason: "exit" | "error", errno?: string) => {
     childhealth[id] = "failed";
     if (stopping || reported) return;
     reported = true;
-    (options.log ?? (() => {}))(reason === "error" ? `${id} could not start` : `${id} exited${code !== 0 && code !== null ? ` with code ${code}` : signal ? ` on ${signal}` : ""}`);
+    (options.log ?? (() => {}))(reason === "error" ? `${id} could not start${errno ? ` (${errno})` : ""}` : `${id} exited${code !== 0 && code !== null ? ` with code ${code}` : signal ? ` on ${signal}` : ""}`);
     options.onFatal?.(id);
   };
   child.on("spawn", () => { if (!options.httpHealth && !stopping) childhealth[id] = "healthy"; });
-  child.on("error", () => fail(null, null, "error"));
+  child.on("error", (error: NodeJS.ErrnoException) => fail(null, null, "error", typeof error?.code === "string" && /^[A-Z0-9_]{2,32}$/.test(error.code) ? error.code : undefined));
   child.on("exit", (code, signal) => fail(code, signal, "exit"));
   return { stop: () => { stopping = true; } };
 }

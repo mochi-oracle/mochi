@@ -5,7 +5,7 @@ import { privateKeyToAccount } from 'viem/accounts';
 import { createProductionIdentityReadiness } from '../production-identities/identities.ts';
 import { createIdentityEndpoint } from '../production-identities/http.ts';
 import { DstackKeySource } from '@mochi/tee';
-import { startProductionRuntime, PRODUCTION_PORTS } from '../../production/runtime.ts';
+import { startProductionRuntime, startupFailureReason, PRODUCTION_PORTS } from '../../production/runtime.ts';
 import { createProductionProxy, createEnrollmentEndpoint } from '../../production/public-proxy.ts';
 const identities = createIdentityEndpoint(() => createProductionIdentityReadiness({
   env:process.env,
@@ -22,7 +22,7 @@ const production = await startProductionRuntime(launchConfig, {
   artifactDir: process.env.MOCHI_PRODUCTION_RUNTIME_DIR || '/tmp/mochi-runtime',
   log: message => console.info(message),
   onFatal: () => { console.error('Production service stopped unexpectedly; restarting supervised runtime.'); process.exit(1); },
-}).catch(() => { throw new Error('Production startup failed a protected configuration or readiness check.'); });
+}).catch((error) => { console.error(`Production startup failed: ${startupFailureReason(error)}`); throw new Error('Production startup failed a protected configuration or readiness check.'); });
 const productionMode = launchConfig ? JSON.parse(launchConfig).mode : 'standby';
 const productionReady = () => production.status === 'running' && productionMode === 'active'
   && Object.keys(production.childhealth).length > 0 && Object.values(production.childhealth).every(status => status === 'healthy');
