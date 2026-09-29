@@ -1,3 +1,5 @@
+import { isCrossOriginPost } from '../../services/claims/src/origin.ts';
+
 const gatewayGet = /^\/v1\/(?:intake\/attestation|stats|queries\/0x[0-9a-f]{64}|verdict\/0x[0-9a-f]{64}|feeds\/[^/]+\/[^/]+|disagreement(?:\/models)?)$/;
 const gatewayPost = /^\/v1\/(?:intake\/upload|query)$/;
 const indexerGet = /^\/v1\/receipts\/0x[0-9a-f]{64}$/;
@@ -12,7 +14,7 @@ export function createProductionProxy(options: {ready(): boolean; gatewayPort: n
     const error=(status:number,message:string)=>Response.json({error:message},{status,headers:{'cache-control':'no-store'}});
     if (!gateway&&!indexer) return error(404,'Not found');
     if (!options.ready()) return error(503,'Production protocol is not active');
-    if(request.method==='POST'&&request.headers.get('origin')&&request.headers.get('origin')!==url.origin) return error(403,'Cross-origin request refused');
+    if(isCrossOriginPost(request)) return error(403,'Cross-origin request refused');
     try {
       let body: Uint8Array | undefined;
       if(request.method==='POST') {

@@ -58,6 +58,11 @@ describe("MochiClient", () => {
     expect(priv.secrets.resultPrivateKey).toBeDefined();
     const qBody = JSON.parse(String(requests.filter((r) => r.url.endsWith("/v1/query")).at(-1)?.init?.body));
     expect(qBody.payerResultPubKey).toBeDefined();
+    const checksummed = "0x986ffc020874b2A6442Fc5264a17FBB43251DB50";
+    await client.prepareQuery({ schema: 3, document: { url: "https://docs.test/y.pdf" }, isPublic: true, sender: checksummed, refundTo: checksummed });
+    const lowered = JSON.parse(String(requests.filter((r) => r.url.endsWith("/v1/query")).at(-1)?.init?.body));
+    expect(lowered.sender).toBe(checksummed.toLowerCase());
+    expect(lowered.refundTo).toBe(checksummed.toLowerCase());
     expect(JSON.stringify(requests.map((r) => r.init?.body))).not.toContain(priv.secrets.resultPrivateKey);
     const envelope = JSON.parse(String(requests.find((r) => r.url.includes("/v1/intake/url"))?.init?.body)).envelope;
     const opened = JSON.parse(new TextDecoder().decode(intake.decryptEnvelope(envelope, aad.intake())));

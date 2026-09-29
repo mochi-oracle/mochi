@@ -129,7 +129,8 @@ export class MochiClient {
     const queryBody: Record<string, unknown> = {
       intake: intakeResult, n: opts.n ?? 3, isPublic: opts.isPublic,
       ...(opts.allowPanelDisclosure === undefined ? {} : { allowPanelDisclosure: opts.allowPanelDisclosure }),
-      refundTo: opts.refundTo ?? opts.sender, nonce: nonce.toString(), sender: opts.sender,
+      // The gateway accepts lowercase addresses only; wallets usually return checksummed ones.
+      refundTo: (opts.refundTo ?? opts.sender).toLowerCase(), nonce: nonce.toString(), sender: opts.sender.toLowerCase(),
       ...(payerResultPubKey ? { payerResultPubKey } : {}), pay: opts.pay ?? { path: "usdg" },
     };
     const query = await this.request(`${this.gateway}/v1/query`, {

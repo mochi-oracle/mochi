@@ -13,6 +13,7 @@ test('public proxy pins loopback services, strips caller headers, rejects cross-
  expect(requests[0]).toEqual({url:'http://127.0.0.1:8086/v1/intake/attestation',headers:{'content-type':'application/json'}});
  const id='0x'+'11'.repeat(32);await proxy(new Request('https://public.example/v1/receipts/'+id));expect(requests[1]?.url).toBe('http://127.0.0.1:8087/v1/receipts/'+id);
  expect((await proxy(new Request('https://public.example/v1/query',{method:'POST',headers:{origin:'https://other.example'},body:'{}'}))).status).toBe(403);expect(requests).toHaveLength(2);
+ const tls=await proxy(new Request('http://public.example/v1/query',{method:'POST',headers:{origin:'https://public.example','x-forwarded-proto':'https'},body:'{}'}));expect(tls.status).not.toBe(403);expect(requests).toHaveLength(3);
 });
 
 test('enrollment endpoint only fetches nine fixed operator-bound proof routes',async()=>{
