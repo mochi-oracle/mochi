@@ -1,3 +1,5 @@
+import { isCrossOriginPost } from '../services/claims/src/origin.ts';
+
 /** Fixed-destination proxy: invitation and review-owner tokens only, no browser cookies. */
 export function createClaimsProxy(base: string, fetcher: typeof fetch = fetch) {
   const origin = new URL(base);
@@ -9,7 +11,7 @@ export function createClaimsProxy(base: string, fetcher: typeof fetch = fetch) {
   return async (request: Request): Promise<Response> => {
     const url = new URL(request.url);
     if (!allowed(url.pathname, request.method) || url.search) return fail(404);
-    if (request.method === 'POST' && request.headers.get('origin') && request.headers.get('origin') !== url.origin) return fail(403);
+    if (isCrossOriginPost(request)) return fail(403);
     try {
       const headers = new Headers({ 'content-type': 'application/json' });
       for (const name of ['x-mochi-access-token', 'x-mochi-review-token']) {

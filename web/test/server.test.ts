@@ -40,6 +40,13 @@ test('proxy rejects writes, cross-origin requests, and arbitrary paths',async()=
  expect((await send('/api/v1/query',{},'https://evil.example')).status).toBe(403);
  expect((await handler(new Request('http://localhost/api/v1/admin'))).status).toBe(404);expect(calls).toBe(0);
 });
+test('same-site browser POSTs pass behind a TLS-terminating proxy; other origins are still refused',async()=>{
+ let calls=0;const handler=createWebHandler({dist,rpc:'https://rpc.example/',fetcher:async()=>{calls++;return Response.json({jsonrpc:'2.0',id:1,result:'0x1237'})}});
+ const send=(origin:string)=>handler(new Request('http://mochioracle.com/rpc',{method:'POST',headers:{'content-type':'application/json','x-forwarded-proto':'https',origin},body:JSON.stringify({jsonrpc:'2.0',id:1,method:'eth_chainId'})}));
+ expect((await send('https://mochioracle.com')).status).toBe(200);expect(calls).toBe(1);
+ expect((await send('https://evil.example')).status).toBe(403);
+ expect((await send('http://mochioracle.com')).status).toBe(403);expect(calls).toBe(1);
+});
 test('collateral endpoint only accepts a bounded FMSPC and CA, with no caller URL',async()=>{
  const calls:unknown[]=[];const handler=createWebHandler({dist,collateral:{get:async(...args)=>{calls.push(args);return {signed:'intel'}}}});
  expect((await handler(new Request('http://localhost/api/v1/attestation/collateral/ABCDEF123456/platform'))).status).toBe(200);

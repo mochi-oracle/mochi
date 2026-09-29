@@ -4,6 +4,7 @@ import { PcsCollateralSource } from '../packages/tee/src/dcap/pcs.ts';
 import { createClaimsProxy } from './claims-proxy.ts';
 import { createRevenueStatusReader, type PublicRevenueStatus } from '../services/claims/src/public-revenue-status.ts';
 import { createClaimsRuntime } from '../services/claims/src/runtime.ts';
+import { isCrossOriginPost } from '../services/claims/src/origin.ts';
 import { loadWebDeployment, validateWebDeployment } from './deployment-config.ts';
 
 // Only this reviewed public shape reaches the browser. Service URLs and RPC credentials stay server-side.
@@ -39,8 +40,7 @@ export function createWebHandler(options: {config?: unknown; dist: string; reven
     let cacheControl='no-store';
     try {
       const url=new URL(request.url), path=url.pathname;
-      const origin=request.headers.get('origin');
-      if(request.method==='POST'&&origin&&origin!==url.origin)return error('Cross-origin request refused',403);
+      if(isCrossOriginPost(request))return error('Cross-origin request refused',403);
       if(path==='/mochi-config.json'&&request.method==='GET')response=Response.json(config);
       else if(path==='/api/tokenomics/report'&&request.method==='GET')response=Response.json(await (options.revenue??createRevenueStatusReader())());
       else if(path.startsWith('/api/claims/'))response=options.claims?await options.claims(request):Response.json({error:{code:'UNAVAILABLE',message:'Claim research is not configured.'}},{status:503});

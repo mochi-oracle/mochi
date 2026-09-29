@@ -9,6 +9,9 @@ test('fixed claims proxy retains invitation/owner auth and removes unrelated bro
   return Response.json({researchToken:'safe'},{headers:{'set-cookie':'must-not-forward'}});
  });
  const result=await proxy(req());expect(result.status).toBe(200);expect(result.headers.has('set-cookie')).toBe(false);expect(result.headers.get('cache-control')).toBe('no-store');expect(calls).toBe(1);
+ // Behind Railway's TLS proxy the request URL is http while the browser's Origin is https.
+ const proxied=new Request('http://site.example/api/claims/research',{method:'POST',headers:{'content-type':'application/json','x-forwarded-proto':'https','origin':'https://site.example','x-mochi-access-token':'invitation','x-mochi-review-token':'owner'},body:JSON.stringify({claim:'Example claim',consent:true})});
+ expect((await proxy(proxied)).status).toBe(200);expect(calls).toBe(2);
 });
 test('proxy blocks unapproved destinations/routes/origins and oversized bodies before upstream',async()=>{
  for(const base of ['http://service.example','https://user:pass@127.0.0.1','https://service.example/path','https://service.example/?secret=1'])expect(()=>createClaimsProxy(base)).toThrow();
@@ -16,6 +19,7 @@ test('proxy blocks unapproved destinations/routes/origins and oversized bodies b
  expect((await proxy(req('/api/claims/research?url=https://elsewhere.example'))).status).toBe(404);
  expect((await proxy(req('/api/claims/admin'))).status).toBe(404);
  expect((await proxy(req('/api/claims/research',{origin:'https://evil.example'}))).status).toBe(403);
+ expect((await proxy(new Request('http://site.example/api/claims/research',{method:'POST',headers:{'x-forwarded-proto':'https',origin:'https://evil.example'},body:'{}'}))).status).toBe(403);
  expect((await proxy(new Request('https://site.example/api/claims/research',{method:'POST',headers:{'content-type':'application/json'},body:'x'.repeat(20001)}))).status).toBe(502);
  expect(calls).toBe(0);
 });

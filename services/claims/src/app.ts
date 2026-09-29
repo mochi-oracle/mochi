@@ -2,6 +2,7 @@ import { createHash, randomBytes, timingSafeEqual } from 'node:crypto';
 import { z } from 'zod';
 import type { ClaimReview, EvidenceBundle, Researcher } from './types.ts';
 import type { PublicClaimStore } from './store.ts';
+import { isCrossOriginPost } from './origin.ts';
 
 const key = () => randomBytes(32).toString('hex');
 const digest = (value: string) => createHash('sha256').update(value).digest();
@@ -63,7 +64,7 @@ export function createClaimsHandler(options: ClaimsOptions) {
     const path = url.pathname;
     let response: Response;
     try {
-      if (request.method === 'POST' && request.headers.get('origin') && request.headers.get('origin') !== url.origin) return fail('ORIGIN', 'Cross-origin request refused.', 403);
+      if (isCrossOriginPost(request)) return fail('ORIGIN', 'Cross-origin request refused.', 403);
       if (path === '/api/claims/config' && request.method === 'GET') {
         return Response.json({ enabled, mode: 'research-preview', jurySize: 3, price: { amountUsd: '0.00', label: 'No payment collected' }, requiresAccessToken: true, limits: { claimChars: 4000, sourceCount: 5 }, ...(!enabled ? { reason: 'Claim research is awaiting provider configuration. Paid reviews are not open.' } : {}) });
       }
