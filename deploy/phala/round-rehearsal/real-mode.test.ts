@@ -5,7 +5,7 @@ test('real ACI config requires protected env-only secrets and pins three models 
   expect(() => loadRealModeConfig({})).toThrow();
   expect(() => loadRealModeConfig({ PHALA_API_KEY: 'x'.repeat(32) })).toThrow();
   expect(loadRealModeConfig({ PHALA_API_KEY: 'x'.repeat(32), MOCHI_ROUND_AUTH_SECRET: 'y'.repeat(40) }).baseUrl).toBe('https://inference.phala.com/v1');
-  expect(REAL_MODELS).toEqual(['meta-llama/llama-3.3-70b-instruct', 'nvidia/nemotron-3.5-lightning', 'google/gemma-4-31b-it']);
+  expect(REAL_MODELS).toEqual(['openai/gpt-oss-120b', 'google/gemma-4-31b-it', 'qwen/qwen3.6-35b-a3b']);
   expect(REAL_ESTIMATED_COST_USD).toBeLessThan(10);
   expect(() => loadRealModeConfig({ PHALA_API_KEY: 'x'.repeat(32), MOCHI_ROUND_AUTH_SECRET: 'y'.repeat(40), PHALA_ACI_BASE_URL: 'http://provider.test' })).toThrow();
 });

@@ -1,5 +1,7 @@
 # Claim review payments: readiness and implementation plan
 
+> **Update, September 29, 2026:** the launch tariff is now **$0.10** for the short N3 review at `tokensK = 1` (jurors $0.08, minimum protocol fee $0.02; `scripts/launch-pricing.ts`). The testnet dress rehearsal measured about 918k gas of protocol-side settlement per review (seal + post), roughly $0.05 at mainnet gas, which five cents could not cover. Five-cent figures below are historical.
+
 ## September 28 implementation update
 
 The private claim-to-protocol SDK bridge is implemented in `packages/sdk/src/claims.ts`. It commits a canonical claim/evidence document, marks supplied excerpts as SUBMITTED rather than independently fetched, and uses the established intake, encryption, quote, escrow and sealed-answer lifecycle. The browser integration is implemented with a saved private recovery file, a one-shot payment attempt and resume-without-payment. This advances steps 3 and 4 below; it does not establish production settlement readiness.

@@ -1,5 +1,7 @@
 # Claims validation — 28 September 2026
 
+> **Update, September 29, 2026:** the launch tariff is now **$0.10** for the short N3 review at `tokensK = 1` (jurors $0.08, minimum protocol fee $0.02; `scripts/launch-pricing.ts`). The testnet dress rehearsal measured about 918k gas of protocol-side settlement per review (seal + post), roughly $0.05 at mainnet gas, which five cents could not cover. Five-cent figures below are historical.
+
 ## Actual model calls
 
 The initial validation record was superseded by the September 28 source-quality audit. That audit's paid evaluation run covered 12 hand-selected cases and 36 inference requests (including the invalid fixture), using Llama 3.3 70B, Nemotron 3.5 Lightning, and Gemma 4 31B through the configured Phala inference endpoint. It resolved eight cases correctly and left four unresolved; three provider inference calls failed. The separate corrected-context case used three more calls and remained unresolved. These are descriptive results for controlled source-backed cases, not a representative accuracy benchmark. See `docs/CLAIMS-LAUNCH-PACKAGE.md` for the launch-safe interpretation. The detailed private audit evidence is maintained outside this public export.

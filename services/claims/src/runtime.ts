@@ -25,7 +25,7 @@ export function createClaimsRuntime(env: Record<string, string | undefined> = pr
       if (transport !== 'chat-completions' && transport !== 'phala-aci') throw new Error('config');
       if (transport === 'phala-aci') {
         if (!apiKey) throw new Error('config');
-        return createAciJuror({ id: item.id, model: item.model, baseUrl: item.baseUrl, apiKey, maxOutputTokens: 1400, timeoutMs: 45_000 });
+        return createAciJuror({ id: item.id, model: item.model, baseUrl: item.baseUrl, apiKey, maxOutputTokens: 1400, timeoutMs: 75_000 });
       }
       return createChatJuror({ id: item.id, model: item.model, baseUrl: item.baseUrl, apiKey, maxOutputTokens: 1400, timeoutMs: 45_000 });
     });
@@ -33,6 +33,6 @@ export function createClaimsRuntime(env: Record<string, string | undefined> = pr
     const search = env.MOCHI_CLAIMS_SEARCH_KEY ? createBraveSearch(env.MOCHI_CLAIMS_SEARCH_KEY) : undefined;
     const researcher = createResearcher({ search });
     const store = new SqlitePublicClaimStore(env.MOCHI_CLAIMS_DATABASE);
-    return createClaimsHandler({ store, accessToken: token, researcher, reviewer: bundle => reviewBundle(bundle, jurors), maxActionsPerDay: Number(env.MOCHI_CLAIMS_DAILY_ACTIONS ?? 100), maxConcurrent: 2 });
+    return createClaimsHandler({ store, accessToken: token, researcher, reviewer: bundle => reviewBundle(bundle, jurors, { timeoutMs: 80_000 }), maxActionsPerDay: Number(env.MOCHI_CLAIMS_DAILY_ACTIONS ?? 100), maxConcurrent: 2 });
   } catch { return disabled(); }
 }

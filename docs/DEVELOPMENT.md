@@ -154,12 +154,13 @@ Jurors can send extraction requests to Phala's GPU TEE endpoint. The juror verif
 | `TDX_REJECT_ADVISORIES` | Comma-separated advisory IDs to reject | unset |
 | `TDX_ALLOW_DEBUG` | Permit debug TDX VMs | `0` |
 
-Suggested model assignment by seat (confirm deployed slugs with `GET /v1/models`):
+Production model assignment by juror class (pinned in `deploy/production/runtime.ts`; selection evidence in
+`docs/JURY-MODEL-SELECTION.md`):
 
-| Juror class | Suggested model |
+| Juror class | Model |
 |---|---|
-| `LARGE_A` | DeepSeek V4 Flash |
-| `LARGE_B` | GLM 5.3 |
-| `DOC_SPECIALIST` | Qwen3.8 27B |
-| `SMALL_FAST` | Nemotron 3.5 Lightning |
-| `DISSENTER` | Gemma 4 31B |
+| `LARGE_A` | `openai/gpt-oss-120b` |
+| `LARGE_B` | `deepseek/deepseek-v4-flash-0731` |
+| `DOC_SPECIALIST` | `google/gemma-4-31b-it` |
+| `SMALL_FAST` | `moonshotai/kimi-k2.6` |
+| `DISSENTER` | `qwen/qwen3.6-35b-a3b` |

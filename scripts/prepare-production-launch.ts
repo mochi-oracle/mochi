@@ -13,12 +13,12 @@ import { deploymentMinJurorBond, productionChainId, productionTimelockDelay } fr
 const ZERO32 = `0x${"00".repeat(32)}` as Hex;
 const CLASS_COUNTS = [2, 2, 2, 1, 2] as const;
 const MODEL_IDS = [
-  "meta-llama/llama-3.3-70b-instruct", "meta-llama/llama-3.3-70b-instruct",
-  "nvidia/nemotron-3.5-lightning", "nvidia/nemotron-3.5-lightning",
-  "google/gemma-4-31b-it", "google/gemma-4-31b-it", "nvidia/nemotron-3.5-lightning",
-  "google/gemma-4-31b-it", "google/gemma-4-31b-it",
+  "openai/gpt-oss-120b", "openai/gpt-oss-120b",
+  "deepseek/deepseek-v4-flash-0731", "deepseek/deepseek-v4-flash-0731",
+  "google/gemma-4-31b-it", "google/gemma-4-31b-it", "moonshotai/kimi-k2.6",
+  "qwen/qwen3.6-35b-a3b", "qwen/qwen3.6-35b-a3b",
 ] as const;
-const LINEAGES = ["llama", "llama", "nemotron", "nemotron", "gemma", "gemma", "nemotron", "gemma", "gemma"] as const;
+const LINEAGES = ["gpt-oss", "gpt-oss", "deepseek", "deepseek", "gemma", "gemma", "kimi", "qwen", "qwen"] as const;
 const DEFAULT_ACI_BASE_URL = "https://inference.phala.com/v1";
 
 type Deployment = Record<string, any>;

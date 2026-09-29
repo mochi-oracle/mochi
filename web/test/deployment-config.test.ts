@@ -33,3 +33,13 @@ test('enabled deployment requires all secure upstreams; disabled deployment need
   }
   expect(loadWebDeployment({MOCHI_WEB_CONFIG_JSON:'{"enabled":false}'}).enabled).toBe(false);
 });
+
+test('testnet 46630 is accepted only with the explicit local rehearsal flag', () => {
+  const rehearsal = {...config, chainId: 46630};
+  expect(() => validateWebDeployment(rehearsal)).toThrow();
+  expect(validateWebDeployment(rehearsal, {allowRehearsal: true}).chainId).toBe(46630);
+  expect(() => loadWebDeployment({...upstreams, MOCHI_WEB_CONFIG_JSON: JSON.stringify(rehearsal)})).toThrow();
+  expect(loadWebDeployment({...upstreams, MOCHI_WEB_REHEARSAL: '1', MOCHI_WEB_CONFIG_JSON: JSON.stringify(rehearsal)}).enabled).toBe(true);
+  expect(() => loadWebDeployment({...upstreams, MOCHI_WEB_REHEARSAL: 'true', MOCHI_WEB_CONFIG_JSON: JSON.stringify(rehearsal)})).toThrow();
+  expect(() => validateWebDeployment({...config, chainId: 1}, {allowRehearsal: true})).toThrow();
+});

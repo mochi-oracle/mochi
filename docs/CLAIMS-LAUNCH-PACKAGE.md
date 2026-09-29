@@ -1,5 +1,7 @@
 # Claim review launch package
 
+> **Update, September 29, 2026:** the launch tariff is now **$0.10** for the short N3 review at `tokensK = 1` (jurors $0.08, minimum protocol fee $0.02; `scripts/launch-pricing.ts`). The testnet dress rehearsal measured about 918k gas of protocol-side settlement per review (seal + post), roughly $0.05 at mainnet gas, which five cents could not cover. Five-cent figures below are historical.
+
 This package describes two separate offerings: the current unpaid public research invitation and a possible future confidential, escrow-paid short review. The claim SDK/browser bridge and a hardware intake rehearsal exist. Paid activation still depends on production configuration, provider limits, representative evaluation, cost coverage, and end-to-end settlement/refund reconciliation described in [the payment plan](CLAIMS-PAYMENT-PLAN.md).
 
 ## Proposed five-cent short review

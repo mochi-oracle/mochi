@@ -7,7 +7,8 @@ import {
 import { answerHash, canonicalJson, docCommit, docHash, spansRoot, Role } from "@mochi/core";
 import type { AnswerReq, AnswerRes, SubmitAnswerReq, EnvelopeJson } from "@mochi/protocol";
 import { PassportSchema, passportHash } from "@mochi/protocol";
-import { extractionJsonSchema, extractionPrompt, normalizeAnswer, normalizeParams, paramsHash, resolveSchema } from "@mochi/schemas";
+import { normalizeParams, paramsHash, resolveSchema } from "@mochi/schemas";
+import { extractAnswer } from "./extract.ts";
 import { keyBinding, quoteHash, seal, signJurorAnswer } from "@mochi/tee";
 import type { JurorDeps } from "./ports.ts";
 
@@ -141,17 +142,7 @@ export class JurorEnclave {
 
     let body;
     try {
-      const prompt = extractionPrompt(def, plain.params);
-      const raw = await this.deps.runner.run({
-        ...prompt,
-        document: plain.text,
-        jsonSchema: extractionJsonSchema(def),
-        maxTokens: this.deps.maxTokens ?? 4096,
-      });
-      if (!raw || typeof raw !== "object" || !("fields" in raw) || typeof raw.fields !== "object" || raw.fields === null) {
-        throw new TypeError("invalid model output");
-      }
-      body = normalizeAnswer(def, raw as Parameters<typeof normalizeAnswer>[1], plain.text);
+      body = (await extractAnswer(this.deps.runner, def, plain.params, plain.text, this.deps.maxTokens ?? 4096)).body;
       const auditRunner = this.deps.runner as typeof this.deps.runner & { lastReceipt?: unknown };
       if (auditRunner.lastReceipt) this.passportDoc = undefined;
     } catch {

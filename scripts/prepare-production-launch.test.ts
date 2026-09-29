@@ -71,15 +71,15 @@ test("prepares public CA-bound runtime, batch and disabled website inputs", asyn
   expect(prepared.runtime.attestorAdminTokenEnv).toBe("MOCHI_PRODUCTION_ATTESTOR_ADMIN_TOKEN");
   expect(prepared.runtime.endpoints.jurors).toEqual(PRODUCTION_PORTS.jurors.map((port) => `http://127.0.0.1:${port}`));
   expect(prepared.runtime.identities.jurors.map((row) => [row.passport?.modelId, row.passport?.lineage, row.passport?.workload])).toEqual([
-    ["meta-llama/llama-3.3-70b-instruct", "llama", "aci-workload-0"],
-    ["meta-llama/llama-3.3-70b-instruct", "llama", "aci-workload-1"],
-    ["nvidia/nemotron-3.5-lightning", "nemotron", "aci-workload-2"],
-    ["nvidia/nemotron-3.5-lightning", "nemotron", "aci-workload-3"],
+    ["openai/gpt-oss-120b", "gpt-oss", "aci-workload-0"],
+    ["openai/gpt-oss-120b", "gpt-oss", "aci-workload-1"],
+    ["deepseek/deepseek-v4-flash-0731", "deepseek", "aci-workload-2"],
+    ["deepseek/deepseek-v4-flash-0731", "deepseek", "aci-workload-3"],
     ["google/gemma-4-31b-it", "gemma", "aci-workload-4"],
     ["google/gemma-4-31b-it", "gemma", "aci-workload-5"],
-    ["nvidia/nemotron-3.5-lightning", "nemotron", "aci-workload-6"],
-    ["google/gemma-4-31b-it", "gemma", "aci-workload-7"],
-    ["google/gemma-4-31b-it", "gemma", "aci-workload-8"],
+    ["moonshotai/kimi-k2.6", "kimi", "aci-workload-6"],
+    ["qwen/qwen3.6-35b-a3b", "qwen", "aci-workload-7"],
+    ["qwen/qwen3.6-35b-a3b", "qwen", "aci-workload-8"],
   ]);
   expect(prepared.runtime.identities.jurors.every((row) => row.passport?.weightsSha256 === `0x${"00".repeat(32)}` && row.passport.openWeights === false && row.passport.zdr === false && row.passport.provider === "phala-aci")).toBe(true);
   expect(prepared.identities.jurors.map((row) => row.class)).toEqual([0, 0, 1, 1, 2, 2, 3, 4, 4]);

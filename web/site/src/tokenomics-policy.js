@@ -5,7 +5,7 @@ export function illustrateReviewEconomics(reviews, obligations) {
   const [whole, fraction = ''] = obligations.split('.');
   const count = BigInt(reviews);
   const held = BigInt(whole) * 1_000_000n + BigInt(fraction.padEnd(2, '0')) * 10_000n;
-  const remainder = count * 7_500n;
+  const remainder = count * 15_000n;
   const eligible = remainder > held ? remainder - held : 0n;
-  return { total: count * 50_000n, jurors: count * 40_000n, panel: count * 2_500n, remainder, eligible, minimumBatchReached: eligible >= 25_000_000n };
+  return { total: count * 100_000n, jurors: count * 80_000n, panel: count * 5_000n, remainder, eligible, minimumBatchReached: eligible >= 25_000_000n };
 }

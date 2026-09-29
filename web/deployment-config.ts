@@ -5,7 +5,7 @@ const address = z.string().regex(/^0x[0-9a-fA-F]{40}$/).refine(value => !/^0x0{4
 const bytes32 = z.string().regex(/^0x[0-9a-fA-F]{64}$/).refine(value => !/^0x0{64}$/i.test(value));
 const enabledConfig = z.object({
   enabled: z.literal(true),
-  chainId: z.literal(4663),
+  chainId: z.union([z.literal(4663), z.literal(46630)]),
   contracts: z.object({queryEscrow: address, jurorRegistry: address, verdicts: address, usdg: address, receiptAnchor: address}),
   intakeAddress: address,
   intakeMeasurement: bytes32,
@@ -14,11 +14,12 @@ const enabledConfig = z.object({
     .refine(values => new Set(values).size === values.length),
 });
 
-/** Public values only. Invalid enabled configs fail startup without echoing their contents. */
-export function validateWebDeployment(input: unknown) {
+/** Public values only. Invalid enabled configs fail startup without echoing their contents. Robinhood Chain testnet
+ * (46630) is accepted only for an explicit local dress rehearsal (`allowRehearsal`), never in production. */
+export function validateWebDeployment(input: unknown, options: { allowRehearsal?: boolean } = {}) {
   if (input == null || (typeof input === 'object' && 'enabled' in input && input.enabled === false)) return {enabled: false as const};
   const result = enabledConfig.safeParse(input);
-  if (!result.success) throw new Error('Invalid paid-review configuration; check chain, contract addresses, intake identity, receipt key and jury sizes.');
+  if (!result.success || (result.data.chainId === 46630 && options.allowRehearsal !== true)) throw new Error('Invalid paid-review configuration; check chain, contract addresses, intake identity, receipt key and jury sizes.');
   return {...result.data, rpcUrl: '/rpc' as const};
 }
 
@@ -29,7 +30,7 @@ export function loadWebDeployment(env: Record<string, string | undefined>, read:
   let input: unknown = {enabled: false};
   try { if (inline) input = JSON.parse(inline); else if (file) input = JSON.parse(read(file)); }
   catch { throw new Error('Cannot load paid-review configuration JSON.'); }
-  const config = validateWebDeployment(input);
+  const config = validateWebDeployment(input, { allowRehearsal: env.MOCHI_WEB_REHEARSAL === '1' });
   if (config.enabled) {
     for (const name of ['MOCHI_GATEWAY_URL', 'MOCHI_INDEXER_URL', 'RPC_URL'] as const) {
       try {

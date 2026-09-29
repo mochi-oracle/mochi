@@ -111,7 +111,7 @@ export function calculateLaunchCostWorksheet(input: LaunchCostInput): LaunchCost
   const notes = [
     'Cost inputs must cover all attempts, failed requests, retries, search failures, settlement gas, hosting allocation, and other uncovered costs; a null input keeps complete totals and shortfall unknown.',
     'Per-review values divide total aggregate cost by total reviews attempted or completed reviews and round up to one USDG atomic unit.',
-    'The five-cent customer quote is juror fees plus protocol fee. At the current 25% panel-reserve setting, the one-cent protocol fee splits into 2,500 USDG units for panel reserve and 7,500 units for the configured recipient or staking. Neither share is assumed to be available review-product revenue.',
+    `The ten-cent customer quote is juror fees plus protocol fee. At the current 25% panel-reserve setting, the ${protocolFee}-unit protocol fee splits into ${panelReserveShare} USDG units for panel reserve and ${postPanelRemainder} units for the configured recipient or staking. Neither share is assumed to fund review operations.`,
     'This worksheet estimates funding only. It does not initiate or authorize a transaction.',
   ];
   if (!complete || input.totalReviews === 0 || input.completedReviews === 0) {

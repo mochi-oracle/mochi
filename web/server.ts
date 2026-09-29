@@ -8,14 +8,14 @@ import { isCrossOriginPost } from '../services/claims/src/origin.ts';
 import { loadWebDeployment, validateWebDeployment } from './deployment-config.ts';
 
 // Only this reviewed public shape reaches the browser. Service URLs and RPC credentials stay server-side.
-export function publicConfig(input: any) {
-  return validateWebDeployment(input);
+export function publicConfig(input: any, options: { allowRehearsal?: boolean } = {}) {
+  return validateWebDeployment(input, options);
 }
 const readMethods = new Set(['eth_chainId','eth_blockNumber','eth_call','eth_getBlockByNumber','eth_getTransactionReceipt','eth_getTransactionByHash','eth_getCode','eth_getBalance','eth_getLogs','eth_feeHistory','eth_gasPrice','eth_maxPriorityFeePerGas','eth_estimateGas']);
 const gatewayGet = /^\/v1\/(?:intake\/attestation|stats|queries\/0x[0-9a-f]{64}|verdict\/0x[0-9a-f]{64}|feeds\/[^/]+\/[^/]+|disagreement(?:\/models)?)$/;
 const gatewayPost = /^\/v1\/(?:intake\/upload|query)$/;
-export function createWebHandler(options: {config?: unknown; dist: string; revenue?: () => Promise<PublicRevenueStatus>; gateway?: string; indexer?: string; rpc?: string; fetcher?: typeof fetch; claims?: (request:Request)=>Promise<Response>; collateral?: {get(fmspc:string,ca:'platform'|'processor'):Promise<unknown>}}) {
-  const config = publicConfig(options.config);
+export function createWebHandler(options: {config?: unknown; allowRehearsal?: boolean; dist: string; revenue?: () => Promise<PublicRevenueStatus>; gateway?: string; indexer?: string; rpc?: string; fetcher?: typeof fetch; claims?: (request:Request)=>Promise<Response>; collateral?: {get(fmspc:string,ca:'platform'|'processor'):Promise<unknown>}}) {
+  const config = publicConfig(options.config, { allowRehearsal: options.allowRehearsal === true });
   const fetcher = options.fetcher ?? fetch;
   const collateral = options.collateral ?? new PcsCollateralSource({fetch:(url,init)=>fetcher(url,{...init,signal:AbortSignal.timeout(15000)})});
   const dist=resolve(options.dist);
@@ -85,8 +85,9 @@ export function createWebHandler(options: {config?: unknown; dist: string; reven
 }
 if(import.meta.main) {
   const config=loadWebDeployment(process.env);
-  const handler=createWebHandler({config,revenue:createRevenueStatusReader({reportPath:process.env.MOCHI_REVENUE_REPORT_FILE,upstream:process.env.MOCHI_CLAIMS_UPSTREAM,tokenConfigured:process.env.MOCHI_TOKEN_CONFIRMED==='true'}),dist:new URL('./site/dist',import.meta.url).pathname,
+  const rehearsal=process.env.MOCHI_WEB_REHEARSAL==='1';
+  const handler=createWebHandler({config,allowRehearsal:rehearsal,revenue:createRevenueStatusReader({reportPath:process.env.MOCHI_REVENUE_REPORT_FILE,upstream:process.env.MOCHI_CLAIMS_UPSTREAM,tokenConfigured:process.env.MOCHI_TOKEN_CONFIRMED==='true'}),dist:new URL('./site/dist',import.meta.url).pathname,
     gateway:process.env.MOCHI_GATEWAY_URL,indexer:process.env.MOCHI_INDEXER_URL,rpc:process.env.RPC_URL,claims:process.env.MOCHI_CLAIMS_UPSTREAM?createClaimsProxy(process.env.MOCHI_CLAIMS_UPSTREAM):createClaimsRuntime()});
   const server=Bun.serve({hostname:process.env.HOST??'127.0.0.1',port:Number(process.env.PORT??4321),idleTimeout:60,fetch:handler});
-  console.log(`Mochi website listening on port ${server.port}; deployment ${publicConfig(config).enabled?'configured':'pending'}`);
+  console.log(`Mochi website listening on port ${server.port}; deployment ${publicConfig(config,{allowRehearsal:rehearsal}).enabled?'configured':'pending'}${rehearsal?' (TESTNET REHEARSAL)':''}`);
 }

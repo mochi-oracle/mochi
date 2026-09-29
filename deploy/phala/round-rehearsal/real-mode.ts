@@ -1,9 +1,9 @@
-export const REAL_MODELS = ['meta-llama/llama-3.3-70b-instruct', 'nvidia/nemotron-3.5-lightning', 'google/gemma-4-31b-it'] as const;
+export const REAL_MODELS = ['openai/gpt-oss-120b', 'google/gemma-4-31b-it', 'qwen/qwen3.6-35b-a3b'] as const;
 export const REAL_MAX_INPUT_BYTES = 4096;
 export const REAL_MAX_OUTPUT_TOKENS = 1024;
 // Estimate reserves one input token per allowed input byte plus each model's
 // requested output-token limit. Provider-reported usage can differ.
-export const REAL_ESTIMATED_COST_USD = 0.01181696;
+export const REAL_ESTIMATED_COST_USD = 0.00443392;
 
 export function createInferenceCallBudget(limit: number) {
   if (!Number.isInteger(limit) || limit < 1) throw new TypeError('Inference call limit must be a positive integer.');

@@ -77,7 +77,8 @@ async function validReq(overrides: Partial<AnswerReq> = {}, plainOverrides: Reco
 
 function fixture(raw: unknown = {
   fields: { ticker: "ACME", ratio_num: "2", ratio_den: "1", effective_date: "June 1, 2026" },
-  evidence: { ticker: "Acme", ratio_num: "2", ratio_den: "1", effective_date: "June 1, 2026" },
+  // Realistic quotes: locateSpan needs at least two characters, so a bare "2" would never count as evidence.
+  evidence: { ticker: "Acme", ratio_num: "2-for-1", ratio_den: "2-for-1", effective_date: "June 1, 2026" },
   confidence: {},
 }, runnerOverride?: ModelRunner) {
   const state = { runnerCalls: 0, sends: [] as SubmitAnswerReq[], failSends: 0, raw };

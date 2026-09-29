@@ -5,10 +5,10 @@ import { endpointRows, PRODUCTION_PORTS, startProductionRuntime, startupFailureR
 const a = (n: number) => `0x${n.toString(16).padStart(40, "0")}` as `0x${string}`;
 const h = (n: number) => `0x${n.toString(16).padStart(64, "0")}` as `0x${string}`;
 const models = [
-  ["meta-llama/llama-3.3-70b-instruct", "llama"], ["meta-llama/llama-3.3-70b-instruct", "llama"],
-  ["nvidia/nemotron-3.5-lightning", "nemotron"], ["nvidia/nemotron-3.5-lightning", "nemotron"],
+  ["openai/gpt-oss-120b", "gpt-oss"], ["openai/gpt-oss-120b", "gpt-oss"],
+  ["deepseek/deepseek-v4-flash-0731", "deepseek"], ["deepseek/deepseek-v4-flash-0731", "deepseek"],
   ["google/gemma-4-31b-it", "gemma"], ["google/gemma-4-31b-it", "gemma"],
-  ["nvidia/nemotron-3.5-lightning", "nemotron"], ["google/gemma-4-31b-it", "gemma"], ["google/gemma-4-31b-it", "gemma"],
+  ["moonshotai/kimi-k2.6", "kimi"], ["qwen/qwen3.6-35b-a3b", "qwen"], ["qwen/qwen3.6-35b-a3b", "qwen"],
 ] as const;
 const config = () => ({
   format: "mochi-production-runtime-v1", enabled: true, mode: "prepare",

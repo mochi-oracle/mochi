@@ -44,11 +44,11 @@ test('calculates exact aggregate, per-attempt, per-completed and shortfall amoun
   expect(result.shortfallUsdMicros).toBe('125000');
   expect(result.customerQuote).toEqual({
     tokensK: 1,
-    jurorFeesUsdGMicros: '40000',
-    protocolFeeUsdGMicros: '10000',
-    grossCustomerChargeUsdGMicros: '50000',
-    panelReserveShareUsdGMicros: '2500',
-    postPanelReviewProtocolRemainderUsdGMicros: '7500',
+    jurorFeesUsdGMicros: '80000',
+    protocolFeeUsdGMicros: '20000',
+    grossCustomerChargeUsdGMicros: '100000',
+    panelReserveShareUsdGMicros: '5000',
+    postPanelReviewProtocolRemainderUsdGMicros: '15000',
     note: expect.any(String),
   });
 });
