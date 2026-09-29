@@ -8,10 +8,10 @@ export function createStore(db: Database): Store {
     getCursor: (name) => getCursor(db, name),
     setCursor: (name, block) => setCursor(db, name, block),
     async getEndpoint(address) {
-      const row = await getEndpoint(db, address);
+      const row = await getEndpoint(db, address.toLowerCase());
       return row ? { address: row.address, role: row.role, url: row.url } : null;
     },
-    upsertEndpoint: (address, role, url) => upsertEndpoint(db, address, role, url),
+    upsertEndpoint: (address, role, url) => upsertEndpoint(db, address.toLowerCase(), role, url),
     upsertJuror: (record) => upsertJuror(db, record),
     setJurorPassport: (key, passport, passportSig) => setJurorPassport(db, key.toLowerCase(), passport, passportSig),
   };

@@ -148,3 +148,20 @@ test("discovers a shared ACI workload only from a fresh nonce-bound TDX report w
   expect(seenInit?.headers).toEqual({ accept: "application/json" });
   expect(seenInit?.credentials).toBe("omit");
 });
+
+test("a testnet rehearsal deployment keeps its flag, delay and bond through to the runtime and release input", async () => {
+  const rehearsal = { ...deployment(), chainId: 46630, rehearsal: true, timelockDelay: "120", minJurorBond: (1_000n * 10n ** 18n).toString() };
+  const prepared = await build({ deployment: rehearsal });
+  expect(prepared.runtime.deployment.chainId).toBe(46630);
+  expect((prepared.runtime.deployment as any).rehearsal).toBe(true);
+  expect(() => validateLaunchConfig(prepared.runtime)).not.toThrow();
+  expect(prepared.releaseInput.chainId).toBe(46630);
+  expect(prepared.releaseInput.timelockDelaySeconds).toBe(120);
+  expect(prepared.releaseInput.minimumJurorBondMochi).toBe(1000);
+  expect(prepared.releaseInput.bondBelowSpecApproved).toBe(true);
+  expect(prepared.website.chainId).toBe(46630);
+  const mainnet = await build({ deployment: { ...deployment(), timelockDelay: "86400", minJurorBond: (25_000n * 10n ** 18n).toString() } });
+  expect(mainnet.releaseInput.timelockDelaySeconds).toBe(86400);
+  expect((mainnet.runtime.deployment as any).rehearsal).toBeUndefined();
+  await expect(build({ deployment: { ...deployment(), chainId: 46630 } })).rejects.toThrow("explicit testnet rehearsal");
+});

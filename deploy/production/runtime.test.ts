@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { EventEmitter } from "node:events";
-import { PRODUCTION_PORTS, startProductionRuntime, validateEnrollmentReadiness, validateLaunchConfig, watchChildLifecycle } from "./runtime.ts";
+import { endpointRows, PRODUCTION_PORTS, startProductionRuntime, validateEnrollmentReadiness, validateLaunchConfig, watchChildLifecycle } from "./runtime.ts";
 
 const a = (n: number) => `0x${n.toString(16).padStart(40, "0")}` as `0x${string}`;
 const h = (n: number) => `0x${n.toString(16).padStart(64, "0")}` as `0x${string}`;
@@ -88,6 +88,18 @@ describe("production runtime config", () => {
     expect(() => validateLaunchConfig(stub)).toThrow("reviewed Phala ACI model");
     const publicBind = config(); (publicBind as any).endpoints.intake = "http://0.0.0.0:3001";
     expect(() => validateLaunchConfig(publicBind)).toThrow("loopback");
+  });
+
+  test("registers every enclave endpoint with a lowercase address the database accepts", () => {
+    const launch = validateLaunchConfig(config());
+    (launch.identities.intake as any).address = "0x300746866b918D9dD1f4De4a12Eed2b13Be57701";
+    const rows = endpointRows(launch);
+    expect(rows).toHaveLength(11);
+    expect(rows.every((row) => /^0x[0-9a-f]{40}$/.test(row.address))).toBe(true);
+    expect(rows[0]).toMatchObject({ address: "0x300746866b918d9dd1f4de4a12eed2b13be57701", role: 2, url: launch.endpoints.intake });
+    expect(rows[1]!.role).toBe(3);
+    expect(rows.slice(2).map((row) => row.role)).toEqual(Array(9).fill(1));
+    expect(rows.slice(2).map((row) => row.url)).toEqual(launch.endpoints.jurors);
   });
 
   test("accepts only mainnet or an explicit testnet rehearsal deployment", () => {

@@ -275,6 +275,10 @@ function validateDeployment(value: Deployment): Deployment {
     roles: value.roles,
     mochiRecipient: validOptionalAddress(value.mochiRecipient),
     feeTreasury: validOptionalAddress(value.feeTreasury),
+    // Launch parameters recorded by deploy-local; the rehearsal flag keeps a 46630 deployment usable by the runtime.
+    ...(value.rehearsal === true ? { rehearsal: true } : {}),
+    ...(value.timelockDelay !== undefined ? { timelockDelay: String(value.timelockDelay) } : {}),
+    ...(value.minJurorBond !== undefined ? { minJurorBond: deploymentMinJurorBond(value).toString() } : {}),
   };
 }
 

@@ -65,6 +65,15 @@ function nonzeroAddress(value: unknown, field: string): asserts value is Address
   if (typeof value !== "string" || !addressPattern.test(value) || /^0x0{40}$/i.test(value)) throw new Error(`${field} must be a nonzero address`);
 }
 
+/** Enclave endpoints to register (role 2 intake, 3 consensus, 1 juror). The endpoint table stores lowercase addresses. */
+export function endpointRows(config: ProductionLaunchConfig): Array<{ address: string; role: 1 | 2 | 3; url: string }> {
+  return [config.identities.intake, config.identities.consensus, ...config.identities.jurors].map((identity, i) => ({
+    address: identity.address.toLowerCase(),
+    role: i === 0 ? 2 : i === 1 ? 3 : 1,
+    url: i === 0 ? config.endpoints.intake : i === 1 ? config.endpoints.consensus : config.endpoints.jurors[i - 2]!,
+  }));
+}
+
 /** Fail-closed parser. An absent launch file is the normal pre-CA standby state. */
 export function validateLaunchConfig(raw: unknown): ProductionLaunchConfig {
   if (!raw || typeof raw !== "object") throw new Error("launch config must be an object");
@@ -279,9 +288,7 @@ export async function startProductionRuntime(raw: unknown | undefined, deps: Run
           await tx`INSERT INTO _mochi_migrations (name) VALUES (${name})`;
         });
       }
-      for (const [i, identity] of [config.identities.intake, config.identities.consensus, ...config.identities.jurors].entries()) {
-        await upsertEndpoint(db.db, identity.address, i === 0 ? 2 : i === 1 ? 3 : 1, i === 0 ? url("intake") : i === 1 ? url("consensus") : config.endpoints.jurors[i - 2]!);
-      }
+      for (const row of endpointRows(config)) await upsertEndpoint(db.db, row.address, row.role, row.url);
     } finally { await db.close(); }
     const dstackBase = { TEE_MODE: "dstack", TEE_KEYS: "kms", TEE_MEASUREMENT: "dstack-config-v1", QUOTE_VERIFIER: "dcap", DSTACK_SOCKET: env.DSTACK_SOCKET ?? "/var/run/dstack.sock" };
     const childhealth: Record<string, "starting" | "healthy" | "failed"> = {};
