@@ -8,7 +8,7 @@ import { scanEntry } from './identity-guard.ts';
 import { assertLocalRoundDependencies } from './phala-round-rehearsal.ts';
 
 export const RUNTIME_ARTIFACT = 'deploy/production/assets/runtime.br';
-export const RUNTIME_SERVICES = ['intake','consensus','juror','gateway','indexer','attestor','orchestrator','postman'] as const;
+export const RUNTIME_SERVICES = ['intake','consensus','juror','juror-pool','gateway','indexer','attestor','orchestrator','postman'] as const;
 const ROOT=resolve(import.meta.dir,'..');
 export async function buildProductionRuntimeArtifact() {
   assertLocalRoundDependencies();

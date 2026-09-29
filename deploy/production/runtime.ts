@@ -311,11 +311,23 @@ export async function startProductionRuntime(raw: unknown | undefined, deps: Run
     launch("consensus", "consensus", 3002, { ...base(3002), PORT: "3002", SEALED_STORE_DIR: "/data/mochi/sealed/consensus", TEE_KEY_LABEL: "production-consensus", ...dstackBase });
     const classes = config.identities.jurors.map((j) => j.class!);
     const seats = [0, 0, 0, 0, 0];
-    config.identities.jurors.forEach((j, i) => {
+    // All nine seats share one process (one operator, one small VM); each keeps its own enclave key label, port,
+    // sealed store and model. Per-seat health comes from each seat's port.
+    const seatEnvs = config.identities.jurors.map((j, i) => {
       const cls = classes[i]!; const seat = seats[cls]!++;
       const p = j.passport!;
-      launch(`juror-${i}`, "juror", 3100 + i, { ...base(3100 + i), JUROR_OPERATOR: j.operator, JUROR_CLASS: String(cls), MODEL_ID: p.modelId, MODEL_LINEAGE: p.lineage, MODEL_WEIGHTS_SHA256: p.weightsSha256, MODEL_OPEN_WEIGHTS: "false", MODEL_PROVIDER: "phala-aci", ZDR: "false", RUNNER: "phala-aci", PHALA_ACI_MODEL: p.aciModel, PHALA_ACI_ALLOWED_WORKLOADS: p.workload, PHALA_AI_API_KEY: aciKey, MAX_TOKENS: String(p.maxTokens ?? 4096), SEALED_STORE_DIR: `/data/mochi/sealed/juror-${i}`, TEE_KEY_LABEL: `production-juror-class-${cls}-seat-${seat}`, ...dstackBase });
+      return { PORT: String(PRODUCTION_PORTS.jurors[i]), JUROR_OPERATOR: j.operator, JUROR_CLASS: String(cls), MODEL_ID: p.modelId, MODEL_LINEAGE: p.lineage, MODEL_WEIGHTS_SHA256: p.weightsSha256, PHALA_ACI_MODEL: p.aciModel, PHALA_ACI_ALLOWED_WORKLOADS: p.workload, MAX_TOKENS: String(p.maxTokens ?? 4096), SEALED_STORE_DIR: `/data/mochi/sealed/juror-${i}`, TEE_KEY_LABEL: `production-juror-class-${cls}-seat-${seat}` };
     });
+    const { PORT: _poolPort, ...poolBase } = base(PRODUCTION_PORTS.jurors[0]!);
+    const pool = childSpawn(process.execPath, [entry("juror-pool")], { cwd: rootDir, env: { PATH: env.PATH ?? "/usr/bin:/bin", ...poolBase, MODEL_OPEN_WEIGHTS: "false", MODEL_PROVIDER: "phala-aci", ZDR: "false", RUNNER: "phala-aci", PHALA_AI_API_KEY: aciKey, ...dstackBase, JUROR_SEATS_JSON: JSON.stringify(seatEnvs) }, stdio: "ignore" });
+    childhealth["juror-pool"] = "starting";
+    seatEnvs.forEach((_, i) => { childhealth[`juror-${i}`] = "starting"; healthPorts[`juror-${i}`] = PRODUCTION_PORTS.jurors[i]!; });
+    watchers.push(watchChildLifecycle(pool, "juror-pool", childhealth, { httpHealth: false, onFatal: (service) => { exited.add(service); if (!stopping) deps.onFatal?.(service); }, log }));
+    const seatsDown = () => { exited.add("juror-pool"); seatEnvs.forEach((_, i) => { exited.add(`juror-${i}`); childhealth[`juror-${i}`] = "failed"; }); };
+    pool.on("exit", seatsDown);
+    pool.on("error", seatsDown);
+    children.push(pool);
+    log(`juror pool started with ${seatEnvs.length} seats on loopback ports ${PRODUCTION_PORTS.jurors[0]}-${PRODUCTION_PORTS.jurors.at(-1)}`);
     launch("gateway", "gateway", 3200, { ...base(3200), MOCHI_DEPLOYMENT: deployPath, INTAKE_URL: url("intake"), ...(config.mode === "active" ? { RELAYER_KEY: serviceKeys.ORCHESTRATOR_KEY } : {}), ...(env[config.anonHmacSecretEnv ?? ""] ? { ANONYMA_HMAC_SECRET: env[config.anonHmacSecretEnv!] } : {}) });
     if (config.mode === "enroll" || config.mode === "active") launch("attestor", "attestor", 3202, { ...base(3202), MOCHI_DEPLOYMENT: deployPath, ATTESTOR_KEY: serviceKeys.ATTESTOR_KEY, ADMIN_TOKEN: adminToken!, PORT: "3202", QUOTE_VERIFIER: "dcap" });
     if (config.mode === "active") {

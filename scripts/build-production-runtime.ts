@@ -8,7 +8,7 @@ const out = resolve(outputIndex >= 0 ? Bun.argv[outputIndex + 1]! : "dist/mochi-
 const servicesDir = resolve(out, "services");
 const migrationsDir = resolve(out, "migrations");
 const services = ["intake", "consensus", "juror", "gateway", "indexer", "attestor", "orchestrator"] as const;
-const entrypoints = [...services.map((service) => [service, resolve(root, `services/${service}/src/main.ts`)] as const), ["postman", resolve(root, "scripts/asp-postman.ts")] as const];
+const entrypoints = [...services.map((service) => [service, resolve(root, `services/${service}/src/main.ts`)] as const), ["juror-pool", resolve(root, "services/juror/src/pool.ts")] as const, ["postman", resolve(root, "scripts/asp-postman.ts")] as const];
 await mkdir(out, { recursive: true });
 if ((await readdir(out)).length !== 0) throw new Error(`output directory must be empty: ${out}`);
 await mkdir(servicesDir, { recursive: true });

@@ -12,7 +12,7 @@ async function extract(extra:Record<string,string>={},wrongDigest=false){
  return writes;
 }
 test('runtime archive extracts only known service and migration paths',async()=>{
- const writes=await extract();expect(writes).toHaveLength(9);expect(writes.every(x=>x.startsWith('/tmp/mochi-runtime/'))).toBe(true);
+ const writes=await extract();expect(writes).toHaveLength(RUNTIME_SERVICES.length+1);expect(RUNTIME_SERVICES).toContain('juror-pool');expect(writes.every(x=>x.startsWith('/tmp/mochi-runtime/'))).toBe(true);
  await expect(extract({'../outside':'bad'})).rejects.toThrow('Invalid runtime file');
  await expect(extract({},true)).rejects.toThrow('Runtime digest mismatch');
  expect(()=>runtimeBootstrap('main','a'.repeat(64))).toThrow('immutable');
