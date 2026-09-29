@@ -49,15 +49,16 @@ export type RuntimeState = { status: "standby" | "running"; reason: string; chil
 const addressPattern = /^0x[0-9a-fA-F]{40}$/;
 const hex32Pattern = /^0x[0-9a-fA-F]{64}$/;
 const classCounts = [2, 2, 2, 1, 2];
-// One reviewed model family per juror class. The launch N3 panel (classes 0, 2, 4) is GPT-OSS, Gemma and Qwen: on a
+// One reviewed model family per juror class. The launch N3 panel (classes 0, 2, 4) is Qwen, Gemma and GPT-OSS: on a
 // 60-claim SciFact evaluation it resolved the most claims correctly of the tested panels (see
-// docs/JURY-MODEL-SELECTION.md). Llama 3.3 never answered insufficient_evidence and Nemotron often echoed the claim.
+// docs/JURY-MODEL-SELECTION.md). The attestor refuses llama/qwen lineages in the DISSENTER class (4) and requires the
+// dissenter to differ from LARGE_A, so Qwen leads (class 0) and GPT-OSS dissents (class 4).
 const classModels = [
-  ["openai/gpt-oss-120b", "gpt-oss"],
+  ["qwen/qwen3.6-35b-a3b", "qwen"],
   ["deepseek/deepseek-v4-flash-0731", "deepseek"],
   ["google/gemma-4-31b-it", "gemma"],
   ["moonshotai/kimi-k2.6", "kimi"],
-  ["qwen/qwen3.6-35b-a3b", "qwen"],
+  ["openai/gpt-oss-120b", "gpt-oss"],
 ] as const;
 const localUrl = (value: string, field: string) => {
   const parsed = new URL(value);

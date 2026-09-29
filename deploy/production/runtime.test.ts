@@ -5,10 +5,10 @@ import { endpointRows, PRODUCTION_PORTS, startProductionRuntime, startupFailureR
 const a = (n: number) => `0x${n.toString(16).padStart(40, "0")}` as `0x${string}`;
 const h = (n: number) => `0x${n.toString(16).padStart(64, "0")}` as `0x${string}`;
 const models = [
-  ["openai/gpt-oss-120b", "gpt-oss"], ["openai/gpt-oss-120b", "gpt-oss"],
+  ["qwen/qwen3.6-35b-a3b", "qwen"], ["qwen/qwen3.6-35b-a3b", "qwen"],
   ["deepseek/deepseek-v4-flash-0731", "deepseek"], ["deepseek/deepseek-v4-flash-0731", "deepseek"],
   ["google/gemma-4-31b-it", "gemma"], ["google/gemma-4-31b-it", "gemma"],
-  ["moonshotai/kimi-k2.6", "kimi"], ["qwen/qwen3.6-35b-a3b", "qwen"], ["qwen/qwen3.6-35b-a3b", "qwen"],
+  ["moonshotai/kimi-k2.6", "kimi"], ["openai/gpt-oss-120b", "gpt-oss"], ["openai/gpt-oss-120b", "gpt-oss"],
 ] as const;
 const config = () => ({
   format: "mochi-production-runtime-v1", enabled: true, mode: "prepare",
@@ -108,6 +108,15 @@ describe("production runtime config", () => {
     expect(rows[1]!.role).toBe(3);
     expect(rows.slice(2).map((row) => row.role)).toEqual(Array(9).fill(1));
     expect(rows.slice(2).map((row) => row.url)).toEqual(launch.endpoints.jurors);
+  });
+
+  test("the reviewed class models satisfy the attestor's dissenter lineage rules", () => {
+    const launch = validateLaunchConfig(config());
+    const lineageOf = (cls: number) => launch.identities.jurors.filter((j) => j.class === cls).map((j) => j.passport!.lineage.toLowerCase());
+    for (const lineage of lineageOf(4)) {
+      expect(["llama", "qwen"]).not.toContain(lineage); // services/attestor DISSENTER_EXCLUDED_LINEAGES default
+      expect(lineageOf(0)).not.toContain(lineage); // dissenter_lineage_not_distinct
+    }
   });
 
   test("accepts only mainnet or an explicit testnet rehearsal deployment", () => {

@@ -46,7 +46,7 @@ decides both how often a paid review resolves and how often a resolved review is
 | Panel (LARGE_A + DOC_SPECIALIST + DISSENTER) | Correct | Wrong | Unresolved | Median seconds | Mean inference USD |
 |---|---|---|---|---|---|
 | Llama + Gemma + Gemma, before the fixes | 25 | 3 | 32 | 4 | 0.008 |
-| **GPT-OSS + Gemma + Qwen 3.6 (launch)** | **39** | **7** | **14** | 22 | 0.016 |
+| **Qwen 3.6 + Gemma + GPT-OSS (launch)** | **39** | **7** | **14** | 22 | 0.016 |
 | Llama + Gemma + Gemma | 36 | 5 | 19 | 3 | 0.006 |
 | GPT-OSS + Gemma + Gemma | 36 | 9 | 15 | 6 | 0.002 |
 

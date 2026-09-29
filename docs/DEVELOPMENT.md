@@ -159,8 +159,8 @@ Production model assignment by juror class (pinned in `deploy/production/runtime
 
 | Juror class | Model |
 |---|---|
-| `LARGE_A` | `openai/gpt-oss-120b` |
+| `LARGE_A` | `qwen/qwen3.6-35b-a3b` |
 | `LARGE_B` | `deepseek/deepseek-v4-flash-0731` |
 | `DOC_SPECIALIST` | `google/gemma-4-31b-it` |
 | `SMALL_FAST` | `moonshotai/kimi-k2.6` |
-| `DISSENTER` | `qwen/qwen3.6-35b-a3b` |
+| `DISSENTER` | `openai/gpt-oss-120b` (the attestor refuses llama/qwen lineages as dissenter) |
