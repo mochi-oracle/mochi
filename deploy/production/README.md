@@ -76,6 +76,16 @@ bun scripts/prepare-production-enrollment.ts --deployment <mainnet.json> --ident
 
 Each possession proof must match the configured key, class, measurement, operator, chain and registry, with a valid juror signature. Output contains one approval for exactly nine times the deployment's `minJurorBond` and nine minimum-bond enrollment calls. Review and execute these from the approved operator wallet after the configure timelock has executed. Repeated execution is not a recovery mechanism; check on-chain enrollment and allowance before signing. Then select enroll mode, verify active attestations, and continue the separate activation phase described above.
 
+## Environment names are part of the measurement
+
+dstack measures the app definition, including the list of allowed encrypted-environment variable **names** (not their
+values). Deploying standby without `MOCHI_PRODUCTION_CONFIG_JSON` and the production modes with it produces two
+different measurements, and an intake/consensus key registered under one can never match the other (the registry has no
+way to change a registered service key's measurement). Always write the VM environment with
+`bun scripts/phala-cvm-env.ts --base <protected base.env> [--config production-runtime.json] --out <file>`, which emits
+the same five names in the same order in every mode (an empty config means standby), and read the identity report for
+enrollment only from a VM deployed that way. The testnet dress rehearsal found this.
+
 ## Restart-stable application measurement
 
 Production dstack quotes explicitly use the `dstack-config-v1` measurement scheme. Phala's `mr-kms` boot event can change between restarts even when the application, key provider and persistent keys are unchanged, making a digest of the entire RTMR3 unsuitable for immutable registry enrollment. See [Phala's MR-CONFIG-ID documentation](https://phala.com/tr/posts/mr-config-id-tutorial).
