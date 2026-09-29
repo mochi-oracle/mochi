@@ -1,4 +1,4 @@
-import { AciClient, AciVerificationError } from '@mochi/aci';
+import { AciClient, AciVerificationError, ProviderCallAborted, ProviderRetryError, withProviderRetries, type ProviderAttemptFailure, type ProviderRetryOptions } from '@mochi/aci';
 import type { EvidenceBundle, Juror } from './types.ts';
 import { CLAIMS_MAX_RESPONSE_BYTES, createClaimChatRequest, parseClaimChatResponse, reportedClaimUsage, type ChatJurorTelemetry } from './providers.ts';
 import { phalaDcap } from '../../juror/src/phala-dcap.ts';
@@ -17,6 +17,9 @@ export interface AciJurorOptions {
   allowedWorkloads?: string[];
   client?: AciClient;
   onTelemetry?: (event: ChatJurorTelemetry) => void;
+  /** Attempts including the first (1..5, default 3); transient provider failures are retried within timeoutMs. */
+  maxAttempts?: number;
+  retry?: Partial<Pick<ProviderRetryOptions, 'now' | 'sleep' | 'random' | 'minAttemptMs' | 'attemptCapMs'>>;
 }
 
 function buildClient(options: AciJurorOptions): AciClient {
@@ -48,6 +51,8 @@ export function createAciJuror(options: AciJurorOptions): Juror {
   const outputTokens = options.maxOutputTokens ?? DEFAULT_OUTPUT_TOKENS;
   if (!options.id || !options.model || !Number.isInteger(outputTokens) || outputTokens < 64 || outputTokens > 8000) throw new TypeError('Invalid juror configuration');
   if (options.timeoutMs !== undefined && (!Number.isInteger(options.timeoutMs) || options.timeoutMs < 1 || options.timeoutMs > MAX_TIMEOUT_MS)) throw new TypeError('Invalid juror timeout');
+  const maxAttempts = options.maxAttempts ?? 3;
+  if (!Number.isInteger(maxAttempts) || maxAttempts < 1 || maxAttempts > 5) throw new TypeError('Invalid juror attempt limit');
   const client = buildClient(options);
   return {
     id: options.id,
@@ -57,6 +62,8 @@ export function createAciJuror(options: AciJurorOptions): Juror {
       let usage: ChatJurorTelemetry['usage'];
       let stage: NonNullable<ChatJurorTelemetry['stage']> = 'request_build';
       let errorCode: string | undefined;
+      let attempts = 0;
+      let attemptFailures: ProviderAttemptFailure[] = [];
       const report = (outcome: ChatJurorTelemetry['outcome']) => emit(options.onTelemetry, {
         id: options.id,
         model: options.model,
@@ -64,6 +71,8 @@ export function createAciJuror(options: AciJurorOptions): Juror {
         outcome,
         stage: outcome === 'success' ? 'complete' : stage,
         ...(errorCode ? { errorCode } : {}),
+        attempts,
+        ...(attemptFailures.length ? { attemptFailures } : {}),
         ...(usage ? { usage } : {}),
       });
       const controller = new AbortController();
@@ -76,7 +85,25 @@ export function createAciJuror(options: AciJurorOptions): Juror {
         const request = createClaimChatRequest(options.model, bundle, outputTokens, { aciVerified: true });
         if (controller.signal.aborted) { stage = 'aci_exchange'; errorCode = 'REQUEST_ABORTED'; throw new Error('Provider request unavailable'); }
         stage = 'attestation';
-        const result = await client.chat(JSON.parse(request), { signal: controller.signal, maxResponseBytes: CLAIMS_MAX_RESPONSE_BYTES, requireUpToDate: true });
+        const body = JSON.parse(request);
+        const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
+        // Retry transient provider failures with the identical request, inside the same overall timeout.
+        const outcome = await withProviderRetries({
+          maxAttempts,
+          totalMs: timeoutMs,
+          attemptCapMs: Math.max(15_000, Math.floor(timeoutMs * 2 / 3)),
+          signal: controller.signal,
+          ...options.retry,
+        }, signal => client.chat(body, { signal, maxResponseBytes: CLAIMS_MAX_RESPONSE_BYTES, requireUpToDate: true })).catch((error: unknown) => {
+          if (error instanceof ProviderCallAborted) { attemptFailures = error.failures; attempts = error.attemptsStarted; throw error; }
+          if (!(error instanceof ProviderRetryError)) throw error;
+          attemptFailures = error.failures; attempts = error.failures.length;
+          if (error.attemptTimedOut) timeoutTriggered = true;
+          throw error.lastError;
+        });
+        attempts = outcome.attempts;
+        attemptFailures = outcome.failures;
+        const result = outcome.value;
         if (result.established.tcbStatus !== 'UpToDate') { stage = 'attestation'; errorCode = 'TCB_STATUS_NOT_UP_TO_DATE'; throw new Error('Provider request unavailable'); }
         stage = 'response_parse';
         usage = reportedClaimUsage(result.json);

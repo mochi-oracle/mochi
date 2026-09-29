@@ -54,6 +54,12 @@ const VOTING_PERIOD = BigInt(args.get("--voting-period") ?? 3 * 86400);
 const EXECUTION_DELAY = BigInt(args.get("--execution-delay") ?? 86400);
 const TIMELOCK_DELAY = BigInt(args.get("--timelock-delay") ?? 86400);
 const SCHEMA_ACTIVATION_DELAY = BigInt(args.get("--schema-activation-delay") ?? 0);
+// Per-juror MOCHI bond (whole tokens, 18 decimals). The spec default is 25,000; the team's token supply may justify another value.
+const MIN_JUROR_BOND_MOCHI = args.get("--min-juror-bond") ?? "25000";
+if (!/^[1-9][0-9]{0,11}$/.test(MIN_JUROR_BOND_MOCHI)) throw new Error("--min-juror-bond must be a whole number of MOCHI from 1 to 999999999999");
+const MIN_JUROR_BOND = BigInt(MIN_JUROR_BOND_MOCHI) * 10n ** 18n;
+if (mainnetMode && !rehearsal && TIMELOCK_DELAY !== 86400n) throw new Error("production mainnet requires --timelock-delay 86400");
+if (rehearsal && TIMELOCK_DELAY < 60n) throw new Error("--timelock-delay must be at least 60 seconds in a rehearsal");
 const configuredOwner = args.get("--owner") as Address | undefined;
 const configuredUsdg = args.get("--usdg") as Address | undefined;
 const configuredMochiToken = args.get("--mochi-token");
@@ -119,7 +125,7 @@ async function main() {
       mode: rehearsal ? "mainnet rehearsal" : "mainnet", chainId, rpc: redactRpc(rpcUrl), out: outPath,
       keyFileConfigured: Boolean(keyFile), owner, usdg: configuredUsdg, shielded: shieldedKind, randomness: randomnessKind,
       drand: { chainHash: args.get("--drand-chain-hash") ?? DRAND_QUICKNET.chainHash, publicKey: args.get("--drand-public-key") ?? DRAND_QUICKNET.publicKey, genesisTime: args.get("--drand-genesis") ?? DRAND_QUICKNET.genesisTime, period: args.get("--drand-period") ?? DRAND_QUICKNET.period, lookaheadRounds: args.get("--drand-lookahead") ?? "2" },
-      timelockDelay: TIMELOCK_DELAY.toString(), schemaActivationDelay: "0",
+      timelockDelay: TIMELOCK_DELAY.toString(), schemaActivationDelay: "0", minJurorBondMochi: MIN_JUROR_BOND_MOCHI,
       mochiToken: tokenPolicy.source === "external" ? configuredMochiToken : "test-only token deployed for rehearsal",
       mochiRecipient: tokenPolicy.source === "test-deployment" ? configuredRecipient : "team-managed external supply", guardian: configuredGuardian,
       postman: configuredPostman ?? "deployer (renounced at handover; vacant until rotated)", attestor: configuredAttestor ?? "later through timelock",
@@ -214,7 +220,7 @@ async function main() {
     : await deploy("BlockhashRandomness", A.BlockhashRandomnessAbi as Abi, A.BlockhashRandomnessBytecode, [1n]);
   const schemaRegistry = await deploy("SchemaRegistry", A.SchemaRegistryAbi as Abi, A.SchemaRegistryBytecode, [me, mainnetMode ? 0n : SCHEMA_ACTIVATION_DELAY]);
   const jurorRegistry = await deploy("JurorRegistry", A.JurorRegistryAbi as Abi, A.JurorRegistryBytecode, [
-    me, mochiToken, me, 25_000n * 10n ** 18n, 7n * 86400n,
+    me, mochiToken, me, MIN_JUROR_BOND, 7n * 86400n,
   ]);
   const queryEscrow = await deploy("QueryEscrow", A.QueryEscrowAbi as Abi, A.QueryEscrowBytecode, [
     me, usdg, jurorRegistry, schemaRegistry, randomness,
@@ -457,6 +463,7 @@ async function main() {
     ...(privacy ? { privacy } : {}),
   };
   const finalDeployment = mainnetMode ? Object.assign(dep, { deployer: me, owner, timelock, guardian, paused: true, roles: mainnetRoles, stockTokens, ...(mochiRecipient ? { mochiRecipient } : {}), postman: configuredPostman ?? me, rehearsal }) : dep;
+  Object.assign(finalDeployment, { minJurorBond: MIN_JUROR_BOND.toString(), timelockDelay: TIMELOCK_DELAY.toString() });
   Object.assign(finalDeployment, { tokenSource: tokenPolicy.source === "external" ? { kind: "external", decimals: 18 } : { kind: "test-deployment", decimals: 18 } });
   mkdirSync(dirname(outPath), { recursive: true });
   writeFileSync(outPath, JSON.stringify(finalDeployment, null, 2) + "\n");

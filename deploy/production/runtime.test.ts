@@ -89,4 +89,17 @@ describe("production runtime config", () => {
     const publicBind = config(); (publicBind as any).endpoints.intake = "http://0.0.0.0:3001";
     expect(() => validateLaunchConfig(publicBind)).toThrow("loopback");
   });
+
+  test("accepts only mainnet or an explicit testnet rehearsal deployment", () => {
+    const rehearsal = config(); Object.assign((rehearsal as any).deployment, { chainId: 46630, rehearsal: true });
+    expect(validateLaunchConfig(rehearsal).deployment.chainId).toBe(46630);
+    const unmarked = config(); (unmarked as any).deployment.chainId = 46630;
+    expect(() => validateLaunchConfig(unmarked)).toThrow("explicit testnet rehearsal");
+    const markedMainnet = config(); (markedMainnet as any).deployment.rehearsal = true;
+    expect(() => validateLaunchConfig(markedMainnet)).toThrow("explicit testnet rehearsal");
+    const otherChain = config(); (otherChain as any).deployment.chainId = 1;
+    expect(() => validateLaunchConfig(otherChain)).toThrow();
+    const localToken = config(); (localToken as any).deployment.tokenSource.kind = "test-deployment";
+    expect(() => validateLaunchConfig(localToken)).toThrow("external MOCHI");
+  });
 });

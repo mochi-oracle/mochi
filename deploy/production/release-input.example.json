@@ -18,6 +18,7 @@
   "jurorCount": 9,
   "jurorClassCounts": [2, 2, 2, 1, 2],
   "minimumJurorBondMochi": 25000,
+  "bondBelowSpecApproved": false,
   "initialFeedBudgetUsdg": null,
   "deploymentFile": null,
   "identitiesFile": null,

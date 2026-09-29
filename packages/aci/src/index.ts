@@ -253,3 +253,5 @@ export class AciClient {
     try { return { json: JSON.parse(new TextDecoder().decode(responseBytes)), receipt, established }; } catch { throw new AciVerificationError("response_json"); }
   }
 }
+
+export * from "./retry.ts";

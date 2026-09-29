@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { ProviderCallAborted, ProviderRetryError, withProviderRetries, type ProviderAttemptFailure, type ProviderRetryOptions } from "@mochi/aci";
 
 export interface ModelInput {
   system: string;
@@ -83,10 +84,13 @@ export class OpenAICompatibleRunner implements ModelRunner {
 export class PhalaAciRunner implements ModelRunner {
   lastReceipt: { receiptId: string; sessionId: string; workloadId: string; modelId: string } | undefined;
   lastProviderReceipt: { receiptId: string; sessionId: string; workloadId: string; modelId: string; upstreamModelId?: string } | undefined;
-  lastFailure: { causeCode: string; httpStatus?: number } | undefined;
-  constructor(private readonly options: { client: import("@mochi/aci").AciClient; model: string; timeoutMs: number; maxTokens?: number; maxInputBytes?: number; compactReceiptMetadata?: boolean }) {}
+  lastFailure: { causeCode: string; httpStatus?: number; attempts?: number; attemptFailures?: ProviderAttemptFailure[] } | undefined;
+  /** Provider attempts used by the last run, retries included (content-free, for cost and reliability telemetry). */
+  lastAttempts = 0;
+  constructor(private readonly options: { client: import("@mochi/aci").AciClient; model: string; timeoutMs: number; maxTokens?: number; maxInputBytes?: number; compactReceiptMetadata?: boolean; maxAttempts?: number; attemptCapMs?: number; retry?: Partial<Pick<ProviderRetryOptions, "now" | "sleep" | "random" | "minAttemptMs">> }) {}
   async run(input: ModelInput): Promise<unknown> {
     this.lastFailure = undefined;
+    this.lastAttempts = 0;
     const maxTokens = Math.min(input.maxTokens, this.options.maxTokens ?? input.maxTokens);
     const requestBody = {
       model: this.options.model,
@@ -106,8 +110,26 @@ export class PhalaAciRunner implements ModelRunner {
     }
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), this.options.timeoutMs);
+    let attemptFailures: ProviderAttemptFailure[] = [];
     try {
-      const result = await this.options.client.chat(requestBody, { signal: controller.signal, requireUpToDate: true, maxResponseBytes: 256 * 1024 });
+      // Transient provider failures (429/5xx, dropped connections, stalled attempts) are retried with the
+      // identical request to the same attested route, inside the one overall model timeout.
+      const maxAttempts = this.options.maxAttempts ?? 3;
+      const outcome = await withProviderRetries({
+        maxAttempts,
+        totalMs: this.options.timeoutMs,
+        attemptCapMs: this.options.attemptCapMs ?? Math.max(15_000, Math.floor(this.options.timeoutMs / 2)),
+        signal: controller.signal,
+        ...this.options.retry,
+      }, (signal) => this.options.client.chat(requestBody, { signal, requireUpToDate: true, maxResponseBytes: 256 * 1024 })).catch((error: unknown) => {
+        if (error instanceof ProviderCallAborted) { attemptFailures = error.failures; this.lastAttempts = error.attemptsStarted; throw error; }
+        if (!(error instanceof ProviderRetryError)) throw error;
+        attemptFailures = error.failures;
+        this.lastAttempts = error.failures.length;
+        throw error.attemptTimedOut ? new RunnerError("model request timed out", { cause: error.lastError }, "timeout") : error.lastError;
+      });
+      this.lastAttempts = outcome.attempts;
+      const result = outcome.value;
       // ACI checks UpToDate on the freshly attested workload before submitting
       // chat when requireUpToDate is set. Keep this defense-in-depth check too.
       if (result.established.tcbStatus !== "UpToDate") throw new RunnerError("TDX TCB status is not allowed", undefined, "tcb_status");
@@ -141,7 +163,7 @@ export class PhalaAciRunner implements ModelRunner {
       const causeCode = known.has(code) ? code : "aci_error";
       const nested = error instanceof RunnerError ? error.cause : error;
       const httpStatus = nested && typeof nested === "object" && "httpStatus" in nested && typeof nested.httpStatus === "number" && Number.isInteger(nested.httpStatus) && nested.httpStatus >= 100 && nested.httpStatus <= 599 ? nested.httpStatus : undefined;
-      this.lastFailure = { causeCode, ...(httpStatus === undefined ? {} : { httpStatus }) };
+      this.lastFailure = { causeCode, ...(httpStatus === undefined ? {} : { httpStatus }), ...(this.lastAttempts > 1 ? { attempts: this.lastAttempts, attemptFailures } : {}) };
       if (error instanceof RunnerError) throw error;
       if (controller.signal.aborted) throw new RunnerError("model request timed out", { cause: error }, "timeout");
       throw new RunnerError("model verification or inference failed", { cause: error }, causeCode);

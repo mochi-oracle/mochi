@@ -31,6 +31,7 @@ const runner = config.MODEL_PROVIDER === "phala-aci"
       }),
       model: config.PHALA_ACI_MODEL!,
       timeoutMs: config.MODEL_TIMEOUT_MS,
+      maxAttempts: config.MODEL_MAX_ATTEMPTS,
     })
   : config.RUNNER === "openai"
   ? new OpenAICompatibleRunner({

@@ -7,6 +7,7 @@ import { createChain, ROLE_IDS } from "@mochi/chain";
 import { DstackKeySource } from "@mochi/tee";
 import { createDb, upsertEndpoint } from "@mochi/db";
 import { PRODUCTION_IDENTITY_SPECS, PRODUCTION_RECEIPT_SIGNING_SPEC, PRODUCTION_SERVICE_SPECS } from "../phala/production-identities/identities.ts";
+import { productionChainId } from "./chain-policy.ts";
 
 type Address = `0x${string}`;
 type Hex = `0x${string}`;
@@ -71,7 +72,8 @@ export function validateLaunchConfig(raw: unknown): ProductionLaunchConfig {
   if (c.format !== "mochi-production-runtime-v1") throw new Error("unsupported production runtime config format");
   if (c.enabled !== true) throw new Error("production runtime requires explicit enabled=true after CA and identity review");
   if (!["prepare", "enroll", "active"].includes(c.mode)) throw new Error("runtime mode must be explicitly prepare, enroll or active");
-  if (!c.deployment || c.deployment.chainId !== 4663 || c.deployment.tokenSource?.kind !== "external" || !c.deployment.contracts?.mochiToken) throw new Error("deployment must be the reviewed Robinhood mainnet deployment with external MOCHI CA");
+  if (!c.deployment || !c.deployment.contracts?.mochiToken) throw new Error("deployment must be the reviewed Robinhood mainnet deployment with external MOCHI CA");
+  productionChainId(c.deployment);
   nonzeroAddress(c.deployment.contracts.mochiToken, "deployment.contracts.mochiToken");
   let rpc: URL;
   try { rpc = new URL(c.rpcUrl); } catch { throw new Error("rpcUrl must be a valid HTTPS URL"); }
@@ -219,7 +221,8 @@ export async function startProductionRuntime(raw: unknown | undefined, deps: Run
   try {
     // Public read-only gates happen before KMS signing, DB writes, or service startup.
     const publicClient = createPublicClient({ transport: http(config.rpcUrl) });
-    if (await publicClient.getChainId() !== 4663) throw new Error("RPC chain ID must be 4663");
+    const expectedChainId = productionChainId(config.deployment);
+    if (await publicClient.getChainId() !== expectedChainId) throw new Error(`RPC chain ID must be ${expectedChainId}`);
     const token = config.deployment.contracts.mochiToken as Address;
     const code = await publicClient.getCode({ address: token });
     if (!code || code === "0x") throw new Error("external MOCHI contract code is absent");

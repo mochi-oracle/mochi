@@ -98,11 +98,11 @@ async function main() {
     const { contracts } = deployment;
     assert(await publicClient.readContract({ address: contracts.queryEscrow!, abi: accessAbi, functionName: "paused" }), "QueryEscrow must start paused");
 
-    // Prove deploy-local refuses an external token in rehearsal mode; no request leaves loopback.
-    const productionGuard = start("bun", ["scripts/deploy-local.ts", "--mainnet", "--rehearsal", "--rpc", rpc, "--owner", owner.address,
-      "--guardian", guardian.address, "--usdg", contracts.usdg!, "--mochi-token", contracts.mochiToken!, "--shielded", "privacy-pools", "--randomness", "drand", "--yes"], { cwd: ROOT, env });
+    // A rehearsal may stand in an external token, but deploy-local must refuse one with no contract code; no request leaves loopback.
+    const productionGuard = start("bun", ["scripts/deploy-local.ts", "--mainnet", "--rehearsal", "--rpc", rpc, "--key-file", keyPath, "--out", join(temp, "refused.json"), "--owner", owner.address,
+      "--guardian", guardian.address, "--usdg", contracts.usdg!, "--mochi-token", guardian.address, "--shielded", "privacy-pools", "--randomness", "drand", "--yes"], { cwd: ROOT, env });
     const guardResult = await collect(productionGuard);
-    assert(guardResult.code !== 0 && guardResult.output.includes("--mochi-token is accepted only for production mainnet"), "rehearsal mode must refuse an external MOCHI address");
+    assert(guardResult.code !== 0 && guardResult.output.includes("--mochi-token has no contract code"), "rehearsal mode must refuse an external MOCHI address without contract code");
 
     // The owner and guardian are distinct mnemonic-derived fixtures. Build the exact
     // nine-juror 2/2/2/1/2 payload with deterministic nonzero test identities.
@@ -172,7 +172,7 @@ async function main() {
       usdg: "MockUSDG", initialPaused: true, configure: { callCount: configureSchedule.callCount, earlyExecutionReverted: true, earlyRevert: "TimelockUnexpectedOperationState", executedAfterSeconds: "86400", pausedAfterConfigure: true, attestorRoleAssigned: true, feedRunnerRoleAssigned: true },
       activation: { callCount: activation.callCount, earlyExecutionReverted: true, earlyRevert: "TimelockUnexpectedOperationState", executedAfterSeconds: "86400", unpausedAfterExecution: true, guardianPauseAfterActivation: true },
       jurorFixture: "nine identities, class counts 2/2/2/1/2; activation CLI correctly blocked because no operator enrollment was performed; no bonds, payment, or service health claimed",
-      limitation: "external MOCHI on chainId 4663 cannot be reached with MockUSDG: mainnet rejects MockUSDG outside rehearsal, while rehearsal is chainId 46630 only and rejects --mochi-token",
+      limitation: "this local run deploys the test token; the external-token path is exercised by a testnet dress rehearsal (chain 46630, --mochi-token stand-in) and on mainnet",
     }, null, 2));
   } finally {
     anvil.kill("SIGTERM");

@@ -59,6 +59,10 @@ export interface ChatJurorTelemetry {
   outcome: 'success' | 'failure';
   stage?: 'complete' | 'request_build' | 'attestation' | 'inference' | 'receipt' | 'aci_exchange' | 'response_parse';
   errorCode?: string;
+  /** Provider attempts made, retries included; every attempt may be billed. */
+  attempts?: number;
+  /** Content-free code of each failed attempt, in order. */
+  attemptFailures?: Array<{ code: string; httpStatus?: number }>;
   usage?: {
     promptTokens?: number;
     completionTokens?: number;

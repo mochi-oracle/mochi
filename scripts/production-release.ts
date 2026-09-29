@@ -3,6 +3,10 @@ import { resolve } from "node:path";
 import { createPublicClient, http, keccak256, parseAbi, toHex, type Address, type Hex } from "viem";
 import { createChain, ROLE_IDS, type Deployment as ChainDeployment } from "@mochi/chain";
 import { buildPhalaBatch, type Deployment as BatchDeployment, type Input as IdentityInput } from "./phala-batch.ts";
+import { deploymentMinJurorBond, isProductionRehearsal, productionChainRule, productionTimelockDelay, REHEARSAL_CHAIN_ID } from "../deploy/production/chain-policy.ts";
+
+const SPEC_MIN_JUROR_BOND_MOCHI = 25_000;
+const expectedChain = (deployment: ProductionDeployment): number | undefined => productionChainRule(deployment);
 
 const ADDRESS = /^0x[0-9a-fA-F]{40}$/;
 const ZERO = /^0x0{40}$/i;
@@ -19,13 +23,15 @@ export type ReleaseInput = {
   jurorCount: number;
   jurorClassCounts: number[];
   minimumJurorBondMochi: number;
+  /** Explicit reviewed approval for a per-juror bond below the 25,000 MOCHI spec default. */
+  bondBelowSpecApproved?: boolean;
   initialFeedBudgetUsdg?: number | null;
   deploymentFile?: string | null;
   identitiesFile?: string | null;
   salt?: string | null;
 };
 export type ProductionDeployment = BatchDeployment & {
-  chainId: number; rpcUrl?: string; owner?: Address; guardian?: Address; paused?: boolean;
+  chainId: number; rpcUrl?: string; owner?: Address; guardian?: Address; paused?: boolean; rehearsal?: boolean; minJurorBond?: string;
   tokenSource?: { kind: string; decimals?: number };
   contracts: BatchDeployment["contracts"] & Record<string, Address> & { mochiToken?: Address; usdg?: Address; jurorRegistry: Address; queryEscrow: Address; panel: Address; receiptAnchor: Address; timelock?: Address };
 };
@@ -73,7 +79,7 @@ export async function readTimelockOperationStatus(
   catch {
     return phases.map(([phase, operationId]) => ({ phase, operationId, status: "read-failed", chainId: null, blockTimestamp: null, scheduledTimestamp: null, nextAction: "Retry the public read-only chain ID check; do not infer readiness from unavailable data.", detail: "RPC chain ID read failed; provider details suppressed" }));
   }
-  if (actualChainId !== 4663 || actualChainId !== deployment.chainId) {
+  if (actualChainId !== expectedChain(deployment) || actualChainId !== deployment.chainId) {
     return phases.map(([phase, operationId]) => ({ phase, operationId, status: "read-failed", chainId: actualChainId, blockTimestamp: null, scheduledTimestamp: null, nextAction: "Use the Robinhood Chain mainnet RPC (chain ID 4663) matching the deployment and repeat the read-only check.", detail: `RPC chain ID=${actualChainId}; deployment=${deployment.chainId}; expected=4663` }));
   }
   let now: bigint;
@@ -121,7 +127,7 @@ export async function runReadOnlyPreflight(deployment: ProductionDeployment, inp
     try { const result = await fn(); checks.push({ id, ...result }); }
     catch { checks.push({ id, ok: false, detail: "read failed; provider details suppressed" }); }
   }
-  await check("chain-id", async () => { const actual = await reader.chainId(); return { ok: actual === 4663 && actual === deployment.chainId, detail: `RPC=${actual}; deployment=${deployment.chainId}; expected=4663` }; });
+  await check("chain-id", async () => { const actual = await reader.chainId(); return { ok: actual === expectedChain(deployment) && actual === deployment.chainId, detail: `RPC=${actual}; deployment=${deployment.chainId}; expected=4663` }; });
   await check("paused", async () => { const paused = await reader.paused(deployment.contracts.queryEscrow); return { ok: paused, detail: `QueryEscrow.paused=${paused}; expected=true before activation` }; });
   const contractEntries = Object.entries(deployment.contracts).filter(([, a]) => typeof a === "string" && ADDRESS.test(a) && !ZERO.test(a)) as [string, Address][];
   if (deployment.privacy?.entrypoint) contractEntries.push(["privacy.entrypoint", deployment.privacy.entrypoint]);
@@ -205,7 +211,10 @@ export function buildProductionRelease(input: ReleaseInput, options: { deploymen
   };
   const missing: string[] = [];
   const errors: string[] = [];
-  if (input.chainId !== 4663) errors.push("chainId must be Robinhood Chain mainnet 4663");
+  const warnings: string[] = [];
+  const rehearsalPlan = input.chainId === REHEARSAL_CHAIN_ID && isProductionRehearsal(deployment);
+  if (input.chainId !== 4663 && !rehearsalPlan) errors.push("chainId must be Robinhood Chain mainnet 4663 (46630 only with an explicit rehearsal deployment file)");
+  if (rehearsalPlan) warnings.push("REHEARSAL on Robinhood Chain testnet 46630: nothing in this plan applies to mainnet");
   errors.push(...validateRpcUrl(input.rpcUrl ?? deployment?.rpcUrl));
   address(input.mochiToken, "mochiToken (team-created external MOCHI CA)", missing, errors);
   address(input.usdg, "usdg", missing, errors);
@@ -213,16 +222,22 @@ export function buildProductionRelease(input: ReleaseInput, options: { deploymen
   const a = (key: Role) => roles[key]?.toLowerCase();
   if (a("owner") && a("guardian") && a("owner") === a("guardian")) errors.push("roles.owner and roles.guardian must be distinct for custody and pause isolation");
   for (const role of ["attestor", "feedRunner", "orchestrator", "indexer", "postman"] as Role[]) if (a(role) && a(role) === a("owner")) errors.push(`roles.${role} must be distinct from roles.owner`);
-  if (input.timelockDelaySeconds !== 86400) errors.push("timelockDelaySeconds must be 86400 to match the existing production batch builder");
+  let expectedDelay = 86400;
+  if (rehearsalPlan) { try { expectedDelay = productionTimelockDelay(deployment); } catch (error) { errors.push(error instanceof Error ? error.message : "invalid rehearsal timelock delay"); } }
+  if (input.timelockDelaySeconds !== expectedDelay) errors.push(rehearsalPlan ? `timelockDelaySeconds must be ${expectedDelay} to match the rehearsal deployment` : "timelockDelaySeconds must be 86400 to match the existing production batch builder");
   if (input.jurorCount !== 9 || JSON.stringify(input.jurorClassCounts) !== JSON.stringify([2, 2, 2, 1, 2])) errors.push("launch requires nine jurors with class counts 2/2/2/1/2");
-  if (!Number.isFinite(input.minimumJurorBondMochi) || input.minimumJurorBondMochi < 25_000) errors.push("minimumJurorBondMochi must be at least 25000 per juror");
+  if (!Number.isSafeInteger(input.minimumJurorBondMochi) || input.minimumJurorBondMochi <= 0) errors.push("minimumJurorBondMochi must be a positive whole number of MOCHI");
+  else if (input.minimumJurorBondMochi < SPEC_MIN_JUROR_BOND_MOCHI && input.bondBelowSpecApproved !== true) errors.push("minimumJurorBondMochi must be at least 25000 per juror unless bondBelowSpecApproved=true records a reviewed decision");
+  else if (input.minimumJurorBondMochi < SPEC_MIN_JUROR_BOND_MOCHI) warnings.push(`per-juror bond ${input.minimumJurorBondMochi} MOCHI is below the 25000 spec default (approved)`);
   if (input.initialFeedBudgetUsdg == null) missing.push("initialFeedBudgetUsdg (reviewed USDG feed budget)");
   else if (!Number.isFinite(input.initialFeedBudgetUsdg) || input.initialFeedBudgetUsdg <= 0) errors.push("initialFeedBudgetUsdg must be positive when supplied");
   if (input.salt != null && !/^0x[0-9a-fA-F]{64}$/.test(input.salt)) errors.push("salt must be bytes32");
 
   let batches: Record<string, unknown> | undefined;
   if (deployment) {
-    if (deployment.chainId !== 4663) errors.push("deployment.chainId must be 4663");
+    if (expectedChain(deployment) === undefined || deployment.chainId !== input.chainId) errors.push("deployment.chainId must be 4663 (or 46630 for an explicit rehearsal) and match the input chainId");
+    try { if (Number.isSafeInteger(input.minimumJurorBondMochi) && input.minimumJurorBondMochi > 0 && deploymentMinJurorBond(deployment) !== BigInt(input.minimumJurorBondMochi) * 10n ** 18n) errors.push("deployment.minJurorBond does not match minimumJurorBondMochi"); }
+    catch (error) { errors.push(error instanceof Error ? error.message : "invalid deployment.minJurorBond"); }
     if (deployment.contracts.mochiToken && input.mochiToken && deployment.contracts.mochiToken.toLowerCase() !== input.mochiToken.toLowerCase()) errors.push("input mochiToken does not match deployment contracts.mochiToken");
     if (deployment.contracts.usdg && input.usdg && deployment.contracts.usdg.toLowerCase() !== input.usdg.toLowerCase()) errors.push("input usdg does not match deployment contracts.usdg");
     if (deployment.owner && input.roles.owner && deployment.owner.toLowerCase() !== input.roles.owner.toLowerCase()) errors.push("input roles.owner does not match deployment owner");
@@ -266,6 +281,8 @@ export function buildProductionRelease(input: ReleaseInput, options: { deploymen
     format: "mochi-production-release-plan-v2",
     generatedAt: new Date().toISOString(),
     mode: "offline-review-only",
+    network: rehearsalPlan ? "REHEARSAL (chain 46630) - not mainnet" : "Robinhood Chain mainnet (4663)",
+    warnings,
     target: { chainId: input.chainId, rpcOrigin: safeRpcOrigin(input.rpcUrl ?? deployment?.rpcUrl ?? "https://rpc.mainnet.chain.robinhood.com"), externalMochiToken: input.mochiToken ?? null, usdg: input.usdg ?? null },
     roles,
     economics: { jurorCount: 9, classCounts: [2, 2, 2, 1, 2], minimumBondPerJurorMochi: input.minimumJurorBondMochi, minimumTotalJurorBondsMochi: input.minimumJurorBondMochi * 9, initialFeedBudgetUsdg: input.initialFeedBudgetUsdg ?? null },

@@ -1,0 +1,142 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Mochi owner console</title>
+<style>
+  :root { --bg:#faf7f2; --card:#fff; --ink:#1f1a17; --muted:#6b625b; --line:#e6ded4; --accent:#c2410c; --ok:#15803d; --warn:#b45309; --bad:#b91c1c; }
+  @media (prefers-color-scheme: dark) { :root { --bg:#161311; --card:#211d1a; --ink:#f3ede7; --muted:#a79d94; --line:#3a332d; --accent:#fb923c; --ok:#4ade80; --warn:#fbbf24; --bad:#f87171; } }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--ink); font:15px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif; }
+  main { max-width:860px; margin:0 auto; padding:24px 16px 64px; }
+  h1 { font-size:22px; margin:0 0 4px; }
+  .sub { color:var(--muted); margin:0 0 20px; }
+  .bar { display:flex; flex-wrap:wrap; gap:10px; align-items:center; background:var(--card); border:1px solid var(--line); border-radius:10px; padding:12px 14px; margin-bottom:18px; }
+  .bar .who { flex:1 1 260px; font-family:ui-monospace, monospace; font-size:13px; word-break:break-all; }
+  button { font:inherit; border:0; border-radius:8px; padding:8px 14px; background:var(--accent); color:#fff; cursor:pointer; }
+  button[disabled] { opacity:.45; cursor:not-allowed; }
+  button.ghost { background:transparent; color:var(--ink); border:1px solid var(--line); }
+  .banner { border-radius:10px; padding:10px 14px; margin-bottom:18px; border:1px solid var(--line); }
+  .banner.rehearsal { background:#fef3c7; color:#78350f; border-color:#fcd34d; }
+  .banner.error { background:#fee2e2; color:#7f1d1d; border-color:#fca5a5; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:10px; padding:14px; margin-bottom:12px; }
+  .card h2 { font-size:16px; margin:0 0 6px; }
+  .meta { color:var(--muted); font-size:13px; margin-bottom:8px; }
+  ol.calls { margin:6px 0 10px; padding-left:20px; font-family:ui-monospace, monospace; font-size:12.5px; word-break:break-all; }
+  .status { display:inline-block; font-size:12px; font-weight:600; padding:2px 8px; border-radius:999px; border:1px solid currentColor; }
+  .s-ready,.s-done { color:var(--ok); } .s-pending { color:var(--warn); } .s-unscheduled,.s-unknown,.s-unavailable { color:var(--muted); }
+  .row { display:flex; flex-wrap:wrap; gap:10px; align-items:center; }
+  .result { font-family:ui-monospace, monospace; font-size:12.5px; word-break:break-all; }
+  details summary { cursor:pointer; color:var(--muted); font-size:13px; }
+  details pre { white-space:pre-wrap; word-break:break-all; font-size:12px; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Mochi owner console</h1>
+  <p class="sub">Each card below is one prepared transaction. Read what it does, then press Send and approve it in your wallet. Nothing is sent without your approval, and this page never asks for your recovery phrase or private key.</p>
+  <div id="banner"></div>
+  <div class="bar">
+    <div class="who" id="who">Wallet not connected.</div>
+    <button id="connect">Connect wallet</button>
+    <button id="switch" class="ghost" hidden>Switch network</button>
+    <button id="refresh" class="ghost">Refresh status</button>
+  </div>
+  <div id="steps"></div>
+</main>
+<script>
+(() => {
+  const $ = (id) => document.getElementById(id);
+  const eth = window.ethereum;
+  let info = null, account = null, chainOk = false;
+  const CHAINS = {
+    4663: { chainId: '0x1237', chainName: 'Robinhood Chain', rpcUrls: ['https://rpc.mainnet.chain.robinhood.com'], nativeCurrency: { name: 'Ether', symbol: 'ETH', decimals: 18 } },
+    46630: { chainId: '0xb626', chainName: 'Robinhood Chain Testnet', rpcUrls: ['https://rpc.testnet.chain.robinhood.com'], nativeCurrency: { name: 'Ether', symbol: 'ETH', decimals: 18 } },
+  };
+  const esc = (s) => String(s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+  const banner = (html, cls) => { $('banner').innerHTML = html ? `<div class="banner ${cls}">${html}</div>` : ''; };
+  const words = { unscheduled: 'Not scheduled yet', pending: 'Waiting period running', ready: 'Ready to execute', done: 'Done', unknown: 'Plain transaction', unavailable: 'Status unavailable' };
+
+  async function load() {
+    const r = await fetch('/api/steps', { cache: 'no-store' });
+    info = await r.json();
+    if (info.rehearsal) banner('<strong>Testnet rehearsal.</strong> These transactions are for Robinhood Chain testnet (46630), not mainnet.', 'rehearsal');
+    render();
+  }
+
+  function canSend(step) {
+    if (!account || !chainOk) return false;
+    if (step.kind === 'timelock-schedule') return step.status === 'unscheduled';
+    if (step.kind === 'timelock-execute') return step.status === 'ready';
+    return true;
+  }
+
+  function render() {
+    if (!info) return;
+    $('steps').innerHTML = info.steps.map((s, i) => `
+      <div class="card" id="card-${esc(s.id)}">
+        <h2>${i + 1}. ${esc(s.title)}</h2>
+        <div class="meta"><span class="status s-${esc(s.status)}">${esc(words[s.status] || s.status)}</span> &nbsp; from file ${esc(s.file)}</div>
+        <ol class="calls">${s.details.map((d) => `<li>${esc(d)}</li>`).join('')}</ol>
+        <details><summary>Raw transaction</summary><pre>to:   ${esc(s.to)}\ndata: ${esc(s.data)}${s.operationId ? `\noperation: ${esc(s.operationId)}` : ''}</pre></details>
+        <div class="row"><button data-step="${esc(s.id)}" ${canSend(s) ? '' : 'disabled'}>Send</button><span class="result" id="res-${esc(s.id)}"></span></div>
+      </div>`).join('');
+    for (const b of document.querySelectorAll('button[data-step]')) b.addEventListener('click', () => send(b.dataset.step, b));
+  }
+
+  async function checkWallet() {
+    if (!eth || !account || !info) return;
+    const chainHex = await eth.request({ method: 'eth_chainId' });
+    chainOk = parseInt(chainHex, 16) === info.chainId;
+    const rightAccount = account.toLowerCase() === info.expectFrom.toLowerCase();
+    $('who').innerHTML = `Connected: ${esc(account)}<br>${rightAccount ? '' : `<strong style="color:var(--bad)">Expected ${esc(info.expectFrom)}. Switch accounts in your wallet.</strong><br>`}${chainOk ? `Network OK (${info.chainId})` : `<strong style="color:var(--bad)">Wrong network (${parseInt(chainHex, 16)}); need ${info.chainId}.</strong>`}`;
+    $('switch').hidden = chainOk;
+    if (!rightAccount) chainOk = false;
+    render();
+  }
+
+  $('connect').addEventListener('click', async () => {
+    if (!eth) { banner('No browser wallet found. Open this page in the browser where your wallet extension is installed.', 'error'); return; }
+    try { [account] = await eth.request({ method: 'eth_requestAccounts' }); await checkWallet(); }
+    catch (e) { banner(`Wallet connection was not approved (${esc(e.message || e)}).`, 'error'); }
+  });
+  $('switch').addEventListener('click', async () => {
+    const params = CHAINS[info.chainId];
+    try { await eth.request({ method: 'wallet_switchEthereumChain', params: [{ chainId: params.chainId }] }); }
+    catch (e) { if (e && e.code === 4902) await eth.request({ method: 'wallet_addEthereumChain', params: [params] }); else banner(`Network switch failed (${esc(e.message || e)}).`, 'error'); }
+    await checkWallet();
+  });
+  $('refresh').addEventListener('click', async () => { await load(); await checkWallet(); });
+  if (eth && eth.on) { eth.on('accountsChanged', (a) => { account = a[0] || null; checkWallet(); }); eth.on('chainChanged', () => checkWallet()); }
+
+  async function record(stepId, txHash, outcome) {
+    await fetch('/api/record', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ stepId, txHash, from: account, chainId: info.chainId, outcome }) });
+  }
+
+  async function send(id, button) {
+    const step = info.steps.find((s) => s.id === id);
+    const out = $(`res-${id}`);
+    button.disabled = true;
+    try {
+      const hash = await eth.request({ method: 'eth_sendTransaction', params: [{ from: account, to: step.to, data: step.data, value: '0x0' }] });
+      out.textContent = `Sent ${hash}. Waiting for confirmation…`;
+      await record(id, hash, 'sent');
+      let receipt = null;
+      for (let i = 0; i < 120 && !receipt; i++) { await new Promise((r) => setTimeout(r, 2000)); receipt = await eth.request({ method: 'eth_getTransactionReceipt', params: [hash] }); }
+      if (!receipt) { out.textContent = `Sent ${hash}. Still unconfirmed; press Refresh status later.`; return; }
+      const ok = receipt.status === '0x1';
+      out.innerHTML = ok ? `<span style="color:var(--ok)">Confirmed</span> ${esc(hash)}` : `<span style="color:var(--bad)">Reverted</span> ${esc(hash)}`;
+      await record(id, hash, ok ? 'success' : 'reverted');
+      await load(); await checkWallet();
+    } catch (e) {
+      out.textContent = `Not sent: ${e.message || e}`;
+      button.disabled = false;
+    }
+  }
+
+  load().catch((e) => banner(`Could not load the prepared transactions (${esc(e.message || e)}).`, 'error'));
+})();
+</script>
+</body>
+</html>

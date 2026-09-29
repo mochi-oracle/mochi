@@ -26,7 +26,13 @@ export function resolveMochiTokenPolicy(input: TokenPolicyInput): MochiTokenPoli
     if (!ADDRESS_RE.test(tokenAddress) || ZERO_ADDRESS.test(tokenAddress)) throw new Error('--mochi-token must be a valid nonzero external token address');
     return { source: 'external', address: tokenAddress as `0x${string}` };
   }
-  if (tokenAddress) throw new Error('--mochi-token is accepted only for production mainnet; rehearsal and local modes deploy a test-only token');
+  if (tokenAddress) {
+    // A testnet dress rehearsal may stand in a separately deployed ERC20 for the team's token, so the exact
+    // external-token production path (runtime, enrollment, timelock batches) runs before mainnet.
+    if (!(mainnetMode && rehearsal)) throw new Error('--mochi-token is accepted only for production mainnet or a --mainnet --rehearsal on chainId 46630; local mode deploys a test-only token');
+    if (!ADDRESS_RE.test(tokenAddress) || ZERO_ADDRESS.test(tokenAddress)) throw new Error('--mochi-token must be a valid nonzero external token address');
+    return { source: 'external', address: tokenAddress as `0x${string}` };
+  }
   return { source: 'test-deployment' };
 }
 

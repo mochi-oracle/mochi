@@ -215,3 +215,32 @@ test("timelock block timestamp read failure returns unknown statuses", async () 
   expect(observations.map((x) => x.status)).toEqual(["read-failed", "read-failed"]);
   expect(observations[0]).toMatchObject({ chainId: 4663, blockTimestamp: null });
 });
+
+const releaseDeployment = (extra: Record<string, unknown> = {}) => ({
+  chainId: 4663, tokenSource: { kind: "external" }, owner: addr(2), guardian: addr(3),
+  contracts: { timelock: addr(20), jurorRegistry: addr(21), queryEscrow: addr(22), receiptAnchor: addr(23), panel: addr(24), mochiToken: addr(25), usdg: addr(1) },
+  ...extra,
+}) as unknown as ProductionDeployment;
+
+test("a bond below the 25,000 spec default needs an explicit reviewed approval and must match the deployment", () => {
+  expect(() => buildProductionRelease({ ...valid(), minimumJurorBondMochi: 1000 })).toThrow("bondBelowSpecApproved");
+  const approved = buildProductionRelease({ ...valid(), minimumJurorBondMochi: 1000, bondBelowSpecApproved: true });
+  expect(approved.warnings.some((w) => w.includes("below the 25000 spec default"))).toBe(true);
+  expect(approved.economics.minimumTotalJurorBondsMochi).toBe(9000);
+  expect(() => buildProductionRelease({ ...valid(), minimumJurorBondMochi: 0, bondBelowSpecApproved: true })).toThrow("positive whole number");
+  const withDeployment = { ...valid(), mochiToken: addr(25), minimumJurorBondMochi: 1000, bondBelowSpecApproved: true };
+  expect(() => buildProductionRelease(withDeployment, { deployment: releaseDeployment({ minJurorBond: (2000n * 10n ** 18n).toString() }) })).toThrow("deployment.minJurorBond does not match");
+  expect(buildProductionRelease(withDeployment, { deployment: releaseDeployment({ minJurorBond: (1000n * 10n ** 18n).toString() }) }).warnings.length).toBe(1);
+});
+
+test("chain 46630 is accepted only with an explicit rehearsal deployment, with its own delay and a visible label", () => {
+  const rehearsal = releaseDeployment({ chainId: 46630, rehearsal: true, timelockDelay: "120" });
+  const input = { ...valid(), chainId: 46630, mochiToken: addr(25), timelockDelaySeconds: 120 };
+  const plan = buildProductionRelease(input, { deployment: rehearsal });
+  expect(plan.network).toContain("REHEARSAL");
+  expect(plan.warnings.some((w) => w.includes("nothing in this plan applies to mainnet"))).toBe(true);
+  expect(() => buildProductionRelease({ ...input, timelockDelaySeconds: 86400 }, { deployment: rehearsal })).toThrow("must be 120");
+  expect(() => buildProductionRelease(input, { deployment: releaseDeployment({ chainId: 46630, timelockDelay: "120" }) })).toThrow("chainId must be Robinhood Chain mainnet 4663");
+  expect(() => buildProductionRelease({ ...valid(), mochiToken: addr(25) }, { deployment: rehearsal })).toThrow("deployment.chainId must be 4663");
+  expect(buildProductionRelease({ ...valid(), mochiToken: addr(25) }, { deployment: releaseDeployment() }).network).toBe("Robinhood Chain mainnet (4663)");
+});

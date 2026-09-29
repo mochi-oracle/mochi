@@ -9,6 +9,14 @@ describe('MOCHI external token deployment policy', () => {
     expect(() => resolveMochiTokenPolicy({ mainnetMode: true, rehearsal: false, tokenAddress: 'not-an-address' })).toThrow('valid nonzero');
   });
 
+  test('a testnet dress rehearsal may stand in an external token, only on chainId 46630', () => {
+    const token = '0x1234567890123456789012345678901234567890';
+    expect(resolveMochiTokenPolicy({ mainnetMode: true, rehearsal: true, chainId: 46630, tokenAddress: token })).toEqual({ source: 'external', address: token });
+    expect(() => resolveMochiTokenPolicy({ mainnetMode: true, rehearsal: true, chainId: 4663, tokenAddress: token })).toThrow('only on chainId 46630');
+    expect(() => resolveMochiTokenPolicy({ mainnetMode: true, rehearsal: true, chainId: 46630, tokenAddress: '0x0000000000000000000000000000000000000000' })).toThrow('valid nonzero');
+    expect(() => resolveMochiTokenPolicy({ mainnetMode: false, rehearsal: false, chainId: 31337, tokenAddress: token })).toThrow('only for production mainnet');
+  });
+
   test('local and testnet rehearsal modes select only the test deployment fallback', () => {
     expect(resolveMochiTokenPolicy({ mainnetMode: false, rehearsal: false, chainId: 31337 })).toEqual({ source: 'test-deployment' });
     expect(resolveMochiTokenPolicy({ mainnetMode: true, rehearsal: true, chainId: 46630 })).toEqual({ source: 'test-deployment' });

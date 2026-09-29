@@ -1,8 +1,9 @@
 import { readFileSync } from "node:fs";
 import { encodeAbiParameters, encodeFunctionData, keccak256, parseAbi, toHex, type Address, type Hex } from "viem";
 import { ROLE_IDS } from "@mochi/chain";
+import { productionTimelockDelay } from "../deploy/production/chain-policy.ts";
 
-export type Deployment = { contracts: { timelock?: Address; jurorRegistry: Address; queryEscrow: Address; receiptAnchor: Address; panel: Address }; privacy?: { entrypoint: Address } };
+export type Deployment = { chainId?: number; rehearsal?: boolean; timelockDelay?: string | number; contracts: { timelock?: Address; jurorRegistry: Address; queryEscrow: Address; receiptAnchor: Address; panel: Address }; privacy?: { entrypoint: Address } };
 type Identity = { address: Address; measurement: Hex; operator: Address };
 export type Input = {
   salt: Hex;
@@ -70,6 +71,8 @@ add(entrypoint, "grantRole", [keccak256(toHex("ASP_POSTMAN")), input.postman]);
 } else {
 add(escrow, "unpause", []);
 }
+// One day on mainnet; a testnet dress rehearsal schedules with the delay its timelock was deployed with.
+const delay = productionTimelockDelay(deployment);
 const predecessor = `0x${"00".repeat(32)}` as Hex;
 const operationId = keccak256(encodeAbiParameters(
   [{ type: "address[]" }, { type: "uint256[]" }, { type: "bytes[]" }, { type: "bytes32" }, { type: "bytes32" }],
@@ -77,10 +80,10 @@ const operationId = keccak256(encodeAbiParameters(
 ));
 const calldata = action === "schedule"
   ? encodeFunctionData({ abi: parseAbi(["function scheduleBatch(address[] targets,uint256[] values,bytes[] payloads,bytes32 predecessor,bytes32 salt,uint256 delay)"]),
-      functionName: "scheduleBatch", args: [targets, values, payloads, predecessor, input.salt, 86_400n] })
+      functionName: "scheduleBatch", args: [targets, values, payloads, predecessor, input.salt, BigInt(delay)] })
   : encodeFunctionData({ abi: parseAbi(["function executeBatch(address[] targets,uint256[] values,bytes[] payloads,bytes32 predecessor,bytes32 salt)"]),
       functionName: "executeBatch", args: [targets, values, payloads, predecessor, input.salt] });
-return { action, phase, to: timelock, calldata, operationId, callCount: targets.length, delaySeconds: action === "schedule" ? 86_400 : undefined, targets, payloads };
+return { action, phase, to: timelock, calldata, operationId, callCount: targets.length, delaySeconds: action === "schedule" ? delay : undefined, targets, payloads };
 }
 
 if (import.meta.main) {

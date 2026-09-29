@@ -8,6 +8,7 @@ import { phalaDcap } from "../services/juror/src/phala-dcap.ts";
 import { PRODUCTION_IDENTITY_SPECS, PRODUCTION_SERVICE_SPECS, PRODUCTION_RECEIPT_SIGNING_SPEC } from "../deploy/phala/production-identities/identities.ts";
 import { PRODUCTION_PORTS, type ProductionLaunchConfig } from "../deploy/production/runtime.ts";
 import { verifyProductionIdentityReport, type ProductionIdentitySummary } from "./verify-production-identities.ts";
+import { deploymentMinJurorBond, productionChainId, productionTimelockDelay } from "../deploy/production/chain-policy.ts";
 
 const ZERO32 = `0x${"00".repeat(32)}` as Hex;
 const CLASS_COUNTS = [2, 2, 2, 1, 2] as const;
@@ -215,15 +216,16 @@ export function prepareProductionLaunch(options: {
     postman: identityInput.postman,
   };
   const releaseInput = {
-    chainId: 4663,
+    chainId: deployment.chainId,
     rpcUrl: deployment.rpcUrl,
     mochiToken: deployment.contracts.mochiToken,
     usdg: deployment.contracts.usdg,
     roles,
-    timelockDelaySeconds: 86400,
+    timelockDelaySeconds: productionTimelockDelay(deployment),
     jurorCount: 9,
     jurorClassCounts: [...CLASS_COUNTS],
-    minimumJurorBondMochi: 25000,
+    minimumJurorBondMochi: Number(deploymentMinJurorBond(deployment) / 10n ** 18n),
+    bondBelowSpecApproved: deploymentMinJurorBond(deployment) < 25_000n * 10n ** 18n,
     initialFeedBudgetUsdg: null,
     deploymentFile: deploymentPath,
     identitiesFile: identitiesPath,
@@ -231,7 +233,7 @@ export function prepareProductionLaunch(options: {
   };
   const website = {
     enabled: false,
-    chainId: 4663,
+    chainId: deployment.chainId,
     contracts: {
       queryEscrow: deployment.contracts.queryEscrow,
       jurorRegistry: deployment.contracts.jurorRegistry,
@@ -248,7 +250,8 @@ export function prepareProductionLaunch(options: {
 }
 
 function validateDeployment(value: Deployment): Deployment {
-  if (!value || value.chainId !== 4663 || value.tokenSource?.kind !== "external") throw new Error("deployment must be chain 4663 with external MOCHI CA");
+  if (!value) throw new Error("deployment must be chain 4663 with external MOCHI CA");
+  productionChainId(value);
   const rpc = new URL(value.rpcUrl);
   if (rpc.protocol !== "https:" || rpc.username || rpc.password || rpc.search || rpc.hash) throw new Error("deployment rpcUrl must be a public HTTPS URL");
   requireAddress(value.owner, "deployment.owner");

@@ -21,6 +21,7 @@ const ConfigSchema = z.object({
   PHALA_ACI_ALLOWED_WORKLOADS: z.string().optional(),
   RUNNER: z.enum(["openai", "stub", "phala-aci"]).default("stub"),
   MODEL_TIMEOUT_MS: z.coerce.number().int().positive().default(120_000),
+  MODEL_MAX_ATTEMPTS: z.coerce.number().int().min(1).max(5).default(3),
   TEE_MODE: z.enum(["mock", "tdx", "dstack"]).default("mock"),
   TEE_KEYS: z.enum(["kms", "ephemeral"]).optional(),
   TEE_KEY_LABEL: z.string().min(1).max(64).default("default"),
