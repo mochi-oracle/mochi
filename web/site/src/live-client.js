@@ -34,7 +34,8 @@ export function validateConfig(config) {
 
 export class LiveClient {
   constructor(config, {fetcher=fetch, publicClient, verifier}={}) {
-    this.config=validateConfig(config); this.fetcher=fetcher;
+    // Called as a plain function: browsers throw "Illegal invocation" when window.fetch runs with this=LiveClient.
+    this.config=validateConfig(config); this.fetcher=(input,init)=>fetcher(input,init);
     const rpcUrl = new URL(config.rpcUrl, globalThis.location?.origin ?? 'http://localhost').href;
     this.chain=defineChain({id:config.chainId,name:`Mochi ${config.chainId===4663?'mainnet':'test network'}`,nativeCurrency:{name:'Ether',symbol:'ETH',decimals:18},rpcUrls:{default:{http:[rpcUrl]}}});
     this.public=publicClient ?? createPublicClient({chain:this.chain,transport:http(rpcUrl)});

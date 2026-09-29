@@ -77,3 +77,14 @@ test('renders protocol fixed-point values without floating point loss',()=>{
  expect(formatValue({t:'num',e8:'-1'})).toBe('-0.00000001');
  expect(formatValue({t:'num',e8:'900719925474099300000000'})).toBe('9007199254740993');
 });
+
+test('the default fetch is never invoked with the client as this (browsers throw Illegal invocation)',async()=>{
+ const original=globalThis.fetch;const seen:unknown[]=[];
+ globalThis.fetch=(function(this:unknown){seen.push(this);if(this!==undefined&&this!==globalThis)throw new TypeError("Failed to execute 'fetch' on 'Window': Illegal invocation");return Promise.resolve(Response.json({ok:true}));}) as any;
+ try{
+  const client=new LiveClient(config,{publicClient:{} as any,verifier:new MockQuoteVerifier({mockRootAddress:root.address})});
+  expect(await client.request('/api/v1/intake/attestation')).toEqual({ok:true});
+  expect(await (client as any).fetcher('/api/v1/verdict/x',{})).toBeInstanceOf(Response);
+  expect(seen.every(value=>value===undefined||value===globalThis)).toBe(true);
+ }finally{globalThis.fetch=original;}
+});
