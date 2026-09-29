@@ -222,8 +222,10 @@ function requiredSecret(env: NodeJS.ProcessEnv, name: string): string {
 /** Starts in standby until the reviewed CA-bound launch JSON exists and validates. */
 export async function startProductionRuntime(raw: unknown | undefined, deps: RuntimeDeps = {}): Promise<RuntimeState> {
   if (raw === undefined || raw === null || raw === "") return { status: "standby", reason: "reviewed CA launch config is absent", childhealth: {}, stop: async () => {} };
-  const rootDir = resolve(deps.rootDir ?? process.cwd());
   const artifactDir = resolve(deps.artifactDir ?? "/tmp/mochi-runtime");
+  // Children start in the runtime directory: with every capability dropped, root cannot enter the image's
+  // private home-directory working directory, and posix_spawn then fails with EACCES.
+  const rootDir = resolve(deps.rootDir ?? artifactDir);
   const config = validateLaunchConfig(typeof raw === "string" ? JSON.parse(raw) : raw);
   const env = deps.env ?? process.env;
   const log = deps.log ?? (() => {});
