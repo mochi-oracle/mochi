@@ -20,5 +20,5 @@ test("every emitted public record rejects every non-allowlisted field", () => {
 });
 
 test("production passes fixed validated timeouts explicitly to isolated children", () => {
-  expect(productionTiming()).toEqual({ ROUND_TIMEOUT_MS: "120000", JUROR_TIMEOUT_MS: "125000", MODEL_TIMEOUT_MS: "125000", MODEL_ATTEMPT_CAP_MS: "75000", MODEL_MAX_ATTEMPTS: "3", DELIVERY_RESERVE_MS: "10000", ROUND_CLOSE_MAX_WAIT_MS: "125000" });
+  expect(productionTiming()).toEqual({ ROUND_TIMEOUT_MS: "120000", JUROR_TIMEOUT_MS: "125000", MODEL_TIMEOUT_MS: "125000", MODEL_ATTEMPT_CAP_MS: "75000", MODEL_MAX_ATTEMPTS: "3", DELIVERY_RESERVE_MS: "10000", ROUND_CLOSE_MAX_WAIT_MS: "125000", POLL_MS: "1000", MAX_PARALLEL_QUERIES: "8" });
 });

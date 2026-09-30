@@ -52,7 +52,7 @@ function fixture(opts: { private?: boolean; feed?: boolean; n?: number; status?:
 
 describe("orchestrator lifecycle", () => {
   test("discovers, seals, dispatches, collects, retries close, posts and stores public verdict", async () => {
-    const f = fixture({ firstClose409: true }); await f.orchestrator.tick();
+    const f = fixture({ firstClose409: true }); await f.orchestrator.tick(); await f.orchestrator.waitForIdle();
     expect(f.state.stored).toBe(true); expect(f.calls.seal).toHaveLength(1); expect(f.calls.dispatch).toHaveLength(1);
     expect(f.calls.open).toHaveLength(1); expect(f.calls.answer).toHaveLength(3); expect(f.calls.post).toHaveLength(1);
     expect(f.state.closeCount).toBe(2); expect((f.calls.verdicts[0] as unknown[])[1]).toBeDefined();
@@ -68,7 +68,7 @@ describe("orchestrator lifecycle", () => {
     await f.orchestrator.advance(id); expect(f.calls.approve).toEqual([50n]); expect(f.calls.escalate).toEqual([id]);
   });
   test("private payer key is passed to consensus and only ciphertext is stored", async () => {
-    const f = fixture({ private: true }); await f.orchestrator.tick();
+    const f = fixture({ private: true }); await f.orchestrator.tick(); await f.orchestrator.waitForIdle();
     expect((f.calls.open[0] as { payerResultPubKey?: Hex }).payerResultPubKey).toBe(h);
     expect(f.calls.private).toHaveLength(1); expect((f.calls.verdicts[0] as unknown[])[1]).toBeUndefined();
   });
@@ -129,7 +129,7 @@ describe("orchestrator lifecycle", () => {
   test("recovers a verdict posted on-chain but not persisted (crash after post): persists and updates the feed", async () => {
     const f = fixture({ feed: true });
     f.state.failInsertOnce = true;
-    await f.orchestrator.tick().catch(() => {});
+    await f.orchestrator.tick().catch(() => {}); await f.orchestrator.waitForIdle();
     expect(f.calls.post).toHaveLength(1);
     expect(f.calls.verdicts).toHaveLength(0);
     expect(f.calls.feed).toHaveLength(0);
@@ -149,7 +149,7 @@ describe("orchestrator lifecycle", () => {
 });
 
 test("all seats receive the same consensus absolute deadline and round", async () => {
-  const f = fixture(); await f.orchestrator.tick();
+  const f = fixture(); await f.orchestrator.tick(); await f.orchestrator.waitForIdle();
   expect(f.calls.answer).toHaveLength(3);
   for (const req of f.calls.answer) expect(req).toMatchObject({ deadlineMs: 130000, round: 0 });
 });

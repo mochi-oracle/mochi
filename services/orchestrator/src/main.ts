@@ -21,10 +21,23 @@ const orchestrator = new Orchestrator({
 });
 const { app } = createOrchestratorApp({ orchestrator, store });
 const port = Number(process.env.PORT ?? 8084);
-Bun.serve({ hostname: process.env.HOST ?? "127.0.0.1", port, fetch: (request) => new URL(request.url).pathname === "/health" && request.method === "GET" ? Response.json({ ok: true }) : app.fetch(request) });
+const server = Bun.serve({ hostname: process.env.HOST ?? "127.0.0.1", port, fetch: (request) => new URL(request.url).pathname === "/health" && request.method === "GET" ? Response.json({ ok: true }) : app.fetch(request) });
 log("info", "orchestrator.started", { port });
-for (;;) {
+let stopping = false;
+let wakePoll: (() => void) | undefined;
+const stop = () => { stopping = true; wakePoll?.(); };
+process.on("SIGTERM", stop);
+process.on("SIGINT", stop);
+while (!stopping) {
   try { await orchestrator.tick(); }
   catch { log("error", "orchestrator.tick_failed"); }
-  await new Promise(resolve => setTimeout(resolve, config.POLL_MS));
+  if (!stopping) await new Promise<void>(resolve => {
+    const timer = setTimeout(() => { wakePoll = undefined; resolve(); }, config.POLL_MS);
+    wakePoll = () => { clearTimeout(timer); wakePoll = undefined; resolve(); };
+  });
 }
+const drained = await orchestrator.shutdown();
+if (!drained) log("warn", "orchestrator.shutdown_timeout");
+await server.stop(true);
+await connection.close();
+process.exit(drained ? 0 : 1);

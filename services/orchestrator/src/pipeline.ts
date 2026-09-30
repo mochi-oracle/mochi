@@ -14,10 +14,13 @@ export class Orchestrator {
   private cursor: bigint;
   private readonly locks = new Set<Hex>();
   private lastBlock = 0n;
+  private readonly inFlight = new Map<Hex, Promise<void>>();
+  private stopping = false;
   constructor(private readonly deps: OrchestratorDeps) { this.cursor = BigInt(deps.chain.dep.startBlock); }
   get lastBlockProcessed() { return this.lastBlock.toString(); }
 
   async tick(): Promise<void> {
+    if (this.stopping) return;
     const { chain, store } = this.deps;
     this.cursor = (await store.getCursor("orchestrator")) ?? this.cursor;
     if (this.cursor > 0n) this.lastBlock = this.cursor - 1n;
@@ -29,11 +32,30 @@ export class Orchestrator {
       await store.setCursor("orchestrator", this.cursor);
     }
     const ids = await store.queryIds();
-    let index = 0;
-    const workers = Array.from({ length: Math.min(this.deps.config.maxParallelQueries, ids.length) }, async () => {
-      while (index < ids.length) { const id = ids[index++]!; await this.advance(id).catch((error: unknown) => log("error", "orchestrator.advance_failed", { queryId: id, error: String((error as Error)?.message ?? error).slice(0, 300) })); }
-    });
-    await Promise.all(workers);
+    for (const id of ids) {
+      if (this.stopping || this.inFlight.size >= this.deps.config.maxParallelQueries) break;
+      if (this.inFlight.has(id) || this.locks.has(id)) continue;
+      const work = this.advance(id)
+        .catch((error: unknown) => log("error", "orchestrator.advance_failed", { queryId: id, error: String((error as Error)?.message ?? error).slice(0, 300) }))
+        .finally(() => { this.inFlight.delete(id); });
+      this.inFlight.set(id, work);
+    }
+  }
+
+  /** Drain the current work without extending the caller's shutdown grace period. */
+  async waitForIdle(timeoutMs = 4000): Promise<boolean> {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      return await Promise.race([
+        Promise.all(this.inFlight.values()).then(() => true),
+        new Promise<boolean>(resolve => { timer = setTimeout(() => resolve(false), timeoutMs); }),
+      ]);
+    } finally { clearTimeout(timer); }
+  }
+
+  async shutdown(timeoutMs = 4000): Promise<boolean> {
+    this.stopping = true;
+    return this.waitForIdle(timeoutMs);
   }
 
   private async discover(log: QueryLog) {

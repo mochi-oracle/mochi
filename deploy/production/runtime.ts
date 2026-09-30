@@ -373,7 +373,7 @@ export async function startProductionRuntime(raw: unknown | undefined, deps: Run
     if (config.mode === "enroll" || config.mode === "active") launch("attestor", "attestor", 3202, { ...base(3202), MOCHI_DEPLOYMENT: deployPath, ATTESTOR_KEY: serviceKeys.ATTESTOR_KEY, ADMIN_TOKEN: adminToken!, PORT: "3202", QUOTE_VERIFIER: "dcap" });
     if (config.mode === "active") {
       launch("indexer", "indexer", 3201, { ...base(3201), MOCHI_DEPLOYMENT: deployPath, ANCHORER_KEY: serviceKeys.ANCHORER_KEY, RECEIPT_SIGNING_KEY: receiptSigningKey, PORT: "3201" });
-      launch("orchestrator", "orchestrator", 3203, { ...base(3203), MOCHI_DEPLOYMENT: deployPath, ORCHESTRATOR_KEY: serviceKeys.ORCHESTRATOR_KEY, FEED_RUNNER_KEY: serviceKeys.FEED_RUNNER_KEY, INTAKE_URL: url("intake"), CONSENSUS_URL: url("consensus"), ...timing, PORT: "3203", MAX_PARALLEL_QUERIES: "1" });
+      launch("orchestrator", "orchestrator", 3203, { ...base(3203), MOCHI_DEPLOYMENT: deployPath, ORCHESTRATOR_KEY: serviceKeys.ORCHESTRATOR_KEY, FEED_RUNNER_KEY: serviceKeys.FEED_RUNNER_KEY, INTAKE_URL: url("intake"), CONSENSUS_URL: url("consensus"), ...timing, PORT: "3203" });
       launch("postman", "postman", 0, { RPC_URL: config.rpcUrl, ASP_POSTMAN_KEY: serviceKeys.POSTMAN_KEY, MOCHI_DEPLOYMENT: deployPath }, ["--rpc", config.rpcUrl, "--deployment", deployPath], false);
     }
     const refreshHealth = async () => {
