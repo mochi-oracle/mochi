@@ -16,6 +16,7 @@ export class Orchestrator {
   private lastBlock = 0n;
   private readonly inFlight = new Map<Hex, Promise<void>>();
   private stopping = false;
+  private lastStarted: Hex | undefined;
   constructor(private readonly deps: OrchestratorDeps) { this.cursor = BigInt(deps.chain.dep.startBlock); }
   get lastBlockProcessed() { return this.lastBlock.toString(); }
 
@@ -32,13 +33,17 @@ export class Orchestrator {
       await store.setCursor("orchestrator", this.cursor);
     }
     const ids = await store.queryIds();
-    for (const id of ids) {
+    // Rotate admission: repeatedly failing or idle HUNG queries must not starve later ids.
+    const start = this.lastStarted === undefined ? 0 : (ids.indexOf(this.lastStarted) + 1) % Math.max(1, ids.length);
+    for (let offset = 0; offset < ids.length; offset++) {
+      const id = ids[(start + offset) % ids.length]!;
       if (this.stopping || this.inFlight.size >= this.deps.config.maxParallelQueries) break;
       if (this.inFlight.has(id) || this.locks.has(id)) continue;
       const work = this.advance(id)
         .catch((error: unknown) => log("error", "orchestrator.advance_failed", { queryId: id, error: String((error as Error)?.message ?? error).slice(0, 300) }))
         .finally(() => { this.inFlight.delete(id); });
       this.inFlight.set(id, work);
+      this.lastStarted = id;
     }
   }
 

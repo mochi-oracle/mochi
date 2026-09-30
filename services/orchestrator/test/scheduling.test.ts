@@ -64,17 +64,17 @@ test("at most N advances run, duplicate ids and repeated ticks do not start conc
   f.pending.get(ids[3]!)!.resolve(); await f.orchestrator.waitForIdle();
 });
 
-test("failed advances release slots and locks so they can be retried", async () => {
+test("failed advances release slots and locks, and admission rotates past persistent failures", async () => {
   const f = fixture(1); f.open(ids.slice(0, 2), 0);
   await f.orchestrator.tick();
   f.pending.get(ids[0]!)!.reject(new Error("test chain failure"));
   expect(await f.orchestrator.waitForIdle()).toBe(true);
   await f.orchestrator.tick();
-  expect(f.starts.map(s => s.id)).toEqual([ids[0]!, ids[0]!]);
-  f.pending.get(ids[0]!)!.resolve(); await f.orchestrator.waitForIdle();
-  await f.orchestrator.tick();
-  expect(f.starts.at(-1)!.id).toBe(ids[1]!);
+  expect(f.starts.map(s => s.id)).toEqual(ids.slice(0, 2));
   f.pending.get(ids[1]!)!.resolve(); await f.orchestrator.waitForIdle();
+  await f.orchestrator.tick();
+  expect(f.starts.map(s => s.id)).toEqual([ids[0]!, ids[1]!, ids[0]!]);
+  f.pending.get(ids[0]!)!.resolve(); await f.orchestrator.waitForIdle();
 });
 
 test("shutdown drains in-flight work and prevents new starts", async () => {
