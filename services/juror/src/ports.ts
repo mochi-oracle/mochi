@@ -18,7 +18,7 @@ export interface JurorChainPort {
 }
 
 export interface HttpPoster {
-  post(url: string, body: SubmitAnswerReq, timeoutMs: number): Promise<void>;
+  post(url: string, body: SubmitAnswerReq, timeoutMs: number, signal?: AbortSignal): Promise<void>;
 }
 
 export interface Clock {
@@ -31,6 +31,9 @@ export interface JurorDeps {
   jurorClass: number;
   passport: Omit<Passport, "v" | "juror" | "jurorClass" | "tee" | "weightsSha256"> & { weightsSha256: Hex };
   maxTokens?: number;
+  deliveryReserveMs?: number;
+  answerTimeoutMs?: number;
+  telemetry?: (event: import("@mochi/protocol").TimingEvent) => void;
   runner: import("./runner.ts").ModelRunner;
   chain: JurorChainPort;
   store: SealedStore;

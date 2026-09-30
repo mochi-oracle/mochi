@@ -12,7 +12,7 @@ const config = loadConfig();
 const connection = createDb(config.DATABASE_URL);
 const chain = createChainAdapter(config.deployment, config.ORCHESTRATOR_KEY as `0x${string}`, config.FEED_RUNNER_KEY as `0x${string}`);
 const store = createDbAdapter(connection.db);
-const clients = createHttpClients(config.JUROR_TIMEOUT_MS);
+const clients = createHttpClients(60_000, config.JUROR_TIMEOUT_MS);
 const orchestrator = new Orchestrator({
   chain, ...(config.deployment.randomness?.kind === "drand" ? { drand: new DrandClient({ relays: config.drandRelays ?? config.deployment.randomness.relays, chainHash: config.deployment.randomness.chainHash, info: { ...DRAND_QUICKNET, ...config.deployment.randomness }, currentTime: () => chain.latestTimestamp().then(Number) }) } : {}), ...clients,
   directory: { async urlOf(address) { return (await getEndpoint(connection.db, address.toLowerCase()))?.url; } },

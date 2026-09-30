@@ -62,7 +62,7 @@ function makeReq(overrides: Partial<AnswerReq> = {}, plainOverrides: Record<stri
     seat: 0,
     docEnvelope,
     consensus,
-    consensusUrl: "http://consensus.test",
+    consensusUrl: "http://consensus.test", round: 0, deadlineMs: Date.now() + 120_000,
     ...overrides,
   };
 }
@@ -380,4 +380,19 @@ test("rejects a consensus quote whose measurement differs from the on-chain regi
   f.chain.getJuror = async () => ({ measurement: `0x${"cc".repeat(32)}` });
   await expect(f.enclave.answer(await validReq())).rejects.toMatchObject({ code: "BAD_CONSENSUS_QUOTE" });
   expect(await f.store.has(`answer:${queryId}`)).toBe(false);
+});
+
+test("answer schema requires a validated absolute deadline and round", async () => {
+  const { AnswerReqSchema } = await import("@mochi/protocol");
+  const req = await validReq();
+  for (const deadlineMs of [undefined, 0, -1, 1.5, Infinity, Number.MAX_SAFE_INTEGER + 1, "120000"]) {
+    expect(AnswerReqSchema.safeParse({ ...req, deadlineMs }).success).toBe(false);
+  }
+  expect(AnswerReqSchema.safeParse(req).success).toBe(true);
+});
+
+test("expired shared deadline prevents model work and delivery", async () => {
+  const f = fixture(); const req = await validReq({ deadlineMs: Date.now() - 1 });
+  await expect(f.enclave.answer(req)).rejects.toThrow();
+  expect(f.state.runnerCalls).toBe(0); expect(f.state.sends).toHaveLength(0);
 });

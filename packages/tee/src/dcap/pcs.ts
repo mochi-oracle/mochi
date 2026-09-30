@@ -3,6 +3,7 @@ import { parseCrl } from "./crl.ts";
 
 type PcsOptions = {
   baseUrl?: string;
+  signal?: AbortSignal;
   rootCaCrlUrl?: string;
   fetch?: typeof globalThis.fetch;
   now?: () => number;
@@ -14,7 +15,9 @@ export class PcsCollateralSource implements CollateralSource {
 
   constructor(private readonly options: PcsOptions = {}) {}
 
-  async get(fmspc: string, ca: "platform" | "processor"): Promise<TdxCollateral> {
+  async get(fmspc: string, ca: "platform" | "processor", signal?: AbortSignal): Promise<TdxCollateral> {
+    const requestSignal = signal ?? this.options.signal ?? AbortSignal.timeout(30_000);
+    requestSignal.throwIfAborted();
     const normalizedFmspc = fmspc.toUpperCase();
     const key = `${normalizedFmspc}:${ca}`;
     const now = this.options.now?.() ?? Date.now() / 1000;
@@ -24,7 +27,7 @@ export class PcsCollateralSource implements CollateralSource {
     const fetcher = this.options.fetch ?? globalThis.fetch;
     const baseUrl = (this.options.baseUrl ?? "https://api.trustedservices.intel.com").replace(/\/$/, "");
     const request = async (url: string): Promise<Response> => {
-      const response = await fetcher(url);
+      const response = await fetcher(url, { signal: requestSignal });
       if (!response.ok) throw new Error(`PCS HTTP ${response.status}`);
       return response;
     };

@@ -6,6 +6,8 @@ import { createJurorChain } from "./adapters/chain.ts";
 import { FetchHttpPoster } from "./adapters/http.ts";
 import { JurorEnclave } from "./juror.ts";
 import { OpenAICompatibleRunner, PhalaAciRunner, StubRunner } from "./runner.ts";
+import { emitTimingEvent } from "@mochi/protocol";
+import { warmupModel } from "./warmup.ts";
 import { AciClient } from "@mochi/aci";
 import { quoteVerifierFromEnv, teeProviderFromEnv, FileSealedStore } from "@mochi/tee";
 import { phalaDcap } from "./phala-dcap.ts";
@@ -24,17 +26,18 @@ export async function startJurorServer(env: Record<string, string | undefined>):
     mockRoot: root,
   }, { role: "juror" });
   if (tee.kind === "tdx") console.info({ tee: "tdx", address: tee.signer().address, measurement: tee.measurement() });
+  const aci = config.MODEL_PROVIDER === "phala-aci" ? new AciClient({
+    baseUrl: config.PHALA_ACI_BASE_URL, apiKey: config.PHALA_AI_API_KEY!, dcap: phalaDcap,
+    allowedWorkloads: config.PHALA_ACI_ALLOWED_WORKLOADS?.split(",").map(value => value.trim()).filter(Boolean),
+  }) : undefined;
+  const warmupController = new AbortController();
   const runner = config.MODEL_PROVIDER === "phala-aci"
     ? new PhalaAciRunner({
-        client: new AciClient({
-          baseUrl: config.PHALA_ACI_BASE_URL,
-          apiKey: config.PHALA_AI_API_KEY!,
-          dcap: phalaDcap,
-          allowedWorkloads: config.PHALA_ACI_ALLOWED_WORKLOADS?.split(",").map((value) => value.trim()).filter(Boolean),
-        }),
+        client: aci!,
         model: config.PHALA_ACI_MODEL!,
         timeoutMs: config.MODEL_TIMEOUT_MS,
         maxAttempts: config.MODEL_MAX_ATTEMPTS,
+        attemptCapMs: config.MODEL_ATTEMPT_CAP_MS,
       })
     : config.RUNNER === "openai"
     ? new OpenAICompatibleRunner({
@@ -63,6 +66,9 @@ export async function startJurorServer(env: Record<string, string | undefined>):
       zdr: config.ZDR,
     },
     maxTokens: config.MAX_TOKENS,
+    deliveryReserveMs: config.DELIVERY_RESERVE_MS,
+    answerTimeoutMs: config.MODEL_TIMEOUT_MS,
+    telemetry: emitTimingEvent,
     runner,
     chain: createJurorChain(config.MOCHI_DEPLOYMENT),
     store: new FileSealedStore(config.SEALED_STORE_DIR, tee),
@@ -76,6 +82,7 @@ export async function startJurorServer(env: Record<string, string | undefined>):
   const { app } = createJurorApp(juror, config.JUROR_OPERATOR ? () => enrollmentProof(
     tee, deployment.chainId, deployment.contracts.jurorRegistry, config.JUROR_OPERATOR as `0x${string}`, config.JUROR_CLASS,
   ) : undefined);
-  const server = Bun.serve({ hostname: env.HOST ?? "127.0.0.1", port: config.PORT, fetch: (request) => new URL(request.url).pathname === "/health" && request.method === "GET" ? Response.json({ ok: true }) : app.fetch(request) });
-  return { port: config.PORT, stop: () => server.stop(true) };
+  if (aci) await warmupModel(aci, config.PHALA_ACI_MODEL!, warmupController.signal, emitTimingEvent);
+  const server = Bun.serve({ idleTimeout: 130, hostname: env.HOST ?? "127.0.0.1", port: config.PORT, fetch: (request) => new URL(request.url).pathname === "/health" && request.method === "GET" ? Response.json({ ok: true }) : app.fetch(request) });
+  return { port: config.PORT, stop: () => { warmupController.abort(); server.stop(true); } };
 }

@@ -10,7 +10,7 @@ export interface ProviderRetryOptions {
   maxAttempts: number;
   /** Budget for the whole call including backoff waits. */
   totalMs: number;
-  /** Upper bound for a single attempt while more attempts remain. */
+  /** Upper bound for every attempt, including the final one. */
   attemptCapMs: number;
   /** Never start an attempt with less time than this left. */
   minAttemptMs?: number;
@@ -18,6 +18,7 @@ export interface ProviderRetryOptions {
   now?: () => number;
   sleep?: (ms: number, signal?: AbortSignal) => Promise<void>;
   random?: () => number;
+  onAttempt?: (event: { attempt: number; elapsedMs: number; remainingBudgetMs: number; code: string; httpStatus?: number }) => void;
   classify?: (error: unknown, attemptTimedOut: boolean) => ProviderRetryClass;
 }
 
@@ -82,18 +83,23 @@ export async function withProviderRetries<T>(
     if (parent?.aborted) throw new ProviderCallAborted(failures, index);
     const remaining = options.totalMs - (now() - start);
     const last = index === maxAttempts - 1;
-    const budget = last ? remaining : Math.min(remaining, options.attemptCapMs);
+    if (remaining <= 0) throw new ProviderCallAborted(failures, index);
+    const budget = Math.min(remaining, options.attemptCapMs);
+    const attemptStart = now();
     const controller = new AbortController();
     const onParentAbort = () => controller.abort();
     parent?.addEventListener("abort", onParentAbort, { once: true });
     let timedOut = false;
     const timer = setTimeout(() => { timedOut = true; controller.abort(); }, Math.max(1, budget));
     try {
-      const value = await attempt(controller.signal, index);
+      const value = await abortableProviderCall(attempt(controller.signal, index), controller.signal);
+      controller.signal.throwIfAborted();
+      options.onAttempt?.({ attempt: index + 1, elapsedMs: Math.max(0, now() - attemptStart), remainingBudgetMs: Math.max(0, options.totalMs - (now() - start)), code: "ok" });
       return { value, attempts: index + 1, failures };
     } catch (error) {
+      const verdict = parent?.aborted ? { retry: false, code: "timeout" } : classify(error, timedOut);
+      options.onAttempt?.({ attempt: index + 1, elapsedMs: Math.max(0, now() - attemptStart), remainingBudgetMs: Math.max(0, options.totalMs - (now() - start)), code: verdict.code, ...(verdict.httpStatus === undefined ? {} : { httpStatus: verdict.httpStatus }) });
       if (parent?.aborted) throw new ProviderCallAborted(failures, index + 1);
-      const verdict = classify(error, timedOut);
       failures.push({ code: verdict.code, ...(verdict.httpStatus === undefined ? {} : { httpStatus: verdict.httpStatus }) });
       if (!verdict.retry || last) throw new ProviderRetryError(error, failures, timedOut);
       const left = options.totalMs - (now() - start);
@@ -105,4 +111,13 @@ export async function withProviderRetries<T>(
       parent?.removeEventListener("abort", onParentAbort);
     }
   }
+}
+
+/** Bound waiting even if an adapter fails to cooperate; native fetch still receives cancellation. */
+export async function abortableProviderCall<T>(work: Promise<T>, signal: AbortSignal): Promise<T> {
+  if (signal.aborted) { void work.catch(() => {}); signal.throwIfAborted(); }
+  let onAbort!: () => void;
+  try {
+    return await Promise.race([work, new Promise<never>((_, reject) => { onAbort = () => reject(new ProviderCallAborted()); signal.addEventListener("abort", onAbort, { once: true }); })]);
+  } finally { signal.removeEventListener("abort", onAbort); }
 }

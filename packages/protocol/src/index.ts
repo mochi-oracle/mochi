@@ -170,6 +170,8 @@ export const AnswerReqSchema = z.object({
   docEnvelope: EnvelopeSchema,
   consensus: PeerSchema,
   consensusUrl: z.string().url(),
+  round: z.number().int().nonnegative(),
+  deadlineMs: z.number().int().positive().max(Number.MAX_SAFE_INTEGER),
 });
 export const AnswerResSchema = z.object({ seat: z.number().int(), vote: JurorVoteJsonSchema, delivered: z.boolean() });
 export type AnswerReq = z.infer<typeof AnswerReqSchema>;
@@ -356,3 +358,23 @@ export interface EndpointDirectory {
 }
 
 export const ApiErrorSchema = z.object({ error: z.object({ code: z.string(), message: z.string() }) });
+
+/** The only child event permitted on production public stdout. Strict validation at both ends. */
+export const TimingEventSchema = z.object({
+  queryId: hex32.optional(),
+  round: z.number().int().nonnegative().optional(),
+  seat: z.number().int().min(0).max(8).optional(),
+  modelId: z.string().regex(/^[a-zA-Z0-9_./:-]{1,200}$/).optional(),
+  call: z.enum(["initial", "repair"]).optional(),
+  attempt: z.number().int().min(1).max(5).optional(),
+  elapsedMs: z.number().int().nonnegative(),
+  remainingBudgetMs: z.number().int().nonnegative(),
+  causeCode: z.enum(["ok", "timeout", "network", "provider_error", "inference_http", "attestation_http", "verification_failed", "runner_failed", "repair_skipped", "repair_failed", "delivery_failed", "round_closed", "warmup_ok", "warmup_failed"]),
+  httpStatus: z.number().int().min(100).max(599).optional(),
+  delivered: z.boolean().optional(),
+  late: z.boolean().optional(),
+}).strict();
+export type TimingEvent = z.infer<typeof TimingEventSchema>;
+export function emitTimingEvent(event: TimingEvent): void {
+  console.log(JSON.stringify(TimingEventSchema.parse(event)));
+}

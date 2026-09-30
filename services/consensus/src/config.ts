@@ -4,7 +4,7 @@ const schema = z.object({
   PORT: z.coerce.number().int().min(1).max(65535).default(3203),
   HOST: z.string().default("127.0.0.1"),
   MOCHI_DEPLOYMENT: z.string().default("deployments/local.json"),
-  ROUND_TIMEOUT_MS: z.coerce.number().int().positive().default(60_000),
+  ROUND_TIMEOUT_MS: z.coerce.number().int().positive().max(120_000).default(120_000),
   TEE_MODE: z.enum(["mock", "tdx", "dstack"]).default("mock"),
   TEE_KEYS: z.enum(["kms", "ephemeral"]).optional(),
   TEE_KEY_LABEL: z.string().min(1).max(64).default("default"),

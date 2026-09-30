@@ -1,3 +1,4 @@
+import { forwardTimingEvents, productionTiming } from "./timing.ts";
 import { readFile, readdir } from "node:fs/promises";
 import { spawn, type ChildProcess } from "node:child_process";
 import { join, resolve } from "node:path";
@@ -249,6 +250,7 @@ export async function startProductionRuntime(raw: unknown | undefined, deps: Run
   const rootDir = resolve(deps.rootDir ?? artifactDir);
   const config = validateLaunchConfig(typeof raw === "string" ? JSON.parse(raw) : raw);
   const env = deps.env ?? process.env;
+  const timing = productionTiming();
   const log = deps.log ?? (() => {});
   const children: ChildProcess[] = [];
   const entry = (service: string) => join(artifactDir, "services", `${service}.mjs`);
@@ -337,7 +339,8 @@ export async function startProductionRuntime(raw: unknown | undefined, deps: Run
     const launch = (id: string, service: string, port: number, childEnv: Record<string, string>, args: string[] = [], httpHealth = true) => {
       childhealth[id] = "starting";
       if (httpHealth) healthPorts[id] = port;
-      const child = childSpawn(process.execPath, [entry(service), ...args], { cwd: rootDir, env: { PATH: env.PATH ?? "/usr/bin:/bin", ...childEnv }, stdio: "ignore" });
+      const child = childSpawn(process.execPath, [entry(service), ...args], { cwd: rootDir, env: { PATH: env.PATH ?? "/usr/bin:/bin", ...childEnv }, stdio: ["ignore", "pipe", "ignore"] });
+      forwardTimingEvents(child.stdout);
       watchers.push(watchChildLifecycle(child, id, childhealth, { httpHealth, onFatal: (service) => { exited.add(service); if (!stopping) deps.onFatal?.(service); }, log }));
       child.on("exit", () => { exited.add(id); });
       child.on("error", () => { exited.add(id); });
@@ -345,7 +348,7 @@ export async function startProductionRuntime(raw: unknown | undefined, deps: Run
       log(`${id} started on loopback port ${port}`);
     };
     launch("intake", "intake", 3001, { ...base(3001), PORT: "3001", FETCH_ORIGINS: JSON.stringify(config.fetchOrigins ?? []), SEALED_STORE_DIR: "/data/mochi/sealed/intake", TEE_KEY_LABEL: "production-intake", ...dstackBase });
-    launch("consensus", "consensus", 3002, { ...base(3002), PORT: "3002", SEALED_STORE_DIR: "/data/mochi/sealed/consensus", TEE_KEY_LABEL: "production-consensus", ...dstackBase });
+    launch("consensus", "consensus", 3002, { ...base(3002), ...timing, PORT: "3002", SEALED_STORE_DIR: "/data/mochi/sealed/consensus", TEE_KEY_LABEL: "production-consensus", ...dstackBase });
     const classes = config.identities.jurors.map((j) => j.class!);
     const seats = [0, 0, 0, 0, 0];
     // All nine seats share one process (one operator, one small VM); each keeps its own enclave key label, port,
@@ -356,7 +359,8 @@ export async function startProductionRuntime(raw: unknown | undefined, deps: Run
       return { PORT: String(PRODUCTION_PORTS.jurors[i]), JUROR_OPERATOR: j.operator, JUROR_CLASS: String(cls), MODEL_ID: p.modelId, MODEL_LINEAGE: p.lineage, MODEL_WEIGHTS_SHA256: p.weightsSha256, PHALA_ACI_MODEL: p.aciModel, PHALA_ACI_ALLOWED_WORKLOADS: p.workload, MAX_TOKENS: String(p.maxTokens ?? 4096), SEALED_STORE_DIR: `/data/mochi/sealed/juror-${i}`, TEE_KEY_LABEL: `production-juror-class-${cls}-seat-${seat}` };
     });
     const { PORT: _poolPort, ...poolBase } = base(PRODUCTION_PORTS.jurors[0]!);
-    const pool = childSpawn(process.execPath, [entry("juror-pool")], { cwd: rootDir, env: { PATH: env.PATH ?? "/usr/bin:/bin", ...poolBase, MODEL_OPEN_WEIGHTS: "false", MODEL_PROVIDER: "phala-aci", ZDR: "false", RUNNER: "phala-aci", PHALA_AI_API_KEY: aciKey, ...dstackBase, JUROR_SEATS_JSON: JSON.stringify(seatEnvs) }, stdio: "ignore" });
+    const pool = childSpawn(process.execPath, [entry("juror-pool")], { cwd: rootDir, env: { PATH: env.PATH ?? "/usr/bin:/bin", ...poolBase, ...timing, MODEL_OPEN_WEIGHTS: "false", MODEL_PROVIDER: "phala-aci", ZDR: "false", RUNNER: "phala-aci", PHALA_AI_API_KEY: aciKey, ...dstackBase, JUROR_SEATS_JSON: JSON.stringify(seatEnvs) }, stdio: ["ignore", "pipe", "ignore"] });
+    forwardTimingEvents(pool.stdout);
     childhealth["juror-pool"] = "starting";
     seatEnvs.forEach((_, i) => { childhealth[`juror-${i}`] = "starting"; healthPorts[`juror-${i}`] = PRODUCTION_PORTS.jurors[i]!; });
     watchers.push(watchChildLifecycle(pool, "juror-pool", childhealth, { httpHealth: false, onFatal: (service) => { exited.add(service); if (!stopping) deps.onFatal?.(service); }, log }));
@@ -369,7 +373,7 @@ export async function startProductionRuntime(raw: unknown | undefined, deps: Run
     if (config.mode === "enroll" || config.mode === "active") launch("attestor", "attestor", 3202, { ...base(3202), MOCHI_DEPLOYMENT: deployPath, ATTESTOR_KEY: serviceKeys.ATTESTOR_KEY, ADMIN_TOKEN: adminToken!, PORT: "3202", QUOTE_VERIFIER: "dcap" });
     if (config.mode === "active") {
       launch("indexer", "indexer", 3201, { ...base(3201), MOCHI_DEPLOYMENT: deployPath, ANCHORER_KEY: serviceKeys.ANCHORER_KEY, RECEIPT_SIGNING_KEY: receiptSigningKey, PORT: "3201" });
-      launch("orchestrator", "orchestrator", 3203, { ...base(3203), MOCHI_DEPLOYMENT: deployPath, ORCHESTRATOR_KEY: serviceKeys.ORCHESTRATOR_KEY, FEED_RUNNER_KEY: serviceKeys.FEED_RUNNER_KEY, INTAKE_URL: url("intake"), CONSENSUS_URL: url("consensus"), PORT: "3203", MAX_PARALLEL_QUERIES: "1" });
+      launch("orchestrator", "orchestrator", 3203, { ...base(3203), MOCHI_DEPLOYMENT: deployPath, ORCHESTRATOR_KEY: serviceKeys.ORCHESTRATOR_KEY, FEED_RUNNER_KEY: serviceKeys.FEED_RUNNER_KEY, INTAKE_URL: url("intake"), CONSENSUS_URL: url("consensus"), ...timing, PORT: "3203", MAX_PARALLEL_QUERIES: "1" });
       launch("postman", "postman", 0, { RPC_URL: config.rpcUrl, ASP_POSTMAN_KEY: serviceKeys.POSTMAN_KEY, MOCHI_DEPLOYMENT: deployPath }, ["--rpc", config.rpcUrl, "--deployment", deployPath], false);
     }
     const refreshHealth = async () => {

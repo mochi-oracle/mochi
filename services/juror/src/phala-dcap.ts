@@ -2,7 +2,7 @@
 // Used by the juror (MODEL_PROVIDER=phala-aci) and by scripts/aci-live-check.ts.
 import { PcsCollateralSource, parseTdxQuote, pemChain, verifyTdxQuote } from "@mochi/tee";
 
-export const phalaDcap = async (raw: Uint8Array) => {
+export const phalaDcap = async (raw: Uint8Array, signal?: AbortSignal) => {
   const now = Math.floor(Date.now() / 1000);
   const parsed = parseTdxQuote(raw);
   const chain = pemChain(parsed.pckPem);
@@ -11,7 +11,7 @@ export const phalaDcap = async (raw: Uint8Array) => {
   const ca = intermediate.subjectCN === "Intel SGX PCK Platform CA" ? "platform"
     : intermediate.subjectCN === "Intel SGX PCK Processor CA" ? "processor" : undefined;
   if (!ca) return { ok: false, status: "Invalid", reportData: new Uint8Array() };
-  const collateral = await new PcsCollateralSource({ baseUrl: process.env.PCS_BASE_URL, rootCaCrlUrl: process.env.PCS_ROOT_CA_CRL_URL }).get(
+  const collateral = await new PcsCollateralSource({ signal, baseUrl: process.env.PCS_BASE_URL, rootCaCrlUrl: process.env.PCS_ROOT_CA_CRL_URL }).get(
     Array.from(leaf.sgx.fmspc, (b) => b.toString(16).padStart(2, "0")).join("").toUpperCase(), ca,
   );
   const verified = verifyTdxQuote(raw, collateral, now);

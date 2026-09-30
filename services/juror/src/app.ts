@@ -18,7 +18,7 @@ export function createJurorApp(juror: JurorEnclave, enrollment?: () => Promise<u
     const parsed = AnswerReqSchema.safeParse(body);
     if (!parsed.success) return c.json({ error: { code: "INVALID_REQUEST", message: "request body is invalid" } }, 400);
     try {
-      return c.json(await juror.answer(parsed.data));
+      return c.json(await juror.answer(parsed.data, c.req.raw.signal));
     } catch (error) {
       if (error instanceof JurorError) {
         log(error.status >= 500 ? "error" : "warn", "juror.answer.rejected", { queryId: parsed.data.queryId, seat: parsed.data.seat, code: error.code });

@@ -99,22 +99,22 @@ export class Orchestrator {
     const dispatch = await this.deps.intake.dispatch(config.intakeUrl, { queryId: id, jurors: jurorPeers, consensus: consensusPeer });
     for (const item of dispatch.jurors) if (item.address.toLowerCase() !== seats[item.seat]?.toLowerCase()) throw new Error("intake returned an unselected juror");
     const payerResultPubKey = q.isPublic ? undefined : (await store.getPayerResultKey(q.payerCommit)) ?? undefined;
-    await this.deps.consensus.open(config.consensusUrl, { queryId: id, round: q.round, consensusSeed: dispatch.consensusSeed, ...(payerResultPubKey ? { payerResultPubKey } : {}) });
+    const { deadlineMs } = await this.deps.consensus.open(config.consensusUrl, { queryId: id, round: q.round, consensusSeed: dispatch.consensusSeed, ...(payerResultPubKey ? { payerResultPubKey } : {}) });
     await Promise.all(dispatch.jurors.map(async ({ seat, docEnvelope }) => {
       const jurorAddress = seats[seat]!;
       const url = await this.deps.directory.urlOf(jurorAddress); if (!url) return;
       try {
-        const answer = await this.withTimeout(this.deps.juror.answer(url, { queryId: id, seat, docEnvelope, consensus: consensusPeer, consensusUrl: config.consensusUrl }), config.jurorTimeoutMs);
+        const answer = await this.withTimeout((signal) => this.deps.juror.answer(url, { queryId: id, seat, docEnvelope, consensus: consensusPeer, consensusUrl: config.consensusUrl, round: q.round, deadlineMs }, signal), Math.max(1, Math.min(config.jurorTimeoutMs, deadlineMs + 5000 - clock.now())));
         const vote = answer.vote, juror = await chain.getJuror(jurorAddress);
         await store.insertJurorAnswer({ queryId: id, round: q.round, seat, juror: vote.juror as Address, class: juror.jurorClass, answerHash: vote.answerHash as Hex, spansRoot: vote.spansRoot as Hex, quoteHash: vote.quoteHash as Hex, sig: hexToBytes(vote.sig as Hex), timedOut: vote.sig === "0x", ts: new Date(clock.now()) });
       } catch { /* consensus records missing seats as timeouts */ }
     }));
-    const started = clock.now(); let decision: DecisionRes;
+    const closeDeadline = Math.min(deadlineMs + 5000, clock.now() + config.closeMaxWaitMs); let decision: DecisionRes;
     for (;;) {
-      try { decision = await this.deps.consensus.close(config.consensusUrl, id); break; }
+      try { decision = await this.deps.consensus.close(config.consensusUrl, id, Math.max(1, closeDeadline - clock.now())); break; }
       catch (error) {
-        if (errorStatus(error) !== 409 || clock.now() - started >= config.closeMaxWaitMs) throw error;
-        await clock.sleep(Math.min(1000, config.closeMaxWaitMs - (clock.now() - started)));
+        if (errorStatus(error) !== 409 || clock.now() >= closeDeadline) throw error;
+        await clock.sleep(Math.min(1000, closeDeadline - clock.now()));
       }
     }
     const tx = await chain.post({ ...decision.verdictInput, queryId: decision.verdictInput.queryId as Hex, answerHash: decision.verdictInput.answerHash as Hex, payloadHash: decision.verdictInput.payloadHash as Hex, evidenceRoot: decision.verdictInput.evidenceRoot as Hex, round: Number(decision.verdictInput.round), status: decision.verdictInput.status }, decision.votes.map(v => ({ juror: v.juror as Address, answerHash: v.answerHash as Hex, spansRoot: v.spansRoot as Hex, quoteHash: v.quoteHash as Hex, sig: v.sig as Hex })), decision.consensusSig as Hex);
@@ -160,9 +160,10 @@ export class Orchestrator {
     await store.updateQueryStatus(id, decision.verdictInput.status === VerdictStatus.VERDICT ? QueryStatus.DECIDED : QueryStatus.HUNG);
   }
 
-  private async withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
+  private async withTimeout<T>(action: (signal: AbortSignal) => Promise<T>, ms: number): Promise<T> {
+    const controller = new AbortController();
     let timer: ReturnType<typeof setTimeout>;
-    try { return await Promise.race([promise, new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new Error("juror timeout")), ms); })]); }
-    finally { clearTimeout(timer!); }
+    try { return await Promise.race([action(controller.signal), new Promise<never>((_, reject) => { timer = setTimeout(() => { controller.abort(); reject(new Error("juror timeout")); }, ms); })]); }
+    finally { clearTimeout(timer!); controller.abort(); }
   }
 }

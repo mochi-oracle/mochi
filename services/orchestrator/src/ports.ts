@@ -24,11 +24,11 @@ export interface ChainPort {
   feedsUpdate(feedId: Hex, key: Hex, verdictId: Hex, payload: Hex): Promise<Hex>;
 }
 export interface IntakeClient { attestation(url: string): Promise<AttestationDoc>; dispatch(url: string, req: { queryId: Hex; jurors: Array<Peer & { seat: number }>; consensus: Peer }): Promise<DispatchRes> }
-export interface JurorClient { attestation(url: string): Promise<AttestationDoc>; answer(url: string, req: { queryId: Hex; seat: number; docEnvelope: DispatchRes["jurors"][number]["docEnvelope"]; consensus: Peer; consensusUrl: string }): Promise<AnswerRes> }
+export interface JurorClient { attestation(url: string): Promise<AttestationDoc>; answer(url: string, req: { queryId: Hex; seat: number; docEnvelope: DispatchRes["jurors"][number]["docEnvelope"]; consensus: Peer; consensusUrl: string; round: number; deadlineMs: number }, signal?: AbortSignal): Promise<AnswerRes> }
 export interface ConsensusClient {
   attestation(url: string): Promise<AttestationDoc>;
-  open(url: string, req: RoundOpenReq): Promise<void>;
-  close(url: string, queryId: Hex): Promise<DecisionRes>;
+  open(url: string, req: RoundOpenReq): Promise<{ deadlineMs: number }>;
+  close(url: string, queryId: Hex, remainingMs?: number): Promise<DecisionRes>;
 }
 export interface Directory { urlOf(addr: Hex): Promise<string | undefined> }
 export type FeedQuery = { feedId: Hex; key: Hex };

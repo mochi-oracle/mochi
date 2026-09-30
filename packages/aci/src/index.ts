@@ -101,7 +101,8 @@ export interface DcapResult {
   measurement?: string;
 }
 export interface VerifyAciReportOptions {
-  nonce: string; dcap: (quote: Uint8Array) => Promise<DcapResult> | DcapResult;
+  signal?: AbortSignal;
+  nonce: string; dcap: (quote: Uint8Array, signal?: AbortSignal) => Promise<DcapResult> | DcapResult;
   now?: number; maxAgeSec?: number; allowedWorkloads?: string[]; allowedComposeHashes?: string[];
 }
 export async function verifyAciReport(report: AciReport, options: VerifyAciReportOptions): Promise<EstablishedAciReport> {
@@ -118,7 +119,7 @@ export async function verifyAciReport(report: AciReport, options: VerifyAciRepor
   const quote = att.evidence?.quote ?? att.evidence?.quote_hex;
   if (typeof quote !== "string") throw new AciVerificationError("quote_missing");
   let dcap: DcapResult;
-  try { dcap = await options.dcap(fromHex(quote)); } catch { throw new AciVerificationError("dcap_failed"); }
+  try { dcap = await options.dcap(fromHex(quote), options.signal); } catch { throw new AciVerificationError("dcap_failed"); }
   if (!dcap.ok) throw new AciVerificationError("dcap_failed");
   if (dcap.reportType !== "tdx") throw new AciVerificationError("quote_binding");
   if (typeof att.report_data !== "string" || !/^[0-9a-f]{64}$/.test(att.report_data)) throw new AciVerificationError("quote_binding");
@@ -209,7 +210,7 @@ export class AciClient {
     if (!response.ok || response.redirected) throw httpFailure(response.redirected ? "attestation_redirect" : "attestation_http", response);
     const report = JSON.parse(new TextDecoder().decode(await readBounded(response, MAX_ATTESTATION_BYTES, signal))) as AciReport;
     aborted(signal);
-    const verified = await verifyAciReport(report, { nonce, dcap: this.options.dcap, now: this.now(), allowedWorkloads: this.options.allowedWorkloads });
+    const verified = await verifyAciReport(report, { nonce, signal, dcap: this.options.dcap, now: this.now(), allowedWorkloads: this.options.allowedWorkloads });
     aborted(signal);
     this.established = verified;
     this.cacheUntil = Math.min(verified.staleAfter, this.now() + 3600);

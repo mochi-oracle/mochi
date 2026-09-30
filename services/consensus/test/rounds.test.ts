@@ -135,3 +135,14 @@ describe("ConsensusEnclave", () => {
     expect(bad.status).toBe(400);
   });
 });
+
+test("120 second production window accepts at 110 seconds and rejects at 121 seconds", async () => {
+  const h = new Harness();
+  h.enclave = new ConsensusEnclave({ tee: h.tee, chain: h.chain, store: h.store, quoteVerifier: new MockQuoteVerifier({ mockRootAddress: root.address }), chainId, verdictsAddress: verdicts, clock: { now: () => h.now } });
+  const opened = await h.open(); const originalDeadline = opened.deadlineMs;
+  h.now = originalDeadline - 10_000;
+  await expect(h.answer(0)).resolves.toMatchObject({ accepted: true });
+  expect((await h.open()).deadlineMs).toBe(originalDeadline);
+  h.now = originalDeadline + 1_000;
+  await expect(h.answer(1)).rejects.toMatchObject({ code: "ROUND_CLOSED" });
+});

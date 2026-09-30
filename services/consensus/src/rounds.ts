@@ -48,7 +48,7 @@ export class ConsensusError extends Error {
 export class ConsensusEnclave {
   private readonly timeout: number;
   private readonly answerLocks = new Map<string, Promise<void>>();
-  constructor(private readonly deps: ConsensusEnclaveDeps) { this.timeout = deps.roundTimeoutMs ?? 60_000; }
+  constructor(private readonly deps: ConsensusEnclaveDeps) { this.timeout = deps.roundTimeoutMs ?? 120_000; }
 
   private async withQueryLock<T>(queryId: string, action: () => Promise<T>): Promise<T> {
     const previous = this.answerLocks.get(queryId) ?? Promise.resolve();

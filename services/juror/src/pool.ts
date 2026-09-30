@@ -23,9 +23,9 @@ if (import.meta.main) {
   const seats = parseSeats(process.env.JUROR_SEATS_JSON);
   const shared = { ...process.env };
   delete shared.JUROR_SEATS_JSON;
-  for (const [i, seat] of seats.entries()) {
+  await Promise.all(seats.map(async (seat, i) => {
     try { await startJurorServer({ ...shared, ...seat }); }
     catch { console.error(`juror seat ${i} failed to start`); process.exit(1); }
-  }
+  }));
   console.info(`juror pool serving ${seats.length} seats`);
 }

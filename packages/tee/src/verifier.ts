@@ -9,11 +9,11 @@ import { pemChain } from "./dcap/x509.ts";
 export type TcbStatus = string;
 
 export interface QuoteVerifier {
-  verify(quote: Quote, expected?: { measurement?: Hex; reportData?: Hex; maxAgeSec?: number }): Promise<{ ok: boolean; reason?: string; measurement?: Hex; reportData?: Hex }>;
+  verify(quote: Quote, expected?: { measurement?: Hex; reportData?: Hex; maxAgeSec?: number; signal?: AbortSignal }): Promise<{ ok: boolean; reason?: string; measurement?: Hex; reportData?: Hex }>;
 }
 export class MockQuoteVerifier implements QuoteVerifier {
   constructor(private readonly options: { mockRootAddress: Address }) {}
-  async verify(quote: Quote, expected: { measurement?: Hex; reportData?: Hex; maxAgeSec?: number } = {}) {
+  async verify(quote: Quote, expected: { measurement?: Hex; reportData?: Hex; maxAgeSec?: number; signal?: AbortSignal } = {}) {
     try {
       if (quote.kind !== "mock") return { ok: false, reason: "wrong quote kind" };
       const [tag, measurement, reportData, issuedAtBig, rootSig] = decodeAbiParameters(
@@ -78,7 +78,7 @@ export class DcapQuoteVerifier implements QuoteVerifier {
 
   async verify(
     quote: Quote,
-    expected: { measurement?: Hex; reportData?: Hex; maxAgeSec?: number } = {},
+    expected: { measurement?: Hex; reportData?: Hex; maxAgeSec?: number; signal?: AbortSignal } = {},
   ) {
     if (quote.kind !== "tdx") return { ok: false as const, reason: "wrong quote kind" };
     if (!this.options.collateral) {
@@ -110,7 +110,7 @@ export class DcapQuoteVerifier implements QuoteVerifier {
 
     let collateral;
     try {
-      collateral = await this.options.collateral.get(fmspc, ca);
+      collateral = await this.options.collateral.get(fmspc, ca, expected.signal);
     } catch {
       return { ok: false as const, reason: "dcap: collateral unavailable" };
     }

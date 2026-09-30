@@ -11,7 +11,7 @@ export interface TdxCollateral {
 }
 
 export interface CollateralSource {
-  get(fmspc: string, ca: "platform" | "processor"): Promise<TdxCollateral>;
+  get(fmspc: string, ca: "platform" | "processor", signal?: AbortSignal): Promise<TdxCollateral>;
 }
 
 export class StaticCollateralSource implements CollateralSource {

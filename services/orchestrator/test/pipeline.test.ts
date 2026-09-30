@@ -38,7 +38,7 @@ function fixture(opts: { private?: boolean; feed?: boolean; n?: number; status?:
     },
     intake: { attestation: async () => ({ role: "INTAKE", measurement: h, ...peer }), dispatch: async (_url, req) => { calls.dispatch.push(req); return { jurors: req.jurors.map(({ seat }) => ({ seat, address: jurors[seat]!, docEnvelope: envelope })), consensusSeed: envelope }; } },
     juror: { attestation: async (url) => ({ role: "JUROR", measurement: h, ...peer, address: url.split("/").at(-1) as Address }), answer: async (_url, req) => { calls.answer.push(req); if (opts.jurorFails && req.seat === 1) throw new Error("timeout"); return { seat: req.seat, vote: { juror: jurors[req.seat]!, answerHash: h, spansRoot: h, quoteHash: h, sig: "0x12" }, delivered: true }; } },
-    consensus: { attestation: async () => ({ role: "CONSENSUS", measurement: h, ...peer }), open: async (_url, req) => { calls.open.push(req); }, close: async () => { state.closeCount++; if (opts.firstClose409 && state.closeCount === 1) throw Object.assign(new Error("open"), { status: 409 }); return decision(); } },
+    consensus: { attestation: async () => ({ role: "CONSENSUS", measurement: h, ...peer }), open: async (_url, req) => { calls.open.push(req); return { deadlineMs: 130000 }; }, close: async () => { state.closeCount++; if (opts.firstClose409 && state.closeCount === 1) throw Object.assign(new Error("open"), { status: 409 }); return decision(); } },
     directory: { urlOf: async (address) => `http://juror.test/${address}` },
     store: {
       insertQuery: async () => { state.stored = true; }, setCursor: async (_n, v) => { state.cursor = v; }, getCursor: async () => state.cursor, queryIds: async () => state.stored ? [id] : [],
@@ -146,4 +146,10 @@ describe("orchestrator lifecycle", () => {
     expect(f.calls.reseal).toHaveLength(0);
     expect(f.calls.dispatch).toHaveLength(0);
   });
+});
+
+test("all seats receive the same consensus absolute deadline and round", async () => {
+  const f = fixture(); await f.orchestrator.tick();
+  expect(f.calls.answer).toHaveLength(3);
+  for (const req of f.calls.answer) expect(req).toMatchObject({ deadlineMs: 130000, round: 0 });
 });

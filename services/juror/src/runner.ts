@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { ProviderCallAborted, ProviderRetryError, withProviderRetries, type ProviderAttemptFailure, type ProviderRetryOptions } from "@mochi/aci";
+import { abortableProviderCall, ProviderCallAborted, ProviderRetryError, withProviderRetries, type ProviderAttemptFailure, type ProviderRetryOptions } from "@mochi/aci";
 
 export interface ModelInput {
   system: string;
@@ -9,8 +9,10 @@ export interface ModelInput {
   maxTokens: number;
 }
 
+export interface RunBudget { signal: AbortSignal; remainingMs(): number; onAttempt?: import("@mochi/aci").ProviderRetryOptions["onAttempt"] }
+
 export interface ModelRunner {
-  run(input: ModelInput): Promise<unknown>;
+  run(input: ModelInput, budget?: RunBudget): Promise<unknown>;
 }
 
 export class RunnerError extends Error {
@@ -31,11 +33,15 @@ export class OpenAICompatibleRunner implements ModelRunner {
     fetch?: (input: string | URL, init?: RequestInit) => Promise<Response>;
   }) {}
 
-  async run(input: ModelInput): Promise<unknown> {
+  async run(input: ModelInput, budget?: RunBudget): Promise<unknown> {
     const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), this.options.timeoutMs);
+    const totalMs = Math.min(this.options.timeoutMs, budget?.remainingMs() ?? this.options.timeoutMs);
+    if (totalMs <= 0) throw new RunnerError("model budget exhausted", undefined, "timeout");
+    const signal = budget ? AbortSignal.any([controller.signal, budget.signal]) : controller.signal;
+    signal.throwIfAborted();
+    const timer = setTimeout(() => controller.abort(), totalMs);
     try {
-      const response = await (this.options.fetch ?? fetch)(
+      const response = await abortableProviderCall((this.options.fetch ?? fetch)(
         `${this.options.baseUrl.replace(/\/$/, "")}/v1/chat/completions`,
         {
           method: "POST",
@@ -43,7 +49,7 @@ export class OpenAICompatibleRunner implements ModelRunner {
             "content-type": "application/json",
             ...(this.options.apiKey ? { authorization: `Bearer ${this.options.apiKey}` } : {}),
           },
-          signal: controller.signal,
+          signal,
           body: JSON.stringify({
             model: this.options.model,
             messages: [
@@ -59,9 +65,9 @@ export class OpenAICompatibleRunner implements ModelRunner {
             max_tokens: input.maxTokens,
           }),
         },
-      );
+      ), signal);
       if (!response.ok) throw new RunnerError(`model server returned HTTP ${response.status}`);
-      const payload: unknown = await response.json();
+      const payload: unknown = await abortableProviderCall(response.json(), signal);
       if (!payload || typeof payload !== "object") throw new RunnerError("invalid model response");
       const choices = (payload as { choices?: unknown }).choices;
       const message = Array.isArray(choices) ? choices[0] as { message?: { content?: unknown } } | undefined : undefined;
@@ -71,7 +77,7 @@ export class OpenAICompatibleRunner implements ModelRunner {
       catch (error) { throw new RunnerError("model response content is invalid JSON", { cause: error }); }
     } catch (error) {
       if (error instanceof RunnerError) throw error;
-      if (controller.signal.aborted) throw new RunnerError("model request timed out", { cause: error });
+      if (signal.aborted) throw new RunnerError("model request timed out", { cause: error });
       throw new RunnerError("model request failed", { cause: error });
     } finally {
       clearTimeout(timer);
@@ -88,7 +94,7 @@ export class PhalaAciRunner implements ModelRunner {
   /** Provider attempts used by the last run, retries included (content-free, for cost and reliability telemetry). */
   lastAttempts = 0;
   constructor(private readonly options: { client: import("@mochi/aci").AciClient; model: string; timeoutMs: number; maxTokens?: number; maxInputBytes?: number; compactReceiptMetadata?: boolean; maxAttempts?: number; attemptCapMs?: number; retry?: Partial<Pick<ProviderRetryOptions, "now" | "sleep" | "random" | "minAttemptMs">> }) {}
-  async run(input: ModelInput): Promise<unknown> {
+  async run(input: ModelInput, budget?: RunBudget): Promise<unknown> {
     this.lastFailure = undefined;
     this.lastAttempts = 0;
     const maxTokens = Math.min(input.maxTokens, this.options.maxTokens ?? input.maxTokens);
@@ -109,7 +115,11 @@ export class PhalaAciRunner implements ModelRunner {
       throw new RunnerError("model request exceeds the configured public bound", undefined, "request_too_large");
     }
     const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), this.options.timeoutMs);
+    const totalMs = Math.min(this.options.timeoutMs, budget?.remainingMs() ?? this.options.timeoutMs);
+    if (totalMs <= 0) throw new RunnerError("model budget exhausted", undefined, "timeout");
+    const signal = budget ? AbortSignal.any([controller.signal, budget.signal]) : controller.signal;
+    signal.throwIfAborted();
+    const timer = setTimeout(() => controller.abort(), totalMs);
     let attemptFailures: ProviderAttemptFailure[] = [];
     try {
       // Transient provider failures (429/5xx, dropped connections, stalled attempts) are retried with the
@@ -117,9 +127,10 @@ export class PhalaAciRunner implements ModelRunner {
       const maxAttempts = this.options.maxAttempts ?? 3;
       const outcome = await withProviderRetries({
         maxAttempts,
-        totalMs: this.options.timeoutMs,
+        totalMs,
+        onAttempt: budget?.onAttempt,
         attemptCapMs: this.options.attemptCapMs ?? Math.max(15_000, Math.floor(this.options.timeoutMs / 2)),
-        signal: controller.signal,
+        signal,
         ...this.options.retry,
       }, (signal) => this.options.client.chat(requestBody, { signal, requireUpToDate: true, maxResponseBytes: 256 * 1024 })).catch((error: unknown) => {
         if (error instanceof ProviderCallAborted) { attemptFailures = error.failures; this.lastAttempts = error.attemptsStarted; throw error; }
@@ -156,7 +167,7 @@ export class PhalaAciRunner implements ModelRunner {
       catch (error) { throw new RunnerError("model response content is invalid JSON", { cause: error }, "response_json"); }
     } catch (error) {
       const code = error instanceof RunnerError ? error.diagnosticCode
-        : controller.signal.aborted ? "timeout"
+        : signal.aborted ? "timeout"
         : error && typeof error === "object" && "code" in error && typeof error.code === "string" && /^[a-z_]+$/u.test(error.code) ? error.code
         : "aci_error";
       const known = new Set(["aborted", "attestation_http", "attestation_redirect", "inference_http", "inference_redirect", "receipt_header", "receipt_redirect", "receipt_unavailable", "receipt_binding", "receipt_signature", "receipt_model", "body_hash", "upstream_unverified", "response_json", "response_body", "response_too_large", "invalid_report", "report_binding", "report_stale", "quote_missing", "quote_binding", "dcap_failed", "compose_measurement", "tcb_status", "workload_not_allowed", "request_shape", "request_provider", "request_confidentiality", "timeout", "request_too_large", "runner_failed"]);
@@ -165,7 +176,7 @@ export class PhalaAciRunner implements ModelRunner {
       const httpStatus = nested && typeof nested === "object" && "httpStatus" in nested && typeof nested.httpStatus === "number" && Number.isInteger(nested.httpStatus) && nested.httpStatus >= 100 && nested.httpStatus <= 599 ? nested.httpStatus : undefined;
       this.lastFailure = { causeCode, ...(httpStatus === undefined ? {} : { httpStatus }), ...(this.lastAttempts > 1 ? { attempts: this.lastAttempts, attemptFailures } : {}) };
       if (error instanceof RunnerError) throw error;
-      if (controller.signal.aborted) throw new RunnerError("model request timed out", { cause: error }, "timeout");
+      if (signal.aborted) throw new RunnerError("model request timed out", { cause: error }, "timeout");
       throw new RunnerError("model verification or inference failed", { cause: error }, causeCode);
     } finally { clearTimeout(timer); }
   }
@@ -173,5 +184,5 @@ export class PhalaAciRunner implements ModelRunner {
 
 export class StubRunner implements ModelRunner {
   constructor(private readonly fixture: (input: ModelInput) => unknown | Promise<unknown>) {}
-  async run(input: ModelInput): Promise<unknown> { return this.fixture(input); }
+  async run(input: ModelInput, budget?: RunBudget): Promise<unknown> { return this.fixture(input); }
 }

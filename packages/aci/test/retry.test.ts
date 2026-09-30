@@ -138,3 +138,15 @@ describe("withProviderRetries", () => {
     await expect(withProviderRetries({ ...base, totalMs: 0 }, async () => 1)).rejects.toBeInstanceOf(RangeError);
   });
 });
+
+test("final attempt respects cap and shared remaining budget even with uncooperative provider", async () => {
+  const start = Date.now(); let signal: AbortSignal | undefined;
+  await expect(withProviderRetries({ maxAttempts: 1, totalMs: 200, attemptCapMs: 30 }, async current => { signal = current; return new Promise(() => {}); })).rejects.toBeInstanceOf(ProviderRetryError);
+  expect(signal?.aborted).toBe(true); expect(Date.now() - start).toBeLessThan(150);
+  const clock = fakeClock(); let calls = 0;
+  await expect(withProviderRetries({ maxAttempts: 2, totalMs: 60, attemptCapMs: 40, minAttemptMs: 1, random: () => 0, now: clock.now, sleep: clock.sleep }, async current => {
+    calls++; if (calls === 1) { clock.advance(50); throw httpError(503); }
+    signal = current; return new Promise(() => {});
+  })).rejects.toBeInstanceOf(ProviderRetryError);
+  expect(calls).toBe(2); expect(signal?.aborted).toBe(true);
+});
