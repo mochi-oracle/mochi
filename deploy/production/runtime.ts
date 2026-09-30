@@ -7,7 +7,7 @@ import { createChain, ROLE_IDS } from "@mochi/chain";
 import { DstackKeySource } from "@mochi/tee";
 import { createDb, upsertEndpoint } from "@mochi/db";
 import { PRODUCTION_IDENTITY_SPECS, PRODUCTION_RECEIPT_SIGNING_SPEC, PRODUCTION_SERVICE_SPECS } from "../phala/production-identities/identities.ts";
-import { productionChainId } from "./chain-policy.ts";
+import { deploymentMinJurorBond, productionChainId } from "./chain-policy.ts";
 
 type Address = `0x${string}`;
 type Hex = `0x${string}`;
@@ -116,7 +116,6 @@ export function validateLaunchConfig(raw: unknown): ProductionLaunchConfig {
   if (c.fetchOrigins !== undefined && (!Array.isArray(c.fetchOrigins) || c.fetchOrigins.some((origin) => !origin || !/^[a-z0-9.-]+$/i.test(origin.host) || origin.host.includes("..") || (origin.spkiSha256 && origin.spkiSha256.some((pin) => typeof pin !== "string" || !pin))))) throw new Error("fetchOrigins must be a reviewed host allowlist");
   if (c.fetchOrigins && new Set(c.fetchOrigins.map((origin) => origin.host.toLowerCase())).size !== c.fetchOrigins.length) throw new Error("fetchOrigins hosts must be unique");
   if (c.identities?.jurors?.length !== 9) throw new Error("exactly nine reviewed juror identities are required");
-  if (c.deployment.owner && c.deployment.guardian && c.deployment.owner.toLowerCase() === c.deployment.guardian.toLowerCase()) throw new Error("deployment owner and guardian custody must be distinct");
   const identities = [c.identities.intake, c.identities.consensus, ...c.identities.jurors];
   const seen = new Set<string>();
   for (const [i, identity] of identities.entries()) {
@@ -153,6 +152,7 @@ function validatePassport(p: Passport, cls: number) {
 export type EnrollmentReadinessReader = {
   juror(address: Address): Promise<{ operator: Address; measurement: Hex; role: number; jurorClass: number; bond: bigint; delisted: boolean }>;
   isActive(address: Address, role: number): Promise<boolean>;
+  unbondedOperator?(address: Address): Promise<Address>;
   hasRole(contract: Address, role: Hex, account: Address): Promise<boolean>;
 };
 
@@ -163,14 +163,15 @@ export async function validateEnrollmentReadiness(config: ProductionLaunchConfig
     { identity: config.identities.consensus, role: 3, jurorClass: undefined },
     ...config.identities.jurors.map((identity) => ({ identity, role: 1, jurorClass: identity.class })),
   ];
-  const minimumBond = 25_000n * 10n ** 18n;
+  const minimumBond = deploymentMinJurorBond(config.deployment);
   for (const { identity, role, jurorClass } of registered) {
     const current = await reader.juror(identity.address);
     if (current.operator.toLowerCase() !== identity.operator.toLowerCase() || current.measurement.toLowerCase() !== identity.measurement.toLowerCase() || current.role !== role || (jurorClass !== undefined && current.jurorClass !== jurorClass) || current.delisted) {
       throw new Error(`enrollment mismatch for ${identity.address}`);
     }
     if (requireActive && !(await reader.isActive(identity.address, role))) throw new Error(`enclave identity is not active: ${identity.address}`);
-    if (role === 1 && current.bond < minimumBond) throw new Error(`juror bond below 25000 MOCHI: ${identity.address}`);
+    if (role === 1 && minimumBond === 0n && (!reader.unbondedOperator || (await reader.unbondedOperator(identity.address)).toLowerCase() !== identity.operator.toLowerCase())) throw new Error(`team juror approval missing: ${identity.address}`);
+    if (role === 1 && current.bond < minimumBond) throw new Error(`juror bond below configured minimum: ${identity.address}`);
   }
   const roles = [
     [config.deployment.contracts.jurorRegistry as Address, ROLE_IDS.ATTESTOR, config.serviceRoleAddresses.attestor],
@@ -190,6 +191,7 @@ async function validateActivatedDeployment(config: ProductionLaunchConfig, clien
   const hasRoleAbi = parseAbi(["function hasRole(bytes32,address) view returns (bool)"]);
   await validateEnrollmentReadiness(config, {
     juror: (address) => chain.getJuror(address),
+    unbondedOperator: (address) => client.readContract({ address: deployment.contracts.jurorRegistry, abi: parseAbi(["function unbondedJurorOperator(address) view returns (address)"]), functionName: "unbondedJurorOperator", args: [address] }),
     isActive: (address, role) => chain.isActive(address, role),
     hasRole: (contract, role, account) => client.readContract({ address: contract, abi: hasRoleAbi, functionName: "hasRole", args: [role, account] }),
   }, requireActive);

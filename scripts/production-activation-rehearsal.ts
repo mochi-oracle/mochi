@@ -74,7 +74,7 @@ async function main() {
   try {
     await waitForRpc(rpc, anvil);
     const owner = accountAt(1);
-    const guardian = accountAt(2);
+    const guardian = owner; // User-selected shared administrative and emergency control.
     const deployer = accountAt(0);
     const publicClient = createPublicClient({ transport: http(rpc) });
     const wallet = (account: ReturnType<typeof accountAt>) => createWalletClient({ account, transport: http(rpc) });
@@ -93,7 +93,7 @@ async function main() {
       "--shielded", "privacy-pools", "--randomness", "drand", "--timelock-delay", "86400", "--yes"], { cwd: ROOT, env });
     const deployed = await collect(deploy);
     assert(deployed.code === 0, `deploy-local rehearsal failed (exit ${deployed.code}):\n${deployed.output}`);
-    const deployment = JSON.parse(await Bun.file(deploymentPath).text()) as { chainId: number; paused: boolean; contracts: Record<string, Address>; privacy?: { entrypoint: Address } };
+    const deployment = JSON.parse(await Bun.file(deploymentPath).text()) as { chainId: number; paused: boolean; minJurorBond: string; contracts: Record<string, Address>; privacy?: { entrypoint: Address } };
     assert(deployment.chainId === 46630 && deployment.paused === true, "deployment metadata must describe paused chainId 46630 rehearsal");
     const { contracts } = deployment;
     assert(await publicClient.readContract({ address: contracts.queryEscrow!, abi: accessAbi, functionName: "paused" }), "QueryEscrow must start paused");
@@ -104,7 +104,7 @@ async function main() {
     const guardResult = await collect(productionGuard);
     assert(guardResult.code !== 0 && guardResult.output.includes("--mochi-token has no contract code"), "rehearsal mode must refuse an external MOCHI address without contract code");
 
-    // The owner and guardian are distinct mnemonic-derived fixtures. Build the exact
+    // The same mnemonic-derived fixture holds owner and guardian roles. Build the exact
     // nine-juror 2/2/2/1/2 payload with deterministic nonzero test identities.
     const identity = (index: number, cls?: number) => ({ address: accountAt(index).address, operator: accountAt(index + 1).address,
       measurement: (`0x${(index + 1).toString(16).padStart(2, "0").repeat(32)}`) as Hex, ...(cls === undefined ? {} : { class: cls }) });
@@ -118,7 +118,7 @@ async function main() {
       indexer: accountAt(18).address, postman: accountAt(19).address,
     };
     assert(deployment.privacy?.entrypoint, "mainnet rehearsal deployment must include its real privacy entrypoint");
-    const deploymentForBatch = { contracts: { timelock: contracts.timelock!, jurorRegistry: contracts.jurorRegistry!,
+    const deploymentForBatch = { minJurorBond: deployment.minJurorBond, contracts: { timelock: contracts.timelock!, jurorRegistry: contracts.jurorRegistry!,
       queryEscrow: contracts.queryEscrow!, receiptAnchor: contracts.receiptAnchor!, panel: contracts.panel! }, privacy: deployment.privacy };
     const configureSchedule = buildPhalaBatch(deploymentForBatch, input, "schedule", "configure");
     const configureExecute = buildPhalaBatch(deploymentForBatch, input, "execute", "configure");
@@ -146,12 +146,29 @@ async function main() {
     assert(await publicClient.readContract({ address: contracts.queryEscrow!, abi: accessAbi, functionName: "paused" }), "configure must keep QueryEscrow paused");
 
     // The activation CLI requires all service/juror enrollment and identity checks.
-    // We intentionally do not manufacture payments, bonds, or successful service enrollment.
+    // Check the closed activation gate before enrolling our local zero-bond fixtures.
     const identitiesPath = join(temp, "identities.json");
     await writeFile(identitiesPath, JSON.stringify(input));
     const activationGate = start("bun", ["scripts/phala-batch.ts", deploymentPath, identitiesPath, "schedule", "activate"], { cwd: ROOT, env });
     const gateResult = await collect(activationGate);
     assert(gateResult.code !== 0 && gateResult.output.includes("enclave is not enrolled and active with the reviewed identity"), "activation CLI must block scheduling until all reviewed service and juror identities are enrolled and active");
+    assert(deployment.minJurorBond === "0", "new team-operated deployment must default to zero bond");
+    for (let i = 0; i < input.jurors.length; i++) {
+      const seat = input.jurors[i]!;
+      const digest = await publicClient.readContract({ address: contracts.jurorRegistry!, abi: A.JurorRegistryAbi, functionName: "enrollmentDigest", args: [seat.operator, seat.address, seat.measurement, seat.class] });
+      const proof = await accountAt(jurorIndexes[i]!).signMessage({ message: { raw: digest } });
+      const tx = await wallet(accountAt(jurorIndexes[i]! + 1)).writeContract({ address: contracts.jurorRegistry!, abi: A.JurorRegistryAbi, functionName: "enrollJuror", args: [seat.address, seat.measurement, seat.class, 0n, proof], chain: null });
+      assert((await publicClient.waitForTransactionReceipt({ hash: tx })).status === "success", "zero-bond enrollment failed");
+    }
+    const until = (await publicClient.getBlock()).timestamp + 14n * delay;
+    const refresh = await wallet(accountAt(18)).writeContract({ address: contracts.jurorRegistry!, abi: A.JurorRegistryAbi, functionName: "refreshAttestation", args: [[input.intake.address, input.consensus.address, ...input.jurors.map(j => j.address)], until], chain: null });
+    assert((await publicClient.waitForTransactionReceipt({ hash: refresh })).status === "success", "fixture attestation failed");
+    const readyGate = await collect(start("bun", ["scripts/phala-batch.ts", deploymentPath, identitiesPath, "schedule", "activate"], { cwd: ROOT, env }));
+    assert(readyGate.code === 0, "activation CLI must accept approved zero-bond jurors after attestation");
+    let directUnpauseRefused = false;
+    try { await publicClient.simulateContract({ account: owner.address, address: contracts.queryEscrow!, abi: A.QueryEscrowAbi, functionName: "unpause" }); }
+    catch { directUnpauseRefused = true; }
+    assert(directUnpauseRefused, "shared owner/guardian must not bypass the reopening delay");
     const activation = buildPhalaBatch(deploymentForBatch, input, "schedule", "activate");
     await schedule(activation);
     const activationExecute = buildPhalaBatch(deploymentForBatch, input, "execute", "activate");
@@ -160,7 +177,7 @@ async function main() {
     await (publicClient.request as (args: { method: string; params: unknown[] }) => Promise<unknown>)({ method: "evm_mine", params: [] });
     await execute(activationExecute);
     assert(!(await publicClient.readContract({ address: contracts.queryEscrow!, abi: accessAbi, functionName: "paused" })), "activation must unpause QueryEscrow after full delay");
-    // Verify guardian retains the independent pause role after unpause.
+    // Verify shared custody still pauses immediately, without gaining direct unpause authority.
     const guardianPauseHash = await guardianWallet.writeContract({ address: contracts.queryEscrow!, abi: parseAbi(["function pause()"]), functionName: "pause", chain: null });
     const guardianPauseReceipt = await publicClient.waitForTransactionReceipt({ hash: guardianPauseHash });
     assert(guardianPauseReceipt.status === "success", "guardian pause transaction failed after activation");
@@ -168,10 +185,10 @@ async function main() {
 
     console.log(JSON.stringify({
       result: "passed", rpc, chainId: 46630, deploymentMode: "mainnet rehearsal", deployer: deployer.address,
-      owner: owner.address, guardian: guardian.address, mochiSource: "test-deployment (external token prohibited by rehearsal policy)",
+      owner: owner.address, guardian: guardian.address, mochiSource: "test-deployment (local fixture only)",
       usdg: "MockUSDG", initialPaused: true, configure: { callCount: configureSchedule.callCount, earlyExecutionReverted: true, earlyRevert: "TimelockUnexpectedOperationState", executedAfterSeconds: "86400", pausedAfterConfigure: true, attestorRoleAssigned: true, feedRunnerRoleAssigned: true },
       activation: { callCount: activation.callCount, earlyExecutionReverted: true, earlyRevert: "TimelockUnexpectedOperationState", executedAfterSeconds: "86400", unpausedAfterExecution: true, guardianPauseAfterActivation: true },
-      jurorFixture: "nine identities, class counts 2/2/2/1/2; activation CLI correctly blocked because no operator enrollment was performed; no bonds, payment, or service health claimed",
+      jurorFixture: "nine locally approved and attested zero-bond jurors; activation CLI refused before enrollment and passed afterward; no payment or real service health claimed",
       limitation: "this local run deploys the test token; the external-token path is exercised by a testnet dress rehearsal (chain 46630, --mochi-token stand-in) and on mainnet",
     }, null, 2));
   } finally {

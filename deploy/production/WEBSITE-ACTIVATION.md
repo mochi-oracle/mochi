@@ -4,7 +4,7 @@ The launch input template now includes Robinhood Chain USDG `0x5fc5360D0400a0Fd4
 
 Railway accepts `MOCHI_WEB_CONFIG_JSON` directly, so activation no longer needs a new image or a manually copied configuration file. Do not set it alongside the older `MOCHI_WEB_CONFIG` file path. Updating Railway variables restarts the service; it does not submit a transaction.
 
-Keep `MOCHI_WEB_CONFIG_JSON={"enabled":false}` until the production protocol and bounded paid canary pass. This is also the website rollback setting. It hides paid checkout, but **does not pause contracts or cancel already-open reviews**. The independent guardian must pause QueryEscrow for a protocol incident. Keep recovery and settlement services available for existing reviews.
+Keep `MOCHI_WEB_CONFIG_JSON={"enabled":false}` until the production protocol and bounded paid canary pass. This is also the website rollback setting. It hides paid checkout, but **does not pause contracts or cancel already-open reviews**. The control wallet holding the guardian role must pause QueryEscrow for a protocol incident. Keep recovery and settlement services available for existing reviews.
 
 After activation, set these existing server-only variables to the verified production HTTPS endpoints: `MOCHI_GATEWAY_URL`, `MOCHI_INDEXER_URL`, and `RPC_URL`. Provider RPC paths may contain credentials; never put them in the public config. Then set the public config using actual deployment and enclave values:
 

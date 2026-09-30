@@ -225,7 +225,7 @@ export function prepareProductionLaunch(options: {
     jurorCount: 9,
     jurorClassCounts: [...CLASS_COUNTS],
     minimumJurorBondMochi: Number(deploymentMinJurorBond(deployment) / 10n ** 18n),
-    bondBelowSpecApproved: deploymentMinJurorBond(deployment) < 25_000n * 10n ** 18n,
+    bondBelowSpecApproved: deploymentMinJurorBond(deployment) > 0n && deploymentMinJurorBond(deployment) < 25_000n * 10n ** 18n,
     initialFeedBudgetUsdg: null,
     deploymentFile: deploymentPath,
     identitiesFile: identitiesPath,
@@ -256,7 +256,6 @@ function validateDeployment(value: Deployment): Deployment {
   if (rpc.protocol !== "https:" || rpc.username || rpc.password || rpc.search || rpc.hash) throw new Error("deployment rpcUrl must be a public HTTPS URL");
   requireAddress(value.owner, "deployment.owner");
   requireAddress(value.guardian, "deployment.guardian");
-  if (value.owner.toLowerCase() === value.guardian.toLowerCase()) throw new Error("deployment owner and guardian must be distinct");
   const required = ["mochiToken", "usdg", "queryEscrow", "jurorRegistry", "verdicts", "receiptAnchor", "panel", "timelock"];
   for (const name of required) requireAddress(value.contracts?.[name], `deployment.contracts.${name}`);
   requireAddress(value.privacy?.entrypoint, "deployment.privacy.entrypoint");

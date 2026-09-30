@@ -78,6 +78,78 @@ contract JurorRegistryTest is Test {
         }
     }
 
+    function testTeamJurorNeedsExactApprovalEvenWithDustBond() public {
+        address key = _key(900);
+        vm.prank(ADMIN);
+        registry.setMinJurorBond(0);
+        bytes memory sig = _keySig(key, MochiTypes.JurorClass.LARGE_A, MEASUREMENT);
+        vm.expectRevert(abi.encodeWithSelector(JurorRegistry.UnbondedJurorNotApproved.selector, key, OP));
+        vm.prank(OP);
+        registry.enrollJuror(key, MEASUREMENT, MochiTypes.JurorClass.LARGE_A, 0, sig);
+        vm.expectRevert(abi.encodeWithSelector(JurorRegistry.UnbondedJurorNotApproved.selector, key, OP));
+        vm.prank(OP);
+        registry.enrollJuror(key, MEASUREMENT, MochiTypes.JurorClass.LARGE_A, 1, sig);
+        vm.prank(OP);
+        vm.expectRevert();
+        registry.setUnbondedJuror(key, OP);
+        vm.prank(ADMIN);
+        registry.setUnbondedJuror(key, address(0xCAFE));
+        vm.expectRevert(abi.encodeWithSelector(JurorRegistry.UnbondedJurorNotApproved.selector, key, OP));
+        vm.prank(OP);
+        registry.enrollJuror(key, MEASUREMENT, MochiTypes.JurorClass.LARGE_A, 0, sig);
+    }
+
+    function testTeamJurorNoTokenCallsAndRevocation() public {
+        address key = _key(901);
+        vm.startPrank(ADMIN);
+        registry.setMinJurorBond(0);
+        registry.setUnbondedJuror(key, OP);
+        vm.stopPrank();
+        vm.mockCallRevert(address(token), abi.encodeWithSelector(token.transferFrom.selector), hex"dead");
+        _enroll(key, MochiTypes.JurorClass.LARGE_A, 0);
+        assertFalse(registry.isActive(key, MochiTypes.Role.JUROR));
+        _attest(key);
+        assertTrue(registry.isActive(key, MochiTypes.Role.JUROR));
+        address[] memory selected = registry.selectJurors(bytes32(uint256(1)), 0, 1, new address[](0));
+        assertEq(selected[0], key);
+        vm.prank(ADMIN);
+        registry.setUnbondedJuror(key, address(0));
+        assertFalse(registry.isActive(key, MochiTypes.Role.JUROR));
+        vm.prank(ADMIN);
+        registry.setUnbondedJuror(key, OP);
+        vm.prank(ADMIN);
+        registry.setMinJurorBond(BOND);
+        assertFalse(registry.isActive(key, MochiTypes.Role.JUROR));
+        vm.prank(ADMIN);
+        registry.setMinJurorBond(0);
+        registry.slashEquivocation(key);
+        assertFalse(registry.isActive(key, MochiTypes.Role.JUROR));
+        assertTrue(registry.getJuror(key).delisted);
+    }
+
+    function testTeamJurorStillRequiresProofAndAttestationAndHonorsExit() public {
+        address key = _key(902);
+        vm.startPrank(ADMIN);
+        registry.setMinJurorBond(0);
+        registry.setUnbondedJuror(key, OP);
+        vm.stopPrank();
+        vm.expectRevert(IJurorRegistry.BadKeySignature.selector);
+        vm.prank(OP);
+        registry.enrollJuror(key, MEASUREMENT, MochiTypes.JurorClass.LARGE_A, 0, hex"");
+        _enroll(key, MochiTypes.JurorClass.LARGE_A, 0);
+        _attest(key);
+        registry.reportAttestationFailure(key);
+        assertFalse(registry.isActive(key, MochiTypes.Role.JUROR));
+        _attest(key);
+        vm.prank(OP);
+        registry.requestExit(key);
+        assertFalse(registry.isActive(key, MochiTypes.Role.JUROR));
+        vm.warp(block.timestamp + EXIT_DELAY);
+        vm.prank(OP);
+        registry.withdrawBond(key);
+        assertTrue(registry.getJuror(key).delisted);
+    }
+
     function testEnrollmentAndMeasurementAccess() public {
         address key = _key(0x1111);
         uint256 beforeBal = token.balanceOf(address(registry));

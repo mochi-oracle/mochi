@@ -132,3 +132,20 @@ describe("production runtime config", () => {
     expect(() => validateLaunchConfig(localToken)).toThrow("external MOCHI");
   });
 });
+
+
+test("zero-bond readiness requires exact team approval; legacy deployments still require their bond", async () => {
+  const launch = validateLaunchConfig(config());
+  launch.deployment.minJurorBond = "0";
+  const identities = [launch.identities.intake, launch.identities.consensus, ...launch.identities.jurors];
+  const reader = {
+    juror: async (address: `0x${string}`) => { const j = identities.find(j => j.address === address)!; return { operator: j.operator, measurement: j.measurement, role: j === launch.identities.intake ? 2 : j === launch.identities.consensus ? 3 : 1, jurorClass: j.class ?? 0, bond: 0n, delisted: false }; },
+    isActive: async () => true, hasRole: async () => true,
+    unbondedOperator: async (address: `0x${string}`) => identities.find(j => j.address === address)!.operator,
+  };
+  await expect(validateEnrollmentReadiness(launch, reader, true)).resolves.toBeUndefined();
+  await expect(validateEnrollmentReadiness(launch, { ...reader, unbondedOperator: undefined }, false)).rejects.toThrow("team juror approval missing");
+  await expect(validateEnrollmentReadiness(launch, { ...reader, unbondedOperator: async () => a(0) }, false)).rejects.toThrow("team juror approval missing");
+  delete launch.deployment.minJurorBond;
+  await expect(validateEnrollmentReadiness(launch, reader, false)).rejects.toThrow("bond below configured minimum");
+});

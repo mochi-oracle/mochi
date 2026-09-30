@@ -51,7 +51,7 @@ test("uses the bond recorded at deployment for the approval and every seat", asy
   expect(result.totalBond).toBe((bond * 9n).toString());
   expect(decodeFunctionData({ abi: CALLS, data: result.transactions[0]!.data }).args).toEqual([deployment.contracts.jurorRegistry, bond * 9n]);
   for (const tx of result.transactions.slice(1)) expect(decodeFunctionData({ abi: CALLS, data: tx.data }).args[3]).toBe(bond);
-  await expect(prepareProductionEnrollment({ deployment: { ...deployment, minJurorBond: "0" }, identities, operator, response })).rejects.toThrow("minJurorBond");
+  await expect(prepareProductionEnrollment({ deployment: { ...deployment, minJurorBond: "-1" }, identities, operator, response })).rejects.toThrow("minJurorBond");
 });
 
 test("a testnet rehearsal enrolls with chain-bound proofs that can never validate on mainnet, and the reverse", async () => {
@@ -66,4 +66,18 @@ test("a testnet rehearsal enrolls with chain-bound proofs that can never validat
   await expect(prepareProductionEnrollment({ deployment: rehearsal, identities: mainnet.identities, operator, response: forged })).rejects.toThrow("digest mismatch");
   await expect(prepareProductionEnrollment({ deployment: { ...deployment, chainId: 46630 }, identities: testnet.identities, operator, response: testnet.response })).rejects.toThrow("explicit testnet rehearsal");
   await expect(prepareProductionEnrollment({ deployment: { ...deployment, rehearsal: true }, identities: mainnet.identities, operator, response: mainnet.response })).rejects.toThrow("explicit testnet rehearsal");
+});
+
+
+test("team-operated enrollment has nine zero-bond calls and no token approval", async () => {
+  const { identities, response } = await fixture();
+  const result = await prepareProductionEnrollment({ deployment: { ...deployment, minJurorBond: "0" }, identities, operator, response });
+  expect(result.totalBond).toBe("0");
+  expect(result.transactions).toHaveLength(9);
+  for (const tx of result.transactions) {
+    expect(tx.to).toBe(deployment.contracts.jurorRegistry);
+    const call = decodeFunctionData({ abi: CALLS, data: tx.data });
+    expect(call.functionName).toBe("enrollJuror");
+    expect(call.args[3]).toBe(0n);
+  }
 });

@@ -1,9 +1,9 @@
 import { readFileSync } from "node:fs";
 import { encodeAbiParameters, encodeFunctionData, keccak256, parseAbi, toHex, type Address, type Hex } from "viem";
 import { ROLE_IDS } from "@mochi/chain";
-import { productionTimelockDelay } from "../deploy/production/chain-policy.ts";
+import { deploymentMinJurorBond, productionTimelockDelay } from "../deploy/production/chain-policy.ts";
 
-export type Deployment = { chainId?: number; rehearsal?: boolean; timelockDelay?: string | number; contracts: { timelock?: Address; jurorRegistry: Address; queryEscrow: Address; receiptAnchor: Address; panel: Address }; privacy?: { entrypoint: Address } };
+export type Deployment = { chainId?: number; rehearsal?: boolean; minJurorBond?: string; timelockDelay?: string | number; contracts: { timelock?: Address; jurorRegistry: Address; queryEscrow: Address; receiptAnchor: Address; panel: Address }; privacy?: { entrypoint: Address } };
 type Identity = { address: Address; measurement: Hex; operator: Address };
 export type Input = {
   salt: Hex;
@@ -36,6 +36,7 @@ const registry = deployment.contracts.jurorRegistry;
 const escrow = deployment.contracts.queryEscrow;
 const anchor = deployment.contracts.receiptAnchor;
 const abi = parseAbi([
+  "function setUnbondedJuror(address key,address operator)",
   "function setMeasurement(bytes32 measurement,uint8 role,bool allowed)",
   "function registerServiceKey(address key,address operator,bytes32 measurement,uint8 role)",
   "function grantRole(bytes32 role,address account)",
@@ -57,6 +58,7 @@ for (const measurement of jurorMeasurements) add(registry, "setMeasurement", [me
 add(registry, "setMeasurement", [input.intake.measurement, 2, true]);
 add(registry, "setMeasurement", [input.consensus.measurement, 3, true]);
 for (const seat of input.jurors) {
+  if (deploymentMinJurorBond(deployment) === 0n) add(registry, "setUnbondedJuror", [seat.address, seat.operator]);
   if (!Number.isInteger(seat.class) || seat.class < 0 || seat.class > 4) throw new Error("juror class must be 0..4");
 }
 add(registry, "registerServiceKey", [input.intake.address, input.intake.operator, input.intake.measurement, 2]);

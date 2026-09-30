@@ -30,6 +30,11 @@ contract JurorRegistry is IJurorRegistry, AccessControl, ReentrancyGuard {
     IERC20 public immutable mochi;
     address public slashSink;
     uint256 public minJurorBond;
+    // Zero-bond seats require approval of the exact enclave key and operator.
+    // This does not make team-operated jurors economically bonded or independent.
+    mapping(address => address) public unbondedJurorOperator;
+    event UnbondedJurorSet(address indexed key, address indexed operator);
+    error UnbondedJurorNotApproved(address key, address operator);
     uint64 public immutable exitDelay;
     IClassMix public classMix;
 
@@ -66,7 +71,8 @@ contract JurorRegistry is IJurorRegistry, AccessControl, ReentrancyGuard {
             revert MeasurementNotAllowed(measurement, MochiTypes.Role.JUROR);
         }
         if (bond < minJurorBond) revert BondTooLow(bond, minJurorBond);
-        mochi.safeTransferFrom(msg.sender, address(this), bond);
+        if (minJurorBond == 0 && unbondedJurorOperator[key] != msg.sender) revert UnbondedJurorNotApproved(key, msg.sender);
+        if (bond != 0) mochi.safeTransferFrom(msg.sender, address(this), bond);
         jurors[key] = Juror(msg.sender, measurement, MochiTypes.Role.JUROR, jurorClass, bond, 0, 0, false, 0, 0, 0);
         _jurorsByClass[jurorClass].push(key);
         emit Enrolled(key, msg.sender, MochiTypes.Role.JUROR, jurorClass, measurement, bond);
@@ -185,7 +191,7 @@ contract JurorRegistry is IJurorRegistry, AccessControl, ReentrancyGuard {
         uint256 timestamp = block.timestamp;
         return j.operator != address(0) && j.role == role && !j.delisted && j.exitRequestedAt == 0
             && j.attestedUntil >= timestamp && allowedMeasurement[j.measurement][role]
-            && (role != MochiTypes.Role.JUROR || j.bond > 0);
+            && (role != MochiTypes.Role.JUROR || (minJurorBond == 0 ? unbondedJurorOperator[key] == j.operator : j.bond > 0));
     }
 
     /// @inheritdoc IJurorRegistry
@@ -239,7 +245,14 @@ contract JurorRegistry is IJurorRegistry, AccessControl, ReentrancyGuard {
         return configured.seatClass(seat);
     }
 
-    /// @notice Sets the minimum bond required for future enrollments.
+    /// @notice Approves an exact team-operated seat when the minimum bond is zero.
+    function setUnbondedJuror(address key, address operator) external onlyRole(MochiRoles.GOVERNOR_ROLE) {
+        if (key == address(0)) revert NotEnrolled(key);
+        unbondedJurorOperator[key] = operator; // zero operator revokes approval and active eligibility
+        emit UnbondedJurorSet(key, operator);
+    }
+
+    /// @notice Sets the minimum bond; zero selects team-approved admission and eligibility.
     function setMinJurorBond(uint256 value) external onlyRole(MochiRoles.GOVERNOR_ROLE) { minJurorBond = value; }
 
     /// @notice Sets the recipient of future slashes.

@@ -32,7 +32,8 @@ test("rejects wrong chain and malformed/zero external CA", () => {
 });
 
 test("rejects role collisions and incomplete or invalid role addresses", () => {
-  expect(() => buildProductionRelease({ ...valid(), roles: { ...valid().roles, guardian: addr(2) } })).toThrow("roles.owner and roles.guardian must be distinct");
+  expect(() => buildProductionRelease({ ...valid(), roles: { ...valid().roles, guardian: addr(2) } })).not.toThrow();
+  expect(() => buildProductionRelease({ ...valid(), roles: { ...valid().roles, postman: addr(2) } })).toThrow("distinct from roles.owner");
   expect(() => buildProductionRelease({ ...valid(), roles: { ...valid().roles, postman: "bad" } })).toThrow("roles.postman must be a valid nonzero EVM address");
   expect(buildProductionRelease({ ...valid(), roles: { ...valid().roles, indexer: null } }).blockers.some((b) => b.includes("roles.indexer"))).toBe(true);
 });
@@ -227,7 +228,7 @@ test("a bond below the 25,000 spec default needs an explicit reviewed approval a
   const approved = buildProductionRelease({ ...valid(), minimumJurorBondMochi: 1000, bondBelowSpecApproved: true });
   expect(approved.warnings.some((w) => w.includes("below the 25000 spec default"))).toBe(true);
   expect(approved.economics.minimumTotalJurorBondsMochi).toBe(9000);
-  expect(() => buildProductionRelease({ ...valid(), minimumJurorBondMochi: 0, bondBelowSpecApproved: true })).toThrow("positive whole number");
+  expect(() => buildProductionRelease({ ...valid(), minimumJurorBondMochi: -1, bondBelowSpecApproved: true })).toThrow("nonnegative whole number");
   const withDeployment = { ...valid(), mochiToken: addr(25), minimumJurorBondMochi: 1000, bondBelowSpecApproved: true };
   expect(() => buildProductionRelease(withDeployment, { deployment: releaseDeployment({ minJurorBond: (2000n * 10n ** 18n).toString() }) })).toThrow("deployment.minJurorBond does not match");
   expect(buildProductionRelease(withDeployment, { deployment: releaseDeployment({ minJurorBond: (1000n * 10n ** 18n).toString() }) }).warnings.length).toBe(1);
@@ -243,4 +244,19 @@ test("chain 46630 is accepted only with an explicit rehearsal deployment, with i
   expect(() => buildProductionRelease(input, { deployment: releaseDeployment({ chainId: 46630, timelockDelay: "120" }) })).toThrow("chainId must be Robinhood Chain mainnet 4663");
   expect(() => buildProductionRelease({ ...valid(), mochiToken: addr(25) }, { deployment: rehearsal })).toThrow("deployment.chainId must be 4663");
   expect(buildProductionRelease({ ...valid(), mochiToken: addr(25) }, { deployment: releaseDeployment() }).network).toBe("Robinhood Chain mainnet (4663)");
+});
+
+
+test("zero-bond shared-control release prepares exact juror approvals and preserves delay", () => {
+  const deployment = { ...releaseDeployment({ minJurorBond: "0" }), guardian: addr(2), privacy: { entrypoint: addr(30) } };
+  const identities = identitiesFixture();
+  const plan = buildProductionRelease({ ...valid(), mochiToken: addr(25), usdg: addr(1), minimumJurorBondMochi: 0, roles: { ...valid().roles, guardian: addr(2) } }, { deployment, identities });
+  expect(plan.economics.minimumTotalJurorBondsMochi).toBe(0);
+  expect(plan.warnings.some(x => x.includes("not customer insurance"))).toBe(true);
+  const batch = (plan.reviewPayloads as any).configuration;
+  const abi = parseAbi(["function setUnbondedJuror(address key,address operator)"]);
+  const calls = batch.payloads.flatMap((data: `0x${string}`) => { try { return [decodeFunctionData({ abi, data })]; } catch { return []; } });
+  expect(calls.map((c: any) => c.args.map((a: string) => a.toLowerCase()))).toEqual(identities.jurors.map(j => [j.address.toLowerCase(), j.operator.toLowerCase()]));
+  expect(batch.delaySeconds).toBe(86400);
+  expect(() => buildProductionRelease({ ...valid(), mochiToken: addr(25), minimumJurorBondMochi: 0 }, { deployment: releaseDeployment({ minJurorBond: "1" }) })).toThrow("does not match");
 });

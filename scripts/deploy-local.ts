@@ -54,9 +54,9 @@ const VOTING_PERIOD = BigInt(args.get("--voting-period") ?? 3 * 86400);
 const EXECUTION_DELAY = BigInt(args.get("--execution-delay") ?? 86400);
 const TIMELOCK_DELAY = BigInt(args.get("--timelock-delay") ?? 86400);
 const SCHEMA_ACTIVATION_DELAY = BigInt(args.get("--schema-activation-delay") ?? 0);
-// Per-juror MOCHI bond (whole tokens, 18 decimals). The spec default is 25,000; the team's token supply may justify another value.
-const MIN_JUROR_BOND_MOCHI = args.get("--min-juror-bond") ?? "25000";
-if (!/^[1-9][0-9]{0,11}$/.test(MIN_JUROR_BOND_MOCHI)) throw new Error("--min-juror-bond must be a whole number of MOCHI from 1 to 999999999999");
+// New mainnet-style launches use approved team seats without deposits. Legacy local fixtures retain bonded mode.
+const MIN_JUROR_BOND_MOCHI = args.get("--min-juror-bond") ?? (mainnetMode ? "0" : "25000");
+if (!/^(0|[1-9][0-9]{0,11})$/.test(MIN_JUROR_BOND_MOCHI)) throw new Error("--min-juror-bond must be a whole number of MOCHI from 0 to 999999999999");
 const MIN_JUROR_BOND = BigInt(MIN_JUROR_BOND_MOCHI) * 10n ** 18n;
 if (mainnetMode && !rehearsal && TIMELOCK_DELAY !== 86400n) throw new Error("production mainnet requires --timelock-delay 86400");
 if (rehearsal && TIMELOCK_DELAY < 60n) throw new Error("--timelock-delay must be at least 60 seconds in a rehearsal");
@@ -369,7 +369,7 @@ async function main() {
 
   let mainnetRoles: Record<string, Record<string, Address[]>> | undefined;
   if (mainnetMode) {
-    // Pausing before governance handover ensures launch starts closed and the guardian remains independently fast.
+    // Pausing before governance handover ensures launch starts closed and the guardian role remains immediately usable.
     await call(queryEscrow, E, "pause", []);
     const proposers = [owner];
     const executors = [owner];

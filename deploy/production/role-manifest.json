@@ -1,26 +1,98 @@
 {
   "chainId": 4663,
   "governance": {
-    "owner": { "required": true, "purpose": "owner/multisig that owns the production timelock and proposes/executes operations" },
-    "guardian": { "required": true, "purpose": "independent fast pause authority; must not share owner custody" },
-    "distributionRecipient": { "required": false, "purpose": "team supply/distribution bookkeeping; not a required deploy-local address for externally supplied MOCHI" },
-    "feeTreasury": { "required": false, "purpose": "accounting decision outside current deploy-local and phala-batch roles; no automatic swap or residual purchase is configured" }
+    "owner": {
+      "required": true,
+      "purpose": "administrative wallet that proposes/executes delayed operations; also holds immediate emergency-pause authority at launch"
+    },
+    "guardian": {
+      "required": true,
+      "purpose": "immediate pause authority; use the same address as owner for the initial shared-control launch"
+    },
+    "distributionRecipient": {
+      "required": false,
+      "purpose": "team supply/distribution bookkeeping; not a required deploy-local address for externally supplied MOCHI"
+    },
+    "feeTreasury": {
+      "required": false,
+      "purpose": "accounting decision outside current deploy-local and phala-batch roles; no automatic swap or residual purchase is configured"
+    }
   },
   "serviceRoles": {
-    "attestor": { "required": true, "contractRole": "ATTESTOR_ROLE on JurorRegistry", "service": "services/attestor", "env": ["ATTESTOR_KEY", "ADMIN_TOKEN"] },
-    "feedRunner": { "required": true, "contractRole": "FEED_RUNNER_ROLE on QueryEscrow and PanelEscalation", "service": "services/orchestrator/feed runner", "env": ["FEED_RUNNER_KEY"] },
-    "orchestrator": { "required": true, "contractRole": "FEED_RUNNER_ROLE on QueryEscrow and PanelEscalation", "service": "services/orchestrator", "env": ["ORCHESTRATOR_KEY"] },
-    "indexer": { "required": true, "contractRole": "ANCHORER_ROLE on ReceiptAnchor (assigned by buildPhalaBatch)", "service": "services/indexer", "env": ["ANCHORER_KEY"] },
-    "postman": { "required": true, "contractRole": "ASP_POSTMAN_ROLE on privacy Entrypoint", "service": "privacy relayer/postman", "env": ["POSTMAN_KEY"] }
+    "attestor": {
+      "required": true,
+      "contractRole": "ATTESTOR_ROLE on JurorRegistry",
+      "service": "services/attestor",
+      "env": [
+        "ATTESTOR_KEY",
+        "ADMIN_TOKEN"
+      ]
+    },
+    "feedRunner": {
+      "required": true,
+      "contractRole": "FEED_RUNNER_ROLE on QueryEscrow and PanelEscalation",
+      "service": "services/orchestrator/feed runner",
+      "env": [
+        "FEED_RUNNER_KEY"
+      ]
+    },
+    "orchestrator": {
+      "required": true,
+      "contractRole": "FEED_RUNNER_ROLE on QueryEscrow and PanelEscalation",
+      "service": "services/orchestrator",
+      "env": [
+        "ORCHESTRATOR_KEY"
+      ]
+    },
+    "indexer": {
+      "required": true,
+      "contractRole": "ANCHORER_ROLE on ReceiptAnchor (assigned by buildPhalaBatch)",
+      "service": "services/indexer",
+      "env": [
+        "ANCHORER_KEY"
+      ]
+    },
+    "postman": {
+      "required": true,
+      "contractRole": "ASP_POSTMAN_ROLE on privacy Entrypoint",
+      "service": "privacy relayer/postman",
+      "env": [
+        "POSTMAN_KEY"
+      ]
+    }
   },
   "identityRoles": {
-    "intake": { "count": 1, "jurorRegistryRole": 2, "operatorRequired": true, "freshMeasurementRequired": true },
-    "consensus": { "count": 1, "jurorRegistryRole": 3, "operatorRequired": true, "freshMeasurementRequired": true },
-    "juror": { "count": 9, "jurorRegistryRole": 1, "classCounts": [2, 2, 2, 1, 2], "minimumBondEachMochi": 25000, "operatorRequired": true, "freshMeasurementRequired": true }
+    "intake": {
+      "count": 1,
+      "jurorRegistryRole": 2,
+      "operatorRequired": true,
+      "freshMeasurementRequired": true
+    },
+    "consensus": {
+      "count": 1,
+      "jurorRegistryRole": 3,
+      "operatorRequired": true,
+      "freshMeasurementRequired": true
+    },
+    "juror": {
+      "count": 9,
+      "jurorRegistryRole": 1,
+      "classCounts": [
+        2,
+        2,
+        2,
+        1,
+        2
+      ],
+      "minimumBondEachMochi": 0,
+      "operatorRequired": true,
+      "freshMeasurementRequired": true,
+      "admission": "each juror key/operator explicitly approved through the timelock; no deposit or customer insurance"
+    }
   },
   "constraints": [
     "Every required role wallet and enclave key must be a real, reviewed address/key; this manifest contains no fabricated production identities.",
-    "Owner and guardian require independent custody. Service signers must be distinct from owner custody; optional distribution and fee accounting destinations can share addresses unless the team's policy requires separation.",
+    "Owner and guardian may share one control wallet; compromise or loss affects both powers. Service signers and deployer remain separate from that wallet. Reopening and administrative changes still use the timelock.",
     "The external MOCHI CA is supplied by the team. Production deployment uses --mochi-token and never deploys a MOCHI token.",
     "Feed runner key and orchestrator key are separate signers in current orchestrator configuration. Indexer ANCHORER_KEY is optional in code, but mandatory for the stated separate indexer role if it submits anchors."
   ]

@@ -34,7 +34,7 @@ export function productionChainId(deployment: DeploymentLike): 4663 | 46630 {
 export function deploymentMinJurorBond(deployment: DeploymentLike): bigint {
   const value = deployment?.minJurorBond;
   if (value === undefined) return DEFAULT_MIN_JUROR_BOND;
-  if (typeof value !== "string" || !/^[1-9][0-9]{0,40}$/.test(value)) throw new Error("deployment.minJurorBond must be a positive integer string");
+  if (typeof value !== "string" || !/^(0|[1-9][0-9]{0,40})$/.test(value)) throw new Error("deployment.minJurorBond must be a nonnegative integer string");
   return BigInt(value);
 }
 

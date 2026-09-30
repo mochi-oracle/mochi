@@ -26,7 +26,7 @@ export async function prepareProductionEnrollment(options: {
   if (!Array.isArray(configured) || configured.length !== 9) throw new Error("identity input must contain exactly nine jurors");
   const keys = new Set<string>();
   const transactions: Array<{ to: Address; data: Hex; value: "0"; purpose: string }> = [];
-  transactions.push({ to: token, data: encodeFunctionData({ abi: MOCHI_ABI, functionName: "approve", args: [registry, BOND * 9n] }), value: "0", purpose: `approve exactly nine minimum juror bonds (${BOND * 9n} MOCHI wei)` });
+  if (BOND > 0n) transactions.push({ to: token, data: encodeFunctionData({ abi: MOCHI_ABI, functionName: "approve", args: [registry, BOND * 9n] }), value: "0", purpose: `approve exactly nine minimum juror bonds (${BOND * 9n} MOCHI wei)` });
   for (let i = 0; i < 9; i += 1) {
     const proof = items[i] as Proof;
     const [expectedIndex, jurorClass] = ROSTER[i]!;

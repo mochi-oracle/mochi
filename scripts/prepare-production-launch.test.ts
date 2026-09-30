@@ -165,3 +165,13 @@ test("a testnet rehearsal deployment keeps its flag, delay and bond through to t
   expect((mainnet.runtime.deployment as any).rehearsal).toBeUndefined();
   await expect(build({ deployment: { ...deployment(), chainId: 46630 } })).rejects.toThrow("explicit testnet rehearsal");
 });
+
+
+test("shared owner/guardian and team-operated zero bonds survive preparation and runtime validation", async () => {
+  const prepared = await build({ deployment: { ...deployment(), guardian: address(201), minJurorBond: "0" } });
+  expect(prepared.releaseInput.minimumJurorBondMochi).toBe(0);
+  expect(prepared.releaseInput.bondBelowSpecApproved).toBe(false);
+  expect(() => validateLaunchConfig(prepared.runtime)).not.toThrow();
+  prepared.runtime.serviceRoleAddresses.postman = address(201);
+  expect(() => validateLaunchConfig(prepared.runtime)).toThrow("distinct from external owner and guardian");
+});
