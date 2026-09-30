@@ -14,12 +14,12 @@ import {
   type Abi, type Address, type Hex,
 } from "viem";
 import * as A from "@mochi/chain";
-import { productionChainRule } from "../deploy/production/chain-policy.ts";
+import { productionChainRule, productionTimelockDelay, validateTimelockDelay } from "../deploy/production/chain-policy.ts";
 
 export type Step = { id: string; kind: "timelock-schedule" | "timelock-execute" | "transaction"; to: Address; data: Hex; title: string; details: string[]; operationId?: Hex; file: string };
 export type StepStatus = "unscheduled" | "pending" | "ready" | "done" | "unknown" | "unavailable";
 export type ChainReader = { operationTimestamp(timelock: Address, id: Hex): Promise<bigint>; latestTimestamp(): Promise<bigint> };
-type Deployment = { chainId: number; rehearsal?: boolean; rpcUrl?: string; owner?: Address; contracts: Record<string, Address>; privacy?: Record<string, Address> };
+type Deployment = { chainId: number; rehearsal?: boolean; timelockDelay?: string | number; rpcUrl?: string; owner?: Address; contracts: Record<string, Address>; privacy?: Record<string, Address> };
 
 const TIMELOCK_ABI = parseAbi([
   "function schedule(address target,uint256 value,bytes data,bytes32 predecessor,bytes32 salt,uint256 delay)",
@@ -42,6 +42,7 @@ export function loadDeployment(raw: unknown): Deployment {
   if (!d || typeof d !== "object" || !d.contracts || typeof d.contracts !== "object") fail("deployment JSON must contain contracts");
   if (productionChainRule(d) === undefined) fail("deployment must be Robinhood Chain mainnet 4663, or a testnet rehearsal on 46630 with rehearsal=true");
   if (!d.contracts.timelock || !isAddress(d.contracts.timelock)) fail("deployment has no timelock address");
+  productionTimelockDelay(d);
   return d;
 }
 
@@ -74,6 +75,7 @@ export function describeCall(d: Deployment, target: Address, data: Hex): string 
   let decoded: { functionName: string; args?: readonly unknown[] };
   try { decoded = decimals === undefined ? decodeFunctionData({ abi: PROJECT_ABI, data }) : decodeFunctionData({ abi: ERC20_ABI, data }); }
   catch { fail(`cannot decode call to ${name}; refusing to show an unexplained transaction`); }
+  if (target.toLowerCase() === d.contracts.timelock?.toLowerCase() && decoded.functionName === "updateDelay") validateTimelockDelay(String(decoded.args?.[0]));
   const args = (decoded.args ?? []).map((arg) => {
     if (typeof arg === "string" && isAddress(arg)) return names.has(arg.toLowerCase()) ? `${arg} (${names.get(arg.toLowerCase())})` : arg;
     return show(arg, decimals);
@@ -89,6 +91,10 @@ const hashSingle = (target: Address, value: bigint, data: Hex, predecessor: Hex,
 /** Normalise one batch file into steps, verifying every internal hash and decoding every inner call. */
 export function loadSteps(d: Deployment, raw: unknown, file: string, prefix: string): Step[] {
   const timelock = d.contracts.timelock!;
+  const expectedDelay = productionTimelockDelay(d);
+  const checkDelay = (delay: bigint) => {
+    if (validateTimelockDelay(delay.toString()) !== expectedDelay) fail(`${file}: schedule delay does not match deployment (${expectedDelay} seconds)`);
+  };
   const b = raw as Record<string, any>;
   if (!b || typeof b !== "object") fail(`${file}: not a JSON object`);
   if (Array.isArray(b.transactions)) {
@@ -117,6 +123,7 @@ export function loadSteps(d: Deployment, raw: unknown, file: string, prefix: str
     if (values.some((v) => v !== 0n)) fail(`${file}: batch sends value`);
     operationId = hashBatch(targets, values, payloads, predecessor, salt);
     targets.forEach((t, i) => details.push(describeCall(d, t, payloads[i]!)));
+    if (delay !== undefined) checkDelay(delay);
     if (delay !== undefined) details.push(`Waiting period after scheduling: ${delay} seconds`);
   } else {
     const [target, value, data, predecessor, salt, delay] = decoded.args as [Address, bigint, Hex, Hex, Hex, bigint?];
@@ -125,6 +132,7 @@ export function loadSteps(d: Deployment, raw: unknown, file: string, prefix: str
     if (b.salt && String(b.salt).toLowerCase() !== salt.toLowerCase()) fail(`${file}: calldata salt does not match the file`);
     operationId = hashSingle(target, value, data, predecessor, salt);
     details.push(describeCall(d, target, data));
+    if (delay !== undefined) checkDelay(delay);
     if (delay !== undefined) details.push(`Waiting period after scheduling: ${delay} seconds`);
   }
   if (b.operationId && String(b.operationId).toLowerCase() !== operationId.toLowerCase()) fail(`${file}: operationId does not match the calldata`);

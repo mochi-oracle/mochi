@@ -16,7 +16,7 @@ Feeds fail closed: no verdict, no update, never a stale "yes". Jurors are paid t
 contracts (RHC)
 ├─ MochiToken           (ERC20 + permit; fixed supply; timelocked display-metadata changes)
 ├─ JurorRegistry      (enclave keys by role JUROR/INTAKE/CONSENSUS; measurement allow-list; attestedUntil; bond $MOCHI; one class per juror; selection; slashing)
-├─ SchemaRegistry     (task schemas; versioned; governor behind 24h timelock; clerk voting (staked $MOCHI) proposes through the timelock)
+├─ SchemaRegistry     (task schemas; versioned; governor behind short timelock (default 60 seconds); clerk voting (staked $MOCHI) proposes through the timelock)
 ├─ QueryEscrow        (query lifecycle open → seal → settle/expire; pricing; USDG / shielded / Anonyma-voucher / feed-budget payment paths)
 ├─ MochiVerdicts     (verifies selected-juror signatures + consensus-enclave attestation; stores verdicts; equivocation slashing)
 ├─ Feeds              (named feeds → latest payload per key; origin allow-list; on-chain crosscheck hook; contract-consumer subscriptions)
@@ -118,7 +118,7 @@ struct Verdict { bytes32 queryId; uint8 round; bytes32 docCommit; uint32 schemaI
 `enroll(key, measurement, class, bond)` by operator (JUROR role; initial team-operated launch uses zero bond and governor approval of the exact key/operator; positive-bond deployments enforce their configured minimum); INTAKE/CONSENSUS keys registered by governor. `refreshAttestation(keys[], until)` by ATTESTOR (every 10 min). `isActive(key, role)` = enrolled ∧ ¬delisted ∧ attestedUntil ≥ now ∧ measurement allowed ∧ ¬exiting. Measurements allowed by governor (timelocked). Exit: `requestExit` → 7 days → `withdrawBond`. Slashing to `slashSink`: failed re-attestation while serving 5% (ATTESTOR), equivocation (two answer hashes for one query/round) 100% + delist (anyone, via `MochiVerdicts.reportEquivocation`), timeout rate > 5% over ≥ 20 served: 1%/day (anyone).
 
 ### 4.2 `SchemaRegistry.sol`
-`propose(schemaId, schemaJsonHash, promptHash, tolerancesHash, crosscheckHash)` → activates after 24h timelock; versioned; old versions stay valid for verification; `isActive(schemaId, version)`, `latest(schemaId)`. Governor = the timelock; clerk voting (staked $MOCHI, snapshot voting power) proposes schema and class-mix changes.
+`propose(schemaId, schemaJsonHash, promptHash, tolerancesHash, crosscheckHash)` → activates after the registry’s configured activation delay (deployment default zero); governance submission uses the recorded short timelock; versioned; old versions stay valid for verification; `isActive(schemaId, version)`, `latest(schemaId)`. Governor = the timelock; clerk voting (staked $MOCHI, snapshot voting power) proposes schema and class-mix changes.
 
 ### 4.3 `QueryEscrow.sol`
 - Pricing: `quote(schemaId, n, tokensK)` = Σ over the class mix of `(classBase[c] + classPerK[c] · tokensK)` + `protocolFee` (= max(minProtocolFee, jurorFees · protocolFeeBps / 10000)). Class prices are set by governor from measured GPU-TEE cost + margin. The "from $0.05" headline applies to short documents (issuer notices) at N=3.
@@ -143,7 +143,7 @@ Stake/unstake $MOCHI (7-day cooldown); `notifyReward(usdg)` from escrow and feed
 ERC20 + ERC20Permit, 18 decimals, fixed supply minted once to the distribution address. The display name/symbol can be changed only through the timelock (`setMetadata`); balances and the permit domain never change.
 
 ### 4.9 Deploy / OPSEC
-Fresh deployer; OZ `TimelockController` (24h) owned by the protocol owner holds GOVERNOR on every contract (measurements, schemas, prices, feeds); guardian pause = new queries only (feeds keep last verdict; payouts continue).
+Fresh deployer; OZ `TimelockController` (default 60 seconds; deployment tooling permits 0–3600 seconds) owned by the protocol owner holds GOVERNOR on every contract (measurements, schemas, prices, feeds); guardian pause = new queries only (feeds keep last verdict; payouts continue).
 
 ---
 
@@ -223,3 +223,5 @@ SDK (TS/Solidity): mochi.ask(), mochi.verify(receipt), IFeeds.latest(feedId, key
 | Panel | 3 staked, random; commit-reveal; appeal; slash 10% on reversal |
 | Receipt | Verifies with Anonyma's verifier logic + anchor proof |
 | Load | 200-ticker corp-actions run completes daily under 30 min with N=3; earnings verdict p95 < 120s with N=7 |
+
+An active enclave restart tolerates expired attestations only after all other reviewed registry eligibility checks pass. The attestor checks immediately and retries failed checks after 15 seconds before returning to its 600-second interval; attestation validity is 1200 seconds. Valid quotes and successful refresh transactions remain required. Prepare/enroll still require paused escrow. See [WAIT-WINDOWS.md](WAIT-WINDOWS.md) for the separate unchanged protocol waits.

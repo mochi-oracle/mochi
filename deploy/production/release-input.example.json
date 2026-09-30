@@ -14,7 +14,7 @@
     "indexer": null,
     "postman": null
   },
-  "timelockDelaySeconds": 86400,
+  "timelockDelaySeconds": 60,
   "jurorCount": 9,
   "jurorClassCounts": [
     2,

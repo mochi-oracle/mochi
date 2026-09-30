@@ -6,6 +6,8 @@ Railway accepts `MOCHI_WEB_CONFIG_JSON` directly, so activation no longer needs 
 
 Keep `MOCHI_WEB_CONFIG_JSON={"enabled":false}` until the production protocol and bounded paid canary pass. This is also the website rollback setting. It hides paid checkout, but **does not pause contracts or cancel already-open reviews**. The control wallet holding the guardian role must pause QueryEscrow for a protocol incident. Keep recovery and settlement services available for existing reviews.
 
+New deployment timelocks default to 60 seconds, with tooling limited to 0–3600 seconds. Active enclave restarts can refresh expired attestations without a governance pause/unpause when all other reviewed registry eligibility checks pass. Prepare and enroll still require paused escrow; an actual pause must be reopened through the recorded timelock delay. Keep checkout disabled until service and payment checks pass.
+
 After activation, set these existing server-only variables to the verified production HTTPS endpoints: `MOCHI_GATEWAY_URL`, `MOCHI_INDEXER_URL`, and `RPC_URL`. Provider RPC paths may contain credentials; never put them in the public config. Then set the public config using actual deployment and enclave values:
 
 ```json

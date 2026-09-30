@@ -10,7 +10,7 @@ const valid = (): ReleaseInput => ({
   mochiToken: null,
   usdg: addr(1),
   roles: { owner: addr(2), guardian: addr(3), tokenRecipient: addr(4), feeTreasury: addr(5), attestor: addr(6), feedRunner: addr(7), orchestrator: addr(8), indexer: addr(9), postman: addr(10) },
-  timelockDelaySeconds: 86400,
+  timelockDelaySeconds: 60,
   jurorCount: 9,
   jurorClassCounts: [2, 2, 2, 1, 2],
   minimumJurorBondMochi: 25000,
@@ -38,10 +38,10 @@ test("rejects role collisions and incomplete or invalid role addresses", () => {
   expect(buildProductionRelease({ ...valid(), roles: { ...valid().roles, indexer: null } }).blockers.some((b) => b.includes("roles.indexer"))).toBe(true);
 });
 
-test("rejects invalid launch counts, bond and too-short timelock", () => {
+test("rejects invalid launch counts, bond and mismatched timelock", () => {
   expect(() => buildProductionRelease({ ...valid(), jurorClassCounts: [3, 2, 2, 1, 1] })).toThrow("class counts 2/2/2/1/2");
   expect(() => buildProductionRelease({ ...valid(), minimumJurorBondMochi: 20000 })).toThrow("at least 25000");
-  expect(() => buildProductionRelease({ ...valid(), timelockDelaySeconds: 172800 })).toThrow("86400 to match");
+  expect(() => buildProductionRelease({ ...valid(), timelockDelaySeconds: 172800 })).toThrow("60 to match");
 });
 
 test("activation phase is ordered after execution, enrollment and service readiness", () => {
@@ -76,13 +76,13 @@ test("offline no-CA fixture creates separate configure and activation review pay
   const activate = plan.reviewPayloads.activation as unknown as { callCount: number; payloads: Hex[]; targets: Address[]; delaySeconds: number };
   const configureExecution = plan.reviewPayloads.configurationExecution as unknown as { operationId: Hex; action: string };
   expect(configure.callCount).toBeGreaterThan(1);
-  expect(configure.delaySeconds).toBe(86400);
+  expect(configure.delaySeconds).toBe(60);
   expect(configureExecution).toBeTruthy();
   expect(configureExecution.action).toBe("execute");
   expect(configureExecution.operationId).toBe((plan.reviewPayloads.configuration as unknown as { operationId: Hex }).operationId);
   expect(configure.payloads).not.toContain(encodeFunctionData({ abi: parseAbi(["function unpause()"]), functionName: "unpause" }));
   expect(activate.callCount).toBe(1);
-  expect(activate.delaySeconds).toBe(86400);
+  expect(activate.delaySeconds).toBe(60);
   expect(decodeFunctionData({ abi: parseAbi(["function unpause()"]), data: activate.payloads[0]! }).functionName).toBe("unpause");
   expect(activate.targets[0]).toBe(deployment.contracts.queryEscrow);
   expect(plan.safety).toMatchObject({ transactionsSent: false, tokenCreated: false, mainnetExecutionEnabled: false });
@@ -240,7 +240,7 @@ test("chain 46630 is accepted only with an explicit rehearsal deployment, with i
   const plan = buildProductionRelease(input, { deployment: rehearsal });
   expect(plan.network).toContain("REHEARSAL");
   expect(plan.warnings.some((w) => w.includes("nothing in this plan applies to mainnet"))).toBe(true);
-  expect(() => buildProductionRelease({ ...input, timelockDelaySeconds: 86400 }, { deployment: rehearsal })).toThrow("must be 120");
+  expect(() => buildProductionRelease({ ...input, timelockDelaySeconds: 60 }, { deployment: rehearsal })).toThrow("must be 120");
   expect(() => buildProductionRelease(input, { deployment: releaseDeployment({ chainId: 46630, timelockDelay: "120" }) })).toThrow("chainId must be Robinhood Chain mainnet 4663");
   expect(() => buildProductionRelease({ ...valid(), mochiToken: addr(25) }, { deployment: rehearsal })).toThrow("deployment.chainId must be 4663");
   expect(buildProductionRelease({ ...valid(), mochiToken: addr(25) }, { deployment: releaseDeployment() }).network).toBe("Robinhood Chain mainnet (4663)");
@@ -257,6 +257,6 @@ test("zero-bond shared-control release prepares exact juror approvals and preser
   const abi = parseAbi(["function setUnbondedJuror(address key,address operator)"]);
   const calls = batch.payloads.flatMap((data: `0x${string}`) => { try { return [decodeFunctionData({ abi, data })]; } catch { return []; } });
   expect(calls.map((c: any) => c.args.map((a: string) => a.toLowerCase()))).toEqual(identities.jurors.map(j => [j.address.toLowerCase(), j.operator.toLowerCase()]));
-  expect(batch.delaySeconds).toBe(86400);
+  expect(batch.delaySeconds).toBe(60);
   expect(() => buildProductionRelease({ ...valid(), mochiToken: addr(25), minimumJurorBondMochi: 0 }, { deployment: releaseDeployment({ minJurorBond: "1" }) })).toThrow("does not match");
 });

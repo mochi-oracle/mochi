@@ -2,6 +2,7 @@
 // Usage: anvil &  then  bun scripts/deploy-local.ts [--rpc http://127.0.0.1:8545] [--out deployments/local.json]
 // Local-only simplifications: the deployer is admin/governor (no TimelockController), schema activation delay is 0,
 // and the mock USDG / mock shielded pool are used. Production deploys go through the timelocked multisig.
+import { productionTimelockDelay } from "../deploy/production/chain-policy.ts";
 import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname } from "node:path";
@@ -52,14 +53,12 @@ const keyFile = args.get("--key-file");
 // Governance timings (seconds). Production defaults; testnet runs pass short values to exercise the full path.
 const VOTING_PERIOD = BigInt(args.get("--voting-period") ?? 3 * 86400);
 const EXECUTION_DELAY = BigInt(args.get("--execution-delay") ?? 86400);
-const TIMELOCK_DELAY = BigInt(args.get("--timelock-delay") ?? 86400);
+const TIMELOCK_DELAY = BigInt(productionTimelockDelay({ timelockDelay: args.get("--timelock-delay") }));
 const SCHEMA_ACTIVATION_DELAY = BigInt(args.get("--schema-activation-delay") ?? 0);
 // New mainnet-style launches use approved team seats without deposits. Legacy local fixtures retain bonded mode.
 const MIN_JUROR_BOND_MOCHI = args.get("--min-juror-bond") ?? (mainnetMode ? "0" : "25000");
 if (!/^(0|[1-9][0-9]{0,11})$/.test(MIN_JUROR_BOND_MOCHI)) throw new Error("--min-juror-bond must be a whole number of MOCHI from 0 to 999999999999");
 const MIN_JUROR_BOND = BigInt(MIN_JUROR_BOND_MOCHI) * 10n ** 18n;
-if (mainnetMode && !rehearsal && TIMELOCK_DELAY !== 86400n) throw new Error("production mainnet requires --timelock-delay 86400");
-if (rehearsal && TIMELOCK_DELAY < 60n) throw new Error("--timelock-delay must be at least 60 seconds in a rehearsal");
 const configuredOwner = args.get("--owner") as Address | undefined;
 const configuredUsdg = args.get("--usdg") as Address | undefined;
 const configuredMochiToken = args.get("--mochi-token");

@@ -21,7 +21,7 @@ const ROOT = resolve(import.meta.dir, "..");
 const MNEMONIC = "test test test test test test test test test test test junk";
 const FIXTURE_DEPLOYER_KEY = "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80";
 const accountAt = (index: number) => mnemonicToAccount(MNEMONIC, { addressIndex: index });
-const delay = 86_400n;
+const delay = 60n;
 const unexpectedStateSelector = keccak256(toHex("TimelockUnexpectedOperationState(bytes32,bytes32)")).slice(0, 10);
 const accessAbi = parseAbi([
   "function hasRole(bytes32 role,address account) view returns (bool)",
@@ -90,12 +90,14 @@ async function main() {
     const env = { PATH: process.env.PATH };
     const deploy = start("bun", ["scripts/deploy-local.ts", "--mainnet", "--rehearsal", "--rpc", rpc, "--key-file", keyPath, "--out", deploymentPath,
       "--owner", owner.address, "--guardian", guardian.address, "--usdg", usdgReceipt.contractAddress!,
-      "--shielded", "privacy-pools", "--randomness", "drand", "--timelock-delay", "86400", "--yes"], { cwd: ROOT, env });
+      "--shielded", "privacy-pools", "--randomness", "drand", "--yes"], { cwd: ROOT, env });
     const deployed = await collect(deploy);
     assert(deployed.code === 0, `deploy-local rehearsal failed (exit ${deployed.code}):\n${deployed.output}`);
-    const deployment = JSON.parse(await Bun.file(deploymentPath).text()) as { chainId: number; paused: boolean; minJurorBond: string; contracts: Record<string, Address>; privacy?: { entrypoint: Address } };
+    const deployment = JSON.parse(await Bun.file(deploymentPath).text()) as { chainId: number; paused: boolean; minJurorBond: string; timelockDelay: string; contracts: Record<string, Address>; privacy?: { entrypoint: Address } };
     assert(deployment.chainId === 46630 && deployment.paused === true, "deployment metadata must describe paused chainId 46630 rehearsal");
     const { contracts } = deployment;
+    assert(deployment.timelockDelay === "60", "new deployments must record the default 60-second delay");
+    assert(await publicClient.readContract({ address: contracts.timelock!, abi: parseAbi(["function getMinDelay() view returns (uint256)"]), functionName: "getMinDelay" }) === delay, "deployed timelock must honour the default delay");
     assert(await publicClient.readContract({ address: contracts.queryEscrow!, abi: accessAbi, functionName: "paused" }), "QueryEscrow must start paused");
 
     // A rehearsal may stand in an external token, but deploy-local must refuse one with no contract code; no request leaves loopback.
@@ -118,7 +120,7 @@ async function main() {
       indexer: accountAt(18).address, postman: accountAt(19).address,
     };
     assert(deployment.privacy?.entrypoint, "mainnet rehearsal deployment must include its real privacy entrypoint");
-    const deploymentForBatch = { minJurorBond: deployment.minJurorBond, contracts: { timelock: contracts.timelock!, jurorRegistry: contracts.jurorRegistry!,
+    const deploymentForBatch = { timelockDelay: deployment.timelockDelay, minJurorBond: deployment.minJurorBond, contracts: { timelock: contracts.timelock!, jurorRegistry: contracts.jurorRegistry!,
       queryEscrow: contracts.queryEscrow!, receiptAnchor: contracts.receiptAnchor!, panel: contracts.panel! }, privacy: deployment.privacy };
     const configureSchedule = buildPhalaBatch(deploymentForBatch, input, "schedule", "configure");
     const configureExecute = buildPhalaBatch(deploymentForBatch, input, "execute", "configure");
@@ -186,8 +188,8 @@ async function main() {
     console.log(JSON.stringify({
       result: "passed", rpc, chainId: 46630, deploymentMode: "mainnet rehearsal", deployer: deployer.address,
       owner: owner.address, guardian: guardian.address, mochiSource: "test-deployment (local fixture only)",
-      usdg: "MockUSDG", initialPaused: true, configure: { callCount: configureSchedule.callCount, earlyExecutionReverted: true, earlyRevert: "TimelockUnexpectedOperationState", executedAfterSeconds: "86400", pausedAfterConfigure: true, attestorRoleAssigned: true, feedRunnerRoleAssigned: true },
-      activation: { callCount: activation.callCount, earlyExecutionReverted: true, earlyRevert: "TimelockUnexpectedOperationState", executedAfterSeconds: "86400", unpausedAfterExecution: true, guardianPauseAfterActivation: true },
+      usdg: "MockUSDG", initialPaused: true, configure: { callCount: configureSchedule.callCount, earlyExecutionReverted: true, earlyRevert: "TimelockUnexpectedOperationState", executedAfterSeconds: "60", pausedAfterConfigure: true, attestorRoleAssigned: true, feedRunnerRoleAssigned: true },
+      activation: { callCount: activation.callCount, earlyExecutionReverted: true, earlyRevert: "TimelockUnexpectedOperationState", executedAfterSeconds: "60", unpausedAfterExecution: true, guardianPauseAfterActivation: true },
       jurorFixture: "nine locally approved and attested zero-bond jurors; activation CLI refused before enrollment and passed afterward; no payment or real service health claimed",
       limitation: "this local run deploys the test token; the external-token path is exercised by a testnet dress rehearsal (chain 46630, --mochi-token stand-in) and on mainnet",
     }, null, 2));

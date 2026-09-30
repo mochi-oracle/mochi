@@ -39,7 +39,7 @@ SchemaRegistry and ClassMix plus LOCKER on MochiStaking to ClerkVoting, and FEED
 runner and orchestrator. The local admin/deployer retains DEFAULT_ADMIN and governor powers.
 
 The documented production design is a fresh deployer followed by a 2-of-3 multisig controlling an OZ timelock with a
-24-hour delay. The timelock is intended to hold DEFAULT_ADMIN/GOVERNOR on the governed contracts. The deployed
+60-second default delay; deployment and launch tooling accepts only 0–3600 seconds. The timelock is intended to hold DEFAULT_ADMIN/GOVERNOR on the governed contracts. The deployed
 operations identities are expected to be separate: attestor, feed runner, orchestrator/anchorer, Anonyma signer,
 juror operators, and evaluator accounts. The repository script accepts one key file and reuses it for its operational
 identities; this is a local/test convenience and must not be treated as production key separation. Confirm the actual
@@ -149,3 +149,5 @@ contributed five passing invariants (three staking and two escrow/verdict proper
    ticket/round timing under sequencer manipulation.
 10. Cross-contract external calls and mutable address wiring: reentrancy, malicious/replaced token or adapter,
     fee-on-transfer assumptions, and atomic rollback when downstream settlement or governance execution fails.
+
+Active runtime restart permits expired attestations only when operator, measurement, role, class, exit/delisting, measurement approval and configured/on-chain bond or exact zero-bond team approval checks pass. The attestor checks immediately and retries failed checks after 15 seconds; valid quote verification and chain refresh remain required. Prepare/enroll still require paused escrow. This does not change the separate panel, voting, withdrawal or schema windows documented in `docs/WAIT-WINDOWS.md`.

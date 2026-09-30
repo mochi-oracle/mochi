@@ -1,3 +1,6 @@
+import { buildProductionRelease, type ReleaseInput } from "./production-release.ts";
+import { loadDeployment, loadSteps } from "./owner-console.ts";
+import { productionTimelockDelay } from "../deploy/production/chain-policy.ts";
 import { afterEach, expect, test } from "bun:test";
 import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -160,8 +163,8 @@ test("a testnet rehearsal deployment keeps its flag, delay and bond through to t
   expect(prepared.releaseInput.minimumJurorBondMochi).toBe(1000);
   expect(prepared.releaseInput.bondBelowSpecApproved).toBe(true);
   expect(prepared.website.chainId).toBe(46630);
-  const mainnet = await build({ deployment: { ...deployment(), timelockDelay: "86400", minJurorBond: (25_000n * 10n ** 18n).toString() } });
-  expect(mainnet.releaseInput.timelockDelaySeconds).toBe(86400);
+  const mainnet = await build({ deployment: { ...deployment(), timelockDelay: "60", minJurorBond: (25_000n * 10n ** 18n).toString() } });
+  expect(mainnet.releaseInput.timelockDelaySeconds).toBe(60);
   expect((mainnet.runtime.deployment as any).rehearsal).toBeUndefined();
   await expect(build({ deployment: { ...deployment(), chainId: 46630 } })).rejects.toThrow("explicit testnet rehearsal");
 });
@@ -174,4 +177,22 @@ test("shared owner/guardian and team-operated zero bonds survive preparation and
   expect(() => validateLaunchConfig(prepared.runtime)).not.toThrow();
   prepared.runtime.serviceRoleAddresses.postman = address(201);
   expect(() => validateLaunchConfig(prepared.runtime)).toThrow("distinct from external owner and guardian");
+});
+
+
+test("recorded mainnet delays reach release input, both schedule batches and owner console", async () => {
+  expect(productionTimelockDelay({ chainId: 4663 })).toBe(60);
+  for (const delay of [0, 60, 120, 3600]) {
+    const deployed = { ...deployment(), timelockDelay: String(delay), minJurorBond: "0" };
+    const prepared = await build({ deployment: deployed });
+    expect(prepared.releaseInput.timelockDelaySeconds).toBe(delay);
+    const plan = buildProductionRelease(prepared.releaseInput as ReleaseInput, { deployment: deployed, identities: prepared.identities });
+    for (const batch of [plan.reviewPayloads.configuration, plan.reviewPayloads.activation]) {
+      expect(batch).toMatchObject({ delaySeconds: delay });
+      expect(loadSteps(loadDeployment(deployed), batch, "schedule.json", "schedule")[0]!.details.at(-1)).toBe(`Waiting period after scheduling: ${delay} seconds`);
+    }
+    expect(plan.phases.find(p => p.id === "configure")!.then).toContain(`${delay}-second delay`);
+  }
+  for (const chainId of [4663, 46630, 31337]) expect(() => productionTimelockDelay({ chainId, timelockDelay: "3601" })).toThrow("0 to 3600");
+  await expect(build({ deployment: { ...deployment(), timelockDelay: "3601" } })).rejects.toThrow("0 to 3600");
 });

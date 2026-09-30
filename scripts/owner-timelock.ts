@@ -1,10 +1,11 @@
+import { productionTimelockDelay, validateTimelockDelay } from "../deploy/production/chain-policy.ts";
 import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { createPublicClient, createWalletClient, encodeAbiParameters, encodeFunctionData, http, keccak256, parseAbiItem, toHex, type Abi, type Address, type Hex } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
 import { chainFor } from "@mochi/chain";
 
-type Deployment = { chainId: number; rpcUrl: string; startBlock: string; owner?: Address; contracts: Record<string, Address>; rehearsal?: boolean };
+type Deployment = { chainId: number; rpcUrl: string; startBlock: string; owner?: Address; contracts: Record<string, Address>; rehearsal?: boolean; timelockDelay?: string | number };
 const [action, deploymentPath, ...rest] = process.argv.slice(2);
 if (!action || !deploymentPath || !["schedule", "execute", "unpause", "set-measurement", "grant-role"].includes(action)) {
   throw new Error("usage: bun scripts/owner-timelock.ts schedule|execute|unpause|set-measurement|grant-role <deployment.json> ... [--key-file path]");
@@ -52,10 +53,12 @@ const item = parseAbiItem(`function ${signature}`) as Extract<Abi[number], { typ
 const inputParams = item.inputs;
 if (inputParams.length !== fnArgs.length) throw new Error(`${signature} expects ${inputParams.length} arguments, got ${fnArgs.length}`);
 if (action === "schedule" || action === "execute") fnArgs = fnArgs.map((v, i) => parseValue(String(v), inputParams[i]!.type));
+if (target.toLowerCase() === targetTimelock.toLowerCase() && item.name === "updateDelay") validateTimelockDelay(String(fnArgs[0]));
 const data = encodeFunctionData({ abi: [item], functionName: item.name, args: fnArgs as never });
 const predecessor = "0x" + "00".repeat(32) as Hex;
 const salt = requestedSalt ?? keccak256(toHex(`${target.toLowerCase()}:${data.toLowerCase()}`));
 const delay = await pub.readContract({ address: targetTimelock, abi: delayAbi, functionName: "getMinDelay" });
+if (validateTimelockDelay(delay.toString()) !== productionTimelockDelay(deployment)) throw new Error("on-chain timelock delay does not match reviewed deployment");
 const operationId = keccak256(encodeAbiParameters(
   [{ type: "address" }, { type: "uint256" }, { type: "bytes" }, { type: "bytes32" }, { type: "bytes32" }],
   [target, 0n, data, predecessor, salt],

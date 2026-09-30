@@ -6,6 +6,7 @@ import { loadConfig } from "./config.ts";
 import { createChainAdapter } from "./adapters/chain.ts";
 import { createEnclaveHttp } from "./adapters/enclave-http.ts";
 import { createStore } from "./adapters/store.ts";
+import { startAttestationChecks } from "./scheduler.ts";
 import { log } from "./log.ts";
 
 const config = loadConfig();
@@ -31,9 +32,10 @@ const runCheck = async () => {
   try {
     const results = await attestor.checkAll();
     log("info", "attestation_check_complete", { checked: results.length, passing: results.filter((row) => row.ok).length });
+    return results.length > 0 && results.every((row) => row.ok);
   } catch (error) {
     log("error", "attestation_check_failed", { error: error instanceof Error ? error.message : "unknown" });
+    return false;
   }
 };
-void runCheck();
-setInterval(() => void runCheck(), config.INTERVAL_MS);
+startAttestationChecks(runCheck, config.INTERVAL_MS);

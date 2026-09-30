@@ -7,7 +7,7 @@ import { createChain, ROLE_IDS } from "@mochi/chain";
 import { DstackKeySource } from "@mochi/tee";
 import { createDb, upsertEndpoint } from "@mochi/db";
 import { PRODUCTION_IDENTITY_SPECS, PRODUCTION_RECEIPT_SIGNING_SPEC, PRODUCTION_SERVICE_SPECS } from "../phala/production-identities/identities.ts";
-import { deploymentMinJurorBond, productionChainId } from "./chain-policy.ts";
+import { deploymentMinJurorBond, productionChainId, productionTimelockDelay } from "./chain-policy.ts";
 
 type Address = `0x${string}`;
 type Hex = `0x${string}`;
@@ -101,6 +101,7 @@ export function validateLaunchConfig(raw: unknown): ProductionLaunchConfig {
   if (!["prepare", "enroll", "active"].includes(c.mode)) throw new Error("runtime mode must be explicitly prepare, enroll or active");
   if (!c.deployment || !c.deployment.contracts?.mochiToken) throw new Error("deployment must be the reviewed Robinhood mainnet deployment with external MOCHI CA");
   productionChainId(c.deployment);
+  productionTimelockDelay(c.deployment);
   nonzeroAddress(c.deployment.contracts.mochiToken, "deployment.contracts.mochiToken");
   let rpc: URL;
   try { rpc = new URL(c.rpcUrl); } catch { throw new Error("rpcUrl must be a valid HTTPS URL"); }
@@ -150,28 +151,39 @@ function validatePassport(p: Passport, cls: number) {
 }
 
 export type EnrollmentReadinessReader = {
-  juror(address: Address): Promise<{ operator: Address; measurement: Hex; role: number; jurorClass: number; bond: bigint; delisted: boolean }>;
+  juror(address: Address): Promise<{ operator: Address; measurement: Hex; role: number; jurorClass: number; bond: bigint; delisted: boolean; attestedUntil?: bigint; exitRequestedAt?: bigint }>;
+  latestTimestamp?(): Promise<bigint>;
+  measurementAllowed?(measurement: Hex, role: number): Promise<boolean>;
+  minimumBond?(): Promise<bigint>;
   isActive(address: Address, role: number): Promise<boolean>;
   unbondedOperator?(address: Address): Promise<Address>;
   hasRole(contract: Address, role: Hex, account: Address): Promise<boolean>;
 };
 
 /** Checks configured chain state before DB mutations or service startup. Enroll mode tolerates inactive keys. */
-export async function validateEnrollmentReadiness(config: ProductionLaunchConfig, reader: EnrollmentReadinessReader, requireActive: boolean): Promise<void> {
+export async function validateEnrollmentReadiness(config: ProductionLaunchConfig, reader: EnrollmentReadinessReader, requireActive: boolean, log: (message: string) => void = () => {}): Promise<void> {
   const registered = [
-    { identity: config.identities.intake, role: 2, jurorClass: undefined },
-    { identity: config.identities.consensus, role: 3, jurorClass: undefined },
+    { identity: config.identities.intake, role: 2, jurorClass: 0 },
+    { identity: config.identities.consensus, role: 3, jurorClass: 0 },
     ...config.identities.jurors.map((identity) => ({ identity, role: 1, jurorClass: identity.class })),
   ];
-  const minimumBond = deploymentMinJurorBond(config.deployment);
+  const reviewedMinimumBond = deploymentMinJurorBond(config.deployment);
+  const chainMinimumBond = reader.minimumBond ? await reader.minimumBond() : reviewedMinimumBond;
+  const minimumBond = chainMinimumBond > reviewedMinimumBond ? chainMinimumBond : reviewedMinimumBond;
   for (const { identity, role, jurorClass } of registered) {
     const current = await reader.juror(identity.address);
-    if (current.operator.toLowerCase() !== identity.operator.toLowerCase() || current.measurement.toLowerCase() !== identity.measurement.toLowerCase() || current.role !== role || (jurorClass !== undefined && current.jurorClass !== jurorClass) || current.delisted) {
+    if (/^0x0{40}$/i.test(current.operator) || current.operator.toLowerCase() !== identity.operator.toLowerCase() || current.measurement.toLowerCase() !== identity.measurement.toLowerCase() || current.role !== role || (jurorClass !== undefined && current.jurorClass !== jurorClass) || current.delisted) {
       throw new Error(`enrollment mismatch for ${identity.address}`);
     }
-    if (requireActive && !(await reader.isActive(identity.address, role))) throw new Error(`enclave identity is not active: ${identity.address}`);
-    if (role === 1 && minimumBond === 0n && (!reader.unbondedOperator || (await reader.unbondedOperator(identity.address)).toLowerCase() !== identity.operator.toLowerCase())) throw new Error(`team juror approval missing: ${identity.address}`);
+    if (role === 1 && chainMinimumBond === 0n && (!reader.unbondedOperator || (await reader.unbondedOperator(identity.address)).toLowerCase() !== identity.operator.toLowerCase())) throw new Error(`team juror approval missing: ${identity.address}`);
     if (role === 1 && current.bond < minimumBond) throw new Error(`juror bond below configured minimum: ${identity.address}`);
+    if (requireActive && !(await reader.isActive(identity.address, role))) {
+      // Unknown/missing fields and failed RPC reads fail closed. Use chain time, never the VM clock.
+      if (current.exitRequestedAt !== 0n || current.attestedUntil === undefined || !reader.latestTimestamp || !reader.measurementAllowed || !reader.minimumBond
+        || current.attestedUntil >= await reader.latestTimestamp()
+        || !(await reader.measurementAllowed(current.measurement, role))) throw new Error(`enclave identity is not active: ${identity.address}`);
+      log("attestation expired; attestor will refresh");
+    }
   }
   const roles = [
     [config.deployment.contracts.jurorRegistry as Address, ROLE_IDS.ATTESTOR, config.serviceRoleAddresses.attestor],
@@ -185,16 +197,19 @@ export async function validateEnrollmentReadiness(config: ProductionLaunchConfig
   for (const [contract, role, account] of roles) if (!(await reader.hasRole(contract, role, account))) throw new Error(`required service role is not granted to ${account}`);
 }
 
-async function validateActivatedDeployment(config: ProductionLaunchConfig, client: ReturnType<typeof createPublicClient>, requireActive: boolean): Promise<void> {
+async function validateActivatedDeployment(config: ProductionLaunchConfig, client: ReturnType<typeof createPublicClient>, requireActive: boolean, log: (message: string) => void): Promise<void> {
   const deployment = { ...config.deployment, rpcUrl: config.rpcUrl } as any;
   const chain = createChain(deployment, { transport: http(config.rpcUrl) });
   const hasRoleAbi = parseAbi(["function hasRole(bytes32,address) view returns (bool)"]);
   await validateEnrollmentReadiness(config, {
     juror: (address) => chain.getJuror(address),
+    latestTimestamp: async () => (await client.getBlock()).timestamp,
+    measurementAllowed: (measurement, role) => client.readContract({ address: deployment.contracts.jurorRegistry, abi: parseAbi(["function allowedMeasurement(bytes32,uint8) view returns (bool)"]), functionName: "allowedMeasurement", args: [measurement, role] }),
+    minimumBond: () => client.readContract({ address: deployment.contracts.jurorRegistry, abi: parseAbi(["function minJurorBond() view returns (uint256)"]), functionName: "minJurorBond" }),
     unbondedOperator: (address) => client.readContract({ address: deployment.contracts.jurorRegistry, abi: parseAbi(["function unbondedJurorOperator(address) view returns (address)"]), functionName: "unbondedJurorOperator", args: [address] }),
     isActive: (address, role) => chain.isActive(address, role),
     hasRole: (contract, role, account) => client.readContract({ address: contract, abi: hasRoleAbi, functionName: "hasRole", args: [role, account] }),
-  }, requireActive);
+  }, requireActive, log);
 }
 
 
@@ -269,7 +284,7 @@ export async function startProductionRuntime(raw: unknown | undefined, deps: Run
       const deployedCode = await publicClient.getCode({ address });
       if (!deployedCode || deployedCode === "0x") throw new Error(`deployment contract ${i} has no code`);
     }
-    if (config.mode !== "prepare") await validateActivatedDeployment(config, publicClient, config.mode === "active");
+    if (config.mode !== "prepare") await validateActivatedDeployment(config, publicClient, config.mode === "active", log);
     // Validate KMS-derived enclave identities before any network service can start.
     for (const [i, spec] of PRODUCTION_IDENTITY_SPECS.entries()) {
       const identity = i === 0 ? config.identities.intake : i === 1 ? config.identities.consensus : config.identities.jurors[i - 2]!;

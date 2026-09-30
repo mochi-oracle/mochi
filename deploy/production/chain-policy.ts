@@ -4,8 +4,8 @@
 
 export const MAINNET_CHAIN_ID = 4663;
 export const REHEARSAL_CHAIN_ID = 46630;
-export const PRODUCTION_TIMELOCK_DELAY = 86_400;
-export const MIN_REHEARSAL_TIMELOCK_DELAY = 60;
+export const PRODUCTION_TIMELOCK_DELAY = 60;
+export const MAX_TIMELOCK_DELAY = 3600;
 /** Bond used by deployments made before the bond became a deploy-time parameter. */
 export const DEFAULT_MIN_JUROR_BOND = 25_000n * 10n ** 18n;
 
@@ -38,14 +38,15 @@ export function deploymentMinJurorBond(deployment: DeploymentLike): bigint {
   return BigInt(value);
 }
 
-/** Timelock delay the batches must schedule with: exactly one day on mainnet, the recorded delay in a rehearsal. */
-export function productionTimelockDelay(deployment: DeploymentLike): number {
-  const recorded = deployment?.timelockDelay;
-  if (!isProductionRehearsal(deployment)) {
-    if (deployment?.chainId === MAINNET_CHAIN_ID && recorded !== undefined && String(recorded) !== String(PRODUCTION_TIMELOCK_DELAY)) throw new Error("mainnet deployments must use the 86400-second timelock delay");
-    return PRODUCTION_TIMELOCK_DELAY;
-  }
-  const delay = Number(recorded);
-  if (!Number.isSafeInteger(delay) || delay < MIN_REHEARSAL_TIMELOCK_DELAY) throw new Error("rehearsal deployment must record timelockDelay of at least 60 seconds");
+/** Shared deploy/batch policy on every chain: whole seconds from zero through one hour. */
+export function validateTimelockDelay(value: unknown): number {
+  if ((typeof value !== "number" && typeof value !== "string") || !/^(0|[1-9][0-9]*)$/.test(String(value))) throw new Error("timelock delay must be whole seconds from 0 to 3600");
+  const delay = Number(value);
+  if (!Number.isSafeInteger(delay) || delay < 0 || delay > MAX_TIMELOCK_DELAY) throw new Error("timelock delay must be whole seconds from 0 to 3600");
   return delay;
+}
+
+/** Honour the recorded deployment delay, including rehearsal; new deployments default to 60 seconds. */
+export function productionTimelockDelay(deployment: DeploymentLike): number {
+  return validateTimelockDelay(deployment?.timelockDelay ?? PRODUCTION_TIMELOCK_DELAY);
 }

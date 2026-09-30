@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { encodeFunctionData, parseAbi, type Address, type Hex } from "viem";
 import { buildPhalaBatch } from "./phala-batch.ts";
-import { createOwnerConsole, loadDeployment, loadSteps, parseArgs, stepStatus, type ChainReader } from "./owner-console.ts";
+import { createOwnerConsole, describeCall, loadDeployment, loadSteps, parseArgs, stepStatus, type ChainReader } from "./owner-console.ts";
 
 const a = (n: number) => `0x${n.toString(16).padStart(40, "0")}` as Address;
 const m = `0x${"12".repeat(32)}` as Hex;
@@ -20,7 +20,7 @@ test("timelock batches decode every inner call by contract and function, with ro
   expect(steps[0]!.details.some((d) => d.startsWith("jurorRegistry.registerServiceKey("))).toBe(true);
   expect(steps[0]!.details.some((d) => d.startsWith("queryEscrow.grantRole(FEED_RUNNER_ROLE"))).toBe(true);
   expect(steps[0]!.details.some((d) => d.startsWith("privacy.entrypoint.grantRole(ASP_POSTMAN_ROLE"))).toBe(true);
-  expect(steps[0]!.details.at(-1)).toBe("Waiting period after scheduling: 86400 seconds");
+  expect(steps[0]!.details.at(-1)).toBe("Waiting period after scheduling: 60 seconds");
   const activate = loadSteps(deployment, buildPhalaBatch(deployment as never, input, "execute", "activate"), "activate.json", "b2");
   expect(activate[0]!.kind).toBe("timelock-execute");
   expect(activate[0]!.details).toEqual(["queryEscrow.unpause()"]);
@@ -89,4 +89,14 @@ test("the page loads nothing from the network and the CLI needs a deployment and
   expect(html).not.toMatch(/<script[^>]+src=|<link[^>]+href=/);
   expect(() => parseArgs(["--deployment", "d.json"])).toThrow("usage");
   expect(parseArgs(["--deployment", "d.json", "--batch", "a.json", "--batch", "b.json"]).batches).toEqual(["a.json", "b.json"]);
+});
+
+
+test("console refuses delays over one hour and timelock updates that reintroduce a day", () => {
+  expect(() => loadDeployment({ ...deployment, timelockDelay: 3601 })).toThrow("0 to 3600");
+  const batch = buildPhalaBatch({ ...deployment, timelockDelay: 120 } as never, input, "schedule");
+  expect(() => loadSteps(deployment, batch, "wrong-delay.json", "b")).toThrow("does not match deployment");
+  const update = (delay: bigint) => encodeFunctionData({ abi: parseAbi(["function updateDelay(uint256)"]), functionName: "updateDelay", args: [delay] });
+  expect(() => describeCall(deployment, deployment.contracts.timelock!, update(86400n))).toThrow("0 to 3600");
+  expect(describeCall(deployment, deployment.contracts.timelock!, update(3600n))).toContain("updateDelay(3600)");
 });

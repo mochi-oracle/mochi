@@ -73,7 +73,7 @@ add(entrypoint, "grantRole", [keccak256(toHex("ASP_POSTMAN")), input.postman]);
 } else {
 add(escrow, "unpause", []);
 }
-// One day on mainnet; a testnet dress rehearsal schedules with the delay its timelock was deployed with.
+// Schedule with the reviewed deployment delay on mainnet and rehearsal (0–3600 seconds).
 const delay = productionTimelockDelay(deployment);
 const predecessor = `0x${"00".repeat(32)}` as Hex;
 const operationId = keccak256(encodeAbiParameters(

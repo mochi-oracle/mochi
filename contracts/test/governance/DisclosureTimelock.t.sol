@@ -19,10 +19,10 @@ contract DisclosureTimelockTest is Test {
         assertEq(disclosures.disclosedAt(verdict, recipient), first);
     }
 
-    function testTimelockSchedulesAndExecutesSchemaProposalAfter24Hours() public {
+    function testTimelockSchedulesAndExecutesSchemaProposalAfter60Seconds() public {
         address[] memory proposers = new address[](1); proposers[0] = address(this);
         address[] memory executors = new address[](1); executors[0] = address(0);
-        MochiTimelock timelock = new MochiTimelock(24 hours, proposers, executors, address(this));
+        MochiTimelock timelock = new MochiTimelock(60 seconds, proposers, executors, address(this));
         SchemaRegistry schemas = new SchemaRegistry(address(this), 24 hours);
         schemas.grantRole(MochiRoles.GOVERNOR_ROLE, address(timelock));
         bytes memory data = abi.encodeCall(
@@ -30,8 +30,10 @@ contract DisclosureTimelockTest is Test {
             (uint32(9), keccak256("schema"), keccak256("prompt"), keccak256("tolerances"), bytes32(0))
         );
         bytes32 salt = keccak256("schema-proposal");
-        timelock.schedule(address(schemas), 0, data, bytes32(0), salt, 24 hours);
-        vm.warp(block.timestamp + 24 hours);
+        timelock.schedule(address(schemas), 0, data, bytes32(0), salt, 60 seconds);
+        vm.expectRevert();
+        timelock.execute(address(schemas), 0, data, bytes32(0), salt);
+        vm.warp(block.timestamp + 60 seconds);
         timelock.execute(address(schemas), 0, data, bytes32(0), salt);
         assertEq(schemas.getVersion(9, 1).schemaJsonHash, keccak256("schema"));
         uint256 activation = uint256(schemas.getVersion(9, 1).activatesAt);

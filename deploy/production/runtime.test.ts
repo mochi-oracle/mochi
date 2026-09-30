@@ -149,3 +149,38 @@ test("zero-bond readiness requires exact team approval; legacy deployments still
   delete launch.deployment.minJurorBond;
   await expect(validateEnrollmentReadiness(launch, reader, false)).rejects.toThrow("bond below configured minimum");
 });
+
+test("active restart allows only expired attestations, with content-free recovery logging", async () => {
+  const launch = validateLaunchConfig(config());
+  launch.deployment.minJurorBond = "0";
+  const identities = [launch.identities.intake, launch.identities.consensus, ...launch.identities.jurors];
+  const juror = async (address: `0x${string}`) => {
+    const j = identities.find(j => j.address === address)!;
+    return { operator: j.operator, measurement: j.measurement, role: j === launch.identities.intake ? 2 : j === launch.identities.consensus ? 3 : 1,
+      jurorClass: j.class ?? 0, bond: 0n, delisted: false, exitRequestedAt: 0n, attestedUntil: 999n };
+  };
+  const reader = { juror, isActive: async () => false, hasRole: async () => true,
+    unbondedOperator: async (address: `0x${string}`) => identities.find(j => j.address === address)!.operator,
+    latestTimestamp: async () => 1000n, minimumBond: async () => 0n, measurementAllowed: async () => true };
+  const logs: string[] = [];
+  await expect(validateEnrollmentReadiness(launch, reader, true, (message) => logs.push(message))).resolves.toBeUndefined();
+  expect(logs).toEqual(Array(11).fill("attestation expired; attestor will refresh"));
+  for (const change of [
+    { operator: a(0) }, { operator: a(999) }, { measurement: h(99) }, { role: 0 }, { jurorClass: 99 },
+    { delisted: true }, { exitRequestedAt: 1n }, { exitRequestedAt: undefined }, { attestedUntil: 1000n }, { attestedUntil: 1001n }, { attestedUntil: undefined },
+  ]) {
+    await expect(validateEnrollmentReadiness(launch, { ...reader, juror: async (address) => ({ ...await juror(address), ...change }) }, true)).rejects.toThrow();
+  }
+  await expect(validateEnrollmentReadiness(launch, { ...reader, measurementAllowed: async () => false }, true)).rejects.toThrow("not active");
+  await expect(validateEnrollmentReadiness(launch, { ...reader, measurementAllowed: undefined }, true)).rejects.toThrow("not active");
+  await expect(validateEnrollmentReadiness(launch, { ...reader, latestTimestamp: undefined }, true)).rejects.toThrow("not active");
+  await expect(validateEnrollmentReadiness(launch, { ...reader, minimumBond: undefined }, true)).rejects.toThrow("not active");
+  await expect(validateEnrollmentReadiness(launch, { ...reader, latestTimestamp: async () => { throw new Error("RPC read failed"); } }, true)).rejects.toThrow("RPC read failed");
+  await expect(validateEnrollmentReadiness(launch, { ...reader, unbondedOperator: async () => a(0) }, true)).rejects.toThrow("approval missing");
+  await expect(validateEnrollmentReadiness(launch, { ...reader, hasRole: async () => false }, true)).rejects.toThrow("service role");
+  launch.deployment.minJurorBond = "100";
+  const bonded = { ...reader, minimumBond: async () => 100n, juror: async (address: `0x${string}`) => ({ ...await juror(address), bond: 100n }) };
+  await expect(validateEnrollmentReadiness(launch, bonded, true)).resolves.toBeUndefined();
+  await expect(validateEnrollmentReadiness(launch, { ...bonded, juror: async (address) => ({ ...await juror(address), bond: 99n }) }, true)).rejects.toThrow("bond below");
+  await expect(validateEnrollmentReadiness(launch, { ...bonded, minimumBond: async () => 101n }, true)).rejects.toThrow("bond below");
+});
