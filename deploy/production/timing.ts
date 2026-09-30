@@ -23,7 +23,7 @@ export function forwardTimingEvents(stream: Readable | null, write: (line: strin
 
 /** Fixed, validated launch values; children receive them explicitly rather than inheriting VM variables. */
 export function productionTiming() {
-  const values = { ROUND_TIMEOUT_MS: 120_000, JUROR_TIMEOUT_MS: 125_000, MODEL_TIMEOUT_MS: 125_000, MODEL_ATTEMPT_CAP_MS: 40_000, MODEL_MAX_ATTEMPTS: 3, DELIVERY_RESERVE_MS: 10_000, ROUND_CLOSE_MAX_WAIT_MS: 125_000 };
+  const values = { ROUND_TIMEOUT_MS: 120_000, JUROR_TIMEOUT_MS: 125_000, MODEL_TIMEOUT_MS: 125_000, MODEL_ATTEMPT_CAP_MS: 75_000, MODEL_MAX_ATTEMPTS: 3, DELIVERY_RESERVE_MS: 10_000, ROUND_CLOSE_MAX_WAIT_MS: 125_000 };
   for (const value of Object.values(values)) if (!Number.isSafeInteger(value) || value <= 0 || value > 125_000) throw new Error("invalid production timing");
   return Object.fromEntries(Object.entries(values).map(([name, value]) => [name, String(value)]));
 }

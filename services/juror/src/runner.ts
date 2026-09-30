@@ -129,7 +129,8 @@ export class PhalaAciRunner implements ModelRunner {
         maxAttempts,
         totalMs,
         onAttempt: budget?.onAttempt,
-        attemptCapMs: this.options.attemptCapMs ?? Math.max(15_000, Math.floor(this.options.timeoutMs / 2)),
+        attemptCapMs: this.options.attemptCapMs ?? 75_000,
+        minAttemptMs: 35_000,
         signal,
         ...this.options.retry,
       }, (signal) => this.options.client.chat(requestBody, { signal, requireUpToDate: true, maxResponseBytes: 256 * 1024 })).catch((error: unknown) => {

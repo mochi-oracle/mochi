@@ -12,7 +12,7 @@ export interface ProviderRetryOptions {
   totalMs: number;
   /** Upper bound for every attempt, including the final one. */
   attemptCapMs: number;
-  /** Never start an attempt with less time than this left. */
+  /** Never start a retry with less time than this left, including after backoff. */
   minAttemptMs?: number;
   signal?: AbortSignal;
   now?: () => number;
@@ -106,6 +106,8 @@ export async function withProviderRetries<T>(
       const wait = verdict.retryAfterMs ?? Math.floor(random() * Math.min(MAX_BACKOFF_MS, BASE_BACKOFF_MS * 2 ** index));
       if (left - wait < minAttemptMs) throw new ProviderRetryError(error, failures, timedOut);
       try { await sleep(wait, parent); } catch { throw new ProviderCallAborted(failures, index + 1); }
+      // Backoff can oversleep; admit the retry using the actual remaining budget.
+      if (options.totalMs - (now() - start) < minAttemptMs) throw new ProviderRetryError(error, failures, timedOut);
     } finally {
       clearTimeout(timer);
       parent?.removeEventListener("abort", onParentAbort);
