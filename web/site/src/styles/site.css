@@ -256,3 +256,64 @@
 .default-section + .default-section { border-top-width: .15rem; }
 @media (min-width: 768px) { .default-section + .default-section { border-top-width: .3rem; } }
 .header .btn { height: 5rem; padding-top: .8rem; padding-bottom: .8rem; line-height: 1.2; }
+
+/* Keep text in its layout bounds; terrain retains its independent parallax. */
+.default-section > [data-animation='parallax'],
+#footer [data-animation='logo-reveal'] > [data-animation='parallax'] {
+  transform: none !important;
+}
+
+/* Viewport-sized scenes must grow with wrapped content. */
+#layers, #connect { height: auto; min-height: calc(100svh - var(--header)); }
+#layers > .relative, #connect > .relative {
+  height: auto;
+  min-height: calc(100svh - var(--header) - 4rem);
+  gap: 4rem;
+}
+.mochi-layer-card { overflow: visible; container-type: inline-size; }
+.mochi-layer-card .multiline-outline-text { overflow: visible; }
+.mochi-layer-card .mochi-layer-row { grid-template-columns: minmax(0, 1fr); gap: 1.25em 2rem; }
+.mochi-layer-row > * { min-width: 0; overflow-wrap: anywhere; }
+@media (min-width: 768px) {
+  @container (min-width: 26rem) {
+    .mochi-layer-card .mochi-layer-row { grid-template-columns: max-content minmax(0, 1fr); }
+  }
+}
+
+.mochi-stat-row.grid {
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  gap: 2rem;
+}
+.mochi-stat-row > div { grid-column: auto; min-width: 0; }
+.mochi-stat-row .secondary-heading { font-size: clamp(3.6rem, 7vw, 9.2rem); }
+.mochi-stat-row > div:last-child > .flex { gap: 2rem; }
+.mochi-stat-row .flex-grow { min-width: 0; }
+@media (min-width: 768px) {
+  .mochi-stat-row.grid { grid-template-columns: minmax(0, 1fr) minmax(0, 2fr); column-gap: clamp(2rem, 5vw, 8rem); }
+}
+
+/* Schema titles share a track with their link; neither may force the other out. */
+#schemas .portfolio-row__container > div { min-width: 0; }
+#schemas .portfolio-row__container h4 { overflow-wrap: anywhere; }
+
+/* Completed frame layers start inset; their boxes must end at the viewport. */
+.preloader-complete .preloader__layer { width: auto; height: auto; right: 0; bottom: 0; }
+#schemas .portfolio-row__container .truncate {
+  white-space: normal;
+  overflow: visible;
+  overflow-wrap: anywhere;
+}
+main .grid > *, main [class*='grid-cols'] > *, .mochi-content { min-width: 0; }
+main .mochi-code { white-space: pre-wrap; overflow-wrap: anywhere; max-width: 100%; }
+@media (max-width: 767px) {
+  .mochi-stat-row .secondary-heading { font-size: clamp(3.6rem, 12vw, 4.8rem); }
+}
+.default-section h3 [data-motion-word] { max-width: 100%; overflow-wrap: anywhere; }
+
+/* Sample and live workspace tables fit their containing track. */
+.workspace .work-table { table-layout: fixed; }
+.workspace .work-table th, .workspace .work-table td { white-space: normal; overflow-wrap: anywhere; }
+@media (max-width: 767px) {
+  .workspace .workspace-tabs { flex-wrap: wrap; gap: 0 2rem; }
+  .workspace .workspace-tabs button { white-space: normal; }
+}
