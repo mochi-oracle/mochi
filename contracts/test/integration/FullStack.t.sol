@@ -19,7 +19,8 @@ contract FullStackTest is Harness {
         uint256 payerPk = 0x7777; address payer = vm.addr(payerPk);
         bytes32 doc = keccak256("public-happy");
         MochiTypes.Provenance memory p = _provenance(doc, 0, 0, 1);
-        MochiTypes.OpenParams memory op = MochiTypes.OpenParams(1, 3, true, true, 0, 0, payer, 101);
+        p.opener = payer; p.nonce = 101;
+        MochiTypes.OpenParams memory op = MochiTypes.OpenParams(3, payer);
         (uint256 fees, uint256 protocol) = escrow.quote(1, 3, 1); uint256 total = fees + protocol;
         usdg.mint(payer, total); vm.prank(payer); usdg.approve(address(escrow), total);
         bytes memory intakeSig = _signProvenance(p);
@@ -163,15 +164,15 @@ contract FullStackTest is Harness {
     }
 
     function test_voucher_path_and_replay() public {
-        bytes32 doc = keccak256("voucher"); MochiTypes.Provenance memory p = _provenance(doc, 0, 0, 1);
-        MochiTypes.OpenParams memory op = MochiTypes.OpenParams(1, 3, true, true, 0, 0, address(this), 801);
+        bytes32 doc = keccak256("voucher"); MochiTypes.Provenance memory p = _provenance(doc, 0, 0, 1); p.nonce = 801;
+        MochiTypes.OpenParams memory op = MochiTypes.OpenParams(3, address(this));
         (, uint256 fee) = escrow.quote(1, 3, 1); (uint256 jf,) = escrow.quote(1, 3, 1);
-        MochiTypes.AnonymaVoucher memory v = MochiTypes.AnonymaVoucher(keccak256("voucher-id"), doc, 1, 3, jf + fee, 1, uint64(block.timestamp + 1 days));
+        MochiTypes.AnonymaVoucher memory v = MochiTypes.AnonymaVoucher(keccak256("voucher-id"), escrow.computeQueryId(address(this), doc, p.nonce), 1, 3, jf + fee, 1, uint64(block.timestamp + 1 days));
         bytes32 sh = MochiTypes.hashAnonymaVoucher(v); (uint8 vv, bytes32 r, bytes32 s) = vm.sign(anonymaPk, keccak256(abi.encodePacked("\x19\x01", escrow.domainSeparator(), sh)));
         bytes memory sig = abi.encodePacked(r, s, vv); uint256 floatBefore = escrow.anonymaFloat(); bytes memory intakeSig = _signProvenance(p);
         bytes32 qid = escrow.openWithVoucher(op, p, intakeSig, v, sig);
         assertEq(floatBefore - escrow.anonymaFloat(), jf + fee);
-        op.nonce++;
+        p.nonce++; intakeSig = _signProvenance(p);
         vm.expectRevert(abi.encodeWithSelector(IQueryEscrow.VoucherUsed.selector, v.voucherId)); escrow.openWithVoucher(op, p, intakeSig, v, sig);
         _seal(qid); bytes32[9] memory a; a[0] = keccak256("A"); a[1] = a[0]; a[2] = keccak256("B");
         _post(qid, 2, 6666, 4, 0, 0, _votes(qid, a, 0));
@@ -181,12 +182,13 @@ contract FullStackTest is Harness {
     function test_shielded_path() public {
         uint256 amount = 1000 * USD; usdg.mint(address(this), amount); usdg.approve(address(shielded), amount); shielded.fund(amount);
         bytes32 doc = keccak256("shielded"); MochiTypes.Provenance memory p = _provenance(doc, 0, 0, 1);
-        MochiTypes.OpenParams memory op = MochiTypes.OpenParams(1, 3, true, false, 0, keccak256("payer-commit"), address(this), 900);
+        p.allowPanelDisclosure = false; p.payerCommit = keccak256("payer-commit"); p.nonce = 900;
+        MochiTypes.OpenParams memory op = MochiTypes.OpenParams(3, address(this));
         (uint256 jf, uint256 pf) = escrow.quote(1, 3, 1); bytes32 nullifier = keccak256("nullifier");
         bytes memory intakeSig = _signProvenance(p);
-        bytes32 qid = escrow.openShielded(op, p, intakeSig, nullifier, abi.encode(nullifier, jf + pf, address(escrow), escrow.computeQueryId(address(this), doc, op.nonce)));
+        bytes32 qid = escrow.openShielded(op, p, intakeSig, nullifier, abi.encode(nullifier, jf + pf, address(escrow), escrow.computeQueryId(address(this), doc, p.nonce)));
         assertEq(uint256(escrow.getQuery(qid).payPath), uint256(MochiTypes.PayPath.SHIELDED));
-        op.nonce = 901; bytes32 qid2 = escrow.computeQueryId(address(this), doc, op.nonce);
+        p.nonce = 901; intakeSig = _signProvenance(p); bytes32 qid2 = escrow.computeQueryId(address(this), doc, p.nonce);
         vm.expectRevert(); escrow.openShielded(op, p, intakeSig, nullifier, abi.encode(nullifier, jf + pf, address(escrow), qid2));
     }
 
@@ -232,7 +234,7 @@ contract FullStackTest is Harness {
         uint256 sinkBefore=mochi.balanceOf(address(this)); verdicts.reportEquivocation(qid,q.docCommit,q.schemaId,q.schemaVersion,a,abi.encodePacked(ra,sa,va),b,abi.encodePacked(rb,sb,vb));
         assertEq(mochi.balanceOf(address(this))-sinkBefore,BOND); assertTrue(registry.getJuror(key).delisted);
         address[] memory none = new address[](0);
-        address[] memory replacement = registry.selectJurors(keccak256("after-slash"), 0, 3, none);
+        address[] memory replacement = registry.selectJurors(address(escrow), qid, keccak256("after-slash"), 0, 3, none);
         for (uint256 i; i < replacement.length; ++i) assertTrue(replacement[i] != key);
     }
 

@@ -1,0 +1,9 @@
+# Reviewed gitleaks false positives in existing history (format: commit:file:rule:line). See .gitleaks.toml.
+# Placeholder value `<UNIQUE_KEY_LABEL>` in an example env file.
+c1dda6c49eb90e6201b278f8045befd0c45755f3:deploy/production/juror.env.example:generic-api-key:17
+# Public token contract addresses passed to register-stock-tokens.ts in a doc example.
+11e2a0dfe15c162871fb6d14bb930b33befca99a:docs/DEVELOPMENT.md:generic-api-key:66
+# Variable name on the right-hand side of an assignment (`x25519Private`), not a value.
+63eff7441090777f8e8d139ba4bdbbaaa9f39b9d:packages/tee/src/tdx-provider.ts:generic-api-key:56
+# Source comment about feed subject keys.
+789cc5f95e5dbfc00fada418f010c497da3a6adf:services/gateway/src/app.ts:generic-api-key:268

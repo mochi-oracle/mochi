@@ -225,7 +225,7 @@ contract QueryEscrow is IQueryEscrow, EIP712, AccessControl, Pausable, Reentranc
     ) external override nonReentrant returns (bytes32 queryId) {
         uint256 total;
         (queryId, total) = _open(p, prov, intakeSig, MochiTypes.PayPath.ANONYMA);
-        _useVoucher(voucher, anonymaSig, prov.docCommit, p.schemaId, p.n, total, queryId);
+        _useVoucher(voucher, anonymaSig, prov.schemaId, p.n, total, queryId);
     }
 
     /// @inheritdoc IQueryEscrow
@@ -236,7 +236,7 @@ contract QueryEscrow is IQueryEscrow, EIP712, AccessControl, Pausable, Reentranc
         returns (bytes32 queryId)
     {
         if (!hasRole(MochiRoles.FEED_RUNNER_ROLE, msg.sender)) revert NotAuthorized(msg.sender);
-        if (!p.isPublic || prov.kind != uint8(MochiTypes.ProvenanceKind.FETCHED)) {
+        if (!prov.isPublic || prov.kind != uint8(MochiTypes.ProvenanceKind.FETCHED)) {
             revert FeedQueryMustBePublicFetched();
         }
         uint256 total;
@@ -256,16 +256,19 @@ contract QueryEscrow is IQueryEscrow, EIP712, AccessControl, Pausable, Reentranc
         if (!MochiTypes.isValidN(p.n)) revert InvalidN(p.n);
         if (p.refundTo == address(0)) revert InvalidRefundTo();
         if (prov.tokensK < 1) revert ZeroTokens();
-        uint16 schemaVersion = schemas.latest(p.schemaId);
-        if (schemaVersion == 0) revert SchemaNotActive(p.schemaId);
-        bytes32 provenanceHash = MochiTypes.hashProvenance(prov);
-        (address signer, ECDSA.RecoverError err,) = ECDSA.tryRecover(_hashTypedDataV4(provenanceHash), intakeSig);
-        if (err != ECDSA.RecoverError.NoError || !registry.isActive(signer, MochiTypes.Role.INTAKE)) {
-            revert BadIntakeSignature();
-        }
-        queryId = computeQueryId(msg.sender, prov.docCommit, p.nonce);
+        // The intake grant names its opener and expires; queryId below is fixed by (opener, docCommit, nonce), so a
+        // grant opens at most one query and a copied grant cannot open one for anybody else.
+        if (prov.opener != msg.sender) revert NotAuthorized(msg.sender);
+        if (block.timestamp > prov.expiry) revert ProvenanceExpired(prov.expiry);
+        uint16 schemaVersion = schemas.latest(prov.schemaId);
+        if (schemaVersion == 0 || schemaVersion != prov.schemaVersion) revert SchemaNotActive(prov.schemaId);
+        bytes32 provenanceHash = MochiTypes.hashProvenanceCalldata(prov);
+        queryId = computeQueryId(msg.sender, prov.docCommit, prov.nonce);
         if (_queries[queryId].status != MochiTypes.QueryStatus.NONE) revert QueryExists(queryId);
-        total = _recordOpen(queryId, p, prov, path, schemaVersion, provenanceHash);
+        (address signer, ECDSA.RecoverError err,) = ECDSA.tryRecover(_hashTypedDataV4(provenanceHash), intakeSig);
+        // One registry call checks the intake key and fixes this query's juror pools before any of its seeds exists.
+        if (err != ECDSA.RecoverError.NoError || !registry.openSelection(queryId, signer)) revert BadIntakeSignature();
+        total = _recordOpen(queryId, p, prov, path, provenanceHash);
         _emitOpened(queryId, path, total);
     }
 
@@ -274,9 +277,9 @@ contract QueryEscrow is IQueryEscrow, EIP712, AccessControl, Pausable, Reentranc
         MochiTypes.OpenParams calldata p,
         MochiTypes.Provenance calldata prov,
         MochiTypes.PayPath path,
-        uint16 schemaVersion,
         bytes32 provenanceHash
     ) private returns (uint256 total) {
+        // slither-disable-next-line uninitialized-local -- accumulator, starts at zero
         uint256 jurorFees;
         for (uint8 i; i < p.n; ++i) {
             uint256 fee = _price(i, prov.tokensK);
@@ -287,19 +290,19 @@ contract QueryEscrow is IQueryEscrow, EIP712, AccessControl, Pausable, Reentranc
         total = jurorFees + feeProtocol;
         MochiTypes.Query storage q = _queries[queryId];
         q.docCommit = prov.docCommit;
-        q.schemaId = p.schemaId;
-        q.schemaVersion = schemaVersion;
+        q.schemaId = prov.schemaId;
+        q.schemaVersion = prov.schemaVersion;
         q.n = p.n;
-        q.isPublic = p.isPublic;
-        q.allowPanelDisclosure = p.allowPanelDisclosure;
+        q.isPublic = prov.isPublic;
+        q.allowPanelDisclosure = prov.allowPanelDisclosure;
         q.payPath = path;
         q.status = MochiTypes.QueryStatus.OPEN;
         q.provenanceKind = MochiTypes.ProvenanceKind(prov.kind);
         q.originId = prov.originId;
         q.tokensK = prov.tokensK;
         q.provenanceHash = provenanceHash;
-        q.paramsHash = p.paramsHash;
-        q.payerCommit = p.payerCommit;
+        q.paramsHash = prov.paramsHash;
+        q.payerCommit = prov.payerCommit;
         q.payer = msg.sender;
         q.refundTo = p.refundTo;
         q.openedAt = uint64(block.timestamp);
@@ -320,8 +323,11 @@ contract QueryEscrow is IQueryEscrow, EIP712, AccessControl, Pausable, Reentranc
         if (q.status != MochiTypes.QueryStatus.OPEN) revert WrongStatus(queryId, q.status);
         // Seed timing is enforced by the randomness source; its SeedNotReady / SeedWindowMissed revert bubbles up
         // unchanged so relays can tell "retry later" from "wrong state".
+        // aderyn-fp-next-line(reentrancy-state-change) view call (staticcall): cannot reenter or change state
         bytes32 seed = randomness.seed(keccak256(abi.encode(queryId, q.docCommit, q.round)), q.sealBlock);
-        address[] memory newJurors = registry.selectJurors(seed, _prevN[queryId], q.n, _seats[queryId]);
+        // aderyn-fp-next-line(reentrancy-state-change) view call (staticcall): cannot reenter or change state
+        address[] memory newJurors =
+            registry.selectJurors(address(this), queryId, seed, _prevN[queryId], q.n, _seats[queryId]);
         for (uint256 i; i < newJurors.length; ++i) {
             _seats[queryId].push(newJurors[i]);
         }
@@ -333,6 +339,7 @@ contract QueryEscrow is IQueryEscrow, EIP712, AccessControl, Pausable, Reentranc
     /// @inheritdoc IQueryEscrow
     function reseal(bytes32 queryId) external override {
         MochiTypes.Query storage q = _requireQuery(queryId);
+        // aderyn-fp-next-line(reentrancy-state-change) view call (staticcall): cannot reenter or change state
         if (q.status != MochiTypes.QueryStatus.OPEN || !randomness.isExpired(q.sealBlock)) {
             revert WrongStatus(queryId, q.status);
         }
@@ -369,7 +376,7 @@ contract QueryEscrow is IQueryEscrow, EIP712, AccessControl, Pausable, Reentranc
     ) external override nonReentrant {
         MochiTypes.Query storage q = _prepareExpansion(queryId, newN, MochiTypes.PayPath.ANONYMA);
         uint256 total = _snapshotExpansion(queryId, q.n, newN, q.tokensK, q);
-        _useVoucher(voucher, anonymaSig, q.docCommit, q.schemaId, newN, total, queryId);
+        _useVoucher(voucher, anonymaSig, q.schemaId, newN, total, queryId);
         _finishExpansion(queryId, q, newN, total);
     }
 
@@ -397,6 +404,7 @@ contract QueryEscrow is IQueryEscrow, EIP712, AccessControl, Pausable, Reentranc
         private
         returns (uint256 total)
     {
+        // slither-disable-next-line uninitialized-local -- accumulator, starts at zero
         uint256 jurorFees;
         for (uint8 i = fromN; i < newN; ++i) {
             uint256 fee = _price(i, tokensK);
@@ -436,13 +444,16 @@ contract QueryEscrow is IQueryEscrow, EIP712, AccessControl, Pausable, Reentranc
         if (result != MochiTypes.VerdictStatus.VERDICT && result != MochiTypes.VerdictStatus.HUNG) {
             revert WrongStatus(queryId, q.status);
         }
+        // slither-disable-next-line uninitialized-local -- accumulator, starts at zero
         uint256 refund;
+        // slither-disable-next-line uninitialized-local -- accumulator, starts at zero
         uint256 jurorsPaid;
         for (uint8 s = _prevN[queryId]; s < q.n; ++s) {
             uint256 fee = _seatFees[queryId][s];
             if ((timeoutMask & (uint32(1) << s)) != 0) {
                 refund += fee;
             } else {
+                // aderyn-fp-next-line(reentrancy-state-change) view call (staticcall): cannot reenter or change state
                 claimable[registry.operatorOf(_seats[queryId][s])] += fee;
                 jurorsPaid += fee;
             }
@@ -591,19 +602,19 @@ contract QueryEscrow is IQueryEscrow, EIP712, AccessControl, Pausable, Reentranc
     function _useVoucher(
         MochiTypes.AnonymaVoucher calldata voucher,
         bytes calldata sig,
-        bytes32 docCommit,
         uint32 schemaId,
         uint8 n,
         uint256 amount,
         bytes32 queryId
     ) private {
+        // slither-disable-next-line unused-return -- err is checked; the third value only details err
         (address signer, ECDSA.RecoverError err,) =
             ECDSA.tryRecover(_hashTypedDataV4(MochiTypes.hashAnonymaVoucher(voucher)), sig);
         if (err != ECDSA.RecoverError.NoError || signer != anonymaSigner) revert BadVoucherSignature();
         if (voucher.expiry < block.timestamp) revert VoucherExpired();
         if (voucherUsed[voucher.voucherId]) revert VoucherUsed(voucher.voucherId);
         if (
-            voucher.docCommit != docCommit || voucher.schemaId != schemaId || voucher.n != n
+            voucher.queryId != queryId || voucher.schemaId != schemaId || voucher.n != n
                 || amount > voucher.maxAmount
         ) revert VoucherMismatch();
         voucherUsed[voucher.voucherId] = true;
@@ -614,7 +625,11 @@ contract QueryEscrow is IQueryEscrow, EIP712, AccessControl, Pausable, Reentranc
     }
 
     /// @dev Pulls `total` USDG through the shielded pool, bound to `queryId`, and checks it actually arrived.
+    ///      Every QueryEscrow path that credits or moves USDG is nonReentrant and the lock is held here, so a reentrant
+    ///      deposit cannot be counted both as this payment and as a float/budget/query credit (see
+    ///      test/escrow/ShieldedSpendReentrancy.t.sol); a direct transfer that lands meanwhile is a real payment.
     function _spendShielded(bytes32 nullifier, uint256 total, bytes32 queryId, bytes calldata proof) private {
+        // slither-disable-next-line reentrancy-balance -- every crediting path is locked; see @dev above
         uint256 beforeBal = usdg.balanceOf(address(this));
         shielded.spend(nullifier, total, address(this), queryId, proof);
         uint256 afterBal = usdg.balanceOf(address(this));

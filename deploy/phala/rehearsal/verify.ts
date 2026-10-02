@@ -1,13 +1,15 @@
 import { boundedHttpsFetch } from "./http.ts";
 export { boundedHttpsFetch } from "./http.ts";
 import { docCommit, docHash, ZERO32 } from "@mochi/core";
-import { aad, AttestationDocSchema, IntakeResultSchema } from "@mochi/protocol";
+import { aad, AttestationDocSchema, IntakeResultSchema, provenanceFromJson, provenanceMatchesBinding } from "@mochi/protocol";
 import { DcapQuoteVerifier, PcsCollateralSource, keyBinding, parseTdxQuote, parseTdxReportData, recoverProvenance, seal, tdxMeasurement, type Quote } from "@mochi/tee";
 import { fromHex, type Hex } from "viem";
 
 const REHEARSAL_CHAIN_ID = 31337;
 const REHEARSAL_ESCROW = `0x${"00".repeat(20)}` as const;
 const FIXTURE = "Synthetic hardware rehearsal document. It contains no user or production data.";
+/** The fixed open binding the server accepts (sealed with the document): a public query from a fixed opener and nonce. */
+const FIXTURE_OPEN = { opener: `0x${"00".repeat(19)}02`, payerCommit: ZERO32, isPublic: true, allowPanelDisclosure: false, nonce: "1" } as const;
 const encode = (value: unknown) => new TextEncoder().encode(JSON.stringify(value));
 const fail = (message: string): never => { throw new Error(message); };
 
@@ -106,7 +108,7 @@ export async function verifyRehearsal(baseUrl = "http://127.0.0.1:8080", expecte
   const upload = {
     v: 1, schemaId: 7, salt: ZERO32,
     params: { question: "Does the synthetic fixture identify itself as a hardware rehearsal document?", answer_type: "BOOL" },
-    contentType: "text/plain", docB64: Buffer.from(fixtureBytes).toString("base64"),
+    contentType: "text/plain", docB64: Buffer.from(fixtureBytes).toString("base64"), open: FIXTURE_OPEN,
   };
   const envelope = seal(publicKey, encode(upload), aad.intake());
   const requestBody = JSON.stringify({ envelope });
@@ -119,14 +121,10 @@ export async function verifyRehearsal(baseUrl = "http://127.0.0.1:8080", expecte
   const result = IntakeResultSchema.parse(await response.json());
   if (result.docCommit.toLowerCase() !== expectedCommit.toLowerCase()) fail("Intake commitment does not match the synthetic upload.");
   if (result.intake.toLowerCase() !== attestation.address.toLowerCase()) fail("Upload was not handled by the attested intake identity.");
-  const recovered = await recoverProvenance(REHEARSAL_CHAIN_ID, REHEARSAL_ESCROW, {
-    docCommit: result.provenance.docCommit as Hex,
-    kind: result.provenance.kind,
-    originId: result.provenance.originId as Hex,
-    fetchedAt: BigInt(result.provenance.fetchedAt),
-    tokensK: result.provenance.tokensK,
-    transcriptHash: result.provenance.transcriptHash as Hex,
-  }, result.intakeSig as Hex);
+  // The grant must open exactly the sealed upload: its document and params, and the fixed public open binding.
+  if (result.provenance.docCommit !== result.docCommit || result.provenance.paramsHash !== result.paramsHash || result.provenance.schemaId !== 7
+    || !provenanceMatchesBinding(result.provenance, FIXTURE_OPEN)) fail("Intake provenance does not bind the synthetic upload and its open binding.");
+  const recovered = await recoverProvenance(REHEARSAL_CHAIN_ID, REHEARSAL_ESCROW, provenanceFromJson(result.provenance), result.intakeSig as Hex);
   if (recovered.toLowerCase() !== attestation.address.toLowerCase()) fail("Intake provenance signature did not recover the advertised identity.");
 
   return {

@@ -2,7 +2,11 @@
 pragma solidity ^0.8.28;
 
 import {AccessControl} from "@openzeppelin/contracts/access/AccessControl.sol";
+// Unused. Removing them renumbers AST ids, which changes the via-IR bytecode of other contracts (PanelEscalation grows
+// by 749 bytes), so they go with the next intentional bytecode change.
+// aderyn-ignore-next-line(unused-import) see above
 import {MochiRoles} from "@mochi/libraries/MochiRoles.sol";
+// aderyn-ignore-next-line(unused-import) see above
 import {MochiTypes} from "@mochi/libraries/MochiTypes.sol";
 import {IMochiStaking} from "@mochi/interfaces/IMochiStaking.sol";
 import {ISchemaRegistry} from "@mochi/interfaces/ISchemaRegistry.sol";
@@ -21,6 +25,7 @@ contract ClerkVoting is AccessControl {
         bytes32 promptHash;
         bytes32 tolerancesHash;
         bytes32 crosscheckHash;
+        // aderyn-fp-next-line(local-variable-shadowing) struct member, not a local variable
         uint8[9] classMix;
     }
 
@@ -42,8 +47,13 @@ contract ClerkVoting is AccessControl {
         bytes32 promptHash;
         bytes32 tolerancesHash;
         bytes32 crosscheckHash;
+        // aderyn-fp-next-line(local-variable-shadowing) struct member, not a local variable
         uint8[9] classMix;
     }
+
+    /// @notice A passed proposal must be queued within GRACE_PERIOD of its voting end and executed within
+    ///         GRACE_PERIOD of its eta; after that it is expired and can never take effect.
+    uint64 public constant GRACE_PERIOD = 14 days;
 
     IMochiStaking public immutable staking;
     ISchemaRegistry public immutable schemas;
@@ -55,6 +65,9 @@ contract ClerkVoting is AccessControl {
     uint256 public proposalCount;
     mapping(uint256 => Proposal) private _proposals;
     mapping(uint256 => mapping(address => bool)) public hasVoted;
+    /// @notice Highest executed proposal id per target (the class mix; a schema id's next version; one schema
+    ///         version's revocation). An older proposal for a target cannot execute after a newer one did.
+    mapping(bytes32 => uint256) public lastExecutedFor;
 
     event ProposalCreated(uint256 indexed proposalId, address indexed proposer, Kind kind, uint64 endTime, uint256 totalStakedSnapshot);
     event VoteCast(uint256 indexed proposalId, address indexed voter, bool support, uint256 weight);
@@ -76,6 +89,8 @@ contract ClerkVoting is AccessControl {
     error AlreadyExecuted(uint256 proposalId);
     error AlreadyQueuedOrCancelled(uint256 proposalId);
     error NoVotingPower();
+    error ProposalExpired(uint256 proposalId);
+    error SupersededProposal(uint256 proposalId, uint256 executedProposalId);
 
     /// @notice Deploy with governance targets; grant this contract GOVERNOR and LOCKER roles after deployment.
     constructor(
@@ -101,6 +116,7 @@ contract ClerkVoting is AccessControl {
     /// @notice Creates a proposal; proposer must hold the threshold stake at creation.
     function propose(ProposalInput calldata input) external returns (uint256 proposalId) {
         uint48 snapshot = uint48(block.timestamp) - 1;
+        // aderyn-fp-next-line(reentrancy-state-change) view call (staticcall): cannot reenter or change state
         uint256 stake = staking.stakeAt(msg.sender, snapshot);
         if (stake < proposalThreshold) revert BelowProposalThreshold(stake, proposalThreshold);
         if (input.kind == Kind.PROPOSE_SCHEMA) {
@@ -114,6 +130,7 @@ contract ClerkVoting is AccessControl {
         p.kind = input.kind;
         p.snapshot = snapshot;
         p.endTime = uint64(block.timestamp) + votingPeriod;
+        // aderyn-fp-next-line(reentrancy-state-change) view call (staticcall): cannot reenter or change state
         p.totalStakedSnapshot = staking.totalStakedAt(snapshot);
         p.schemaId = input.schemaId;
         p.version = input.version;
@@ -131,6 +148,7 @@ contract ClerkVoting is AccessControl {
         // forge-lint: disable-next-line(block-timestamp)
         if (block.timestamp >= p.endTime || p.cancelled) revert VotingClosed(proposalId);
         if (hasVoted[proposalId][msg.sender]) revert AlreadyVoted(msg.sender);
+        // aderyn-fp-next-line(reentrancy-state-change) view call (staticcall): cannot reenter or change state
         uint256 weight = staking.stakeAt(msg.sender, p.snapshot);
         if (weight == 0) revert NoVotingPower();
         hasVoted[proposalId][msg.sender] = true;
@@ -140,11 +158,13 @@ contract ClerkVoting is AccessControl {
         emit VoteCast(proposalId, msg.sender, support, weight);
     }
 
-    /// @notice Queues a successful proposal for execution after the delay.
+    /// @notice Queues a successful proposal for execution after the delay, within GRACE_PERIOD of the voting end.
     function queue(uint256 proposalId) external {
         Proposal storage p = _proposal(proposalId);
         // forge-lint: disable-next-line(block-timestamp)
         if (block.timestamp < p.endTime) revert VotingNotEnded(proposalId);
+        // forge-lint: disable-next-line(block-timestamp)
+        if (block.timestamp > uint256(p.endTime) + GRACE_PERIOD) revert ProposalExpired(proposalId);
         // Queue once: re-queueing would reset eta and let anyone delay execution indefinitely.
         if (p.queued || p.cancelled) revert AlreadyQueuedOrCancelled(proposalId);
         if (p.forVotes <= p.againstVotes) revert ProposalNotSucceeded(proposalId);
@@ -155,15 +175,23 @@ contract ClerkVoting is AccessControl {
         emit ProposalQueued(proposalId, p.eta);
     }
 
-    /// @notice Executes a queued schema or class-mix proposal after the execution delay.
+    /// @notice Executes a queued schema or class-mix proposal after the execution delay and within GRACE_PERIOD
+    ///         of its eta, unless a newer proposal for the same target has already executed.
     function execute(uint256 proposalId) external {
         Proposal storage p = _proposal(proposalId);
         if (!p.queued) revert NotQueued(proposalId);
         if (p.executed) revert AlreadyExecuted(proposalId);
         // forge-lint: disable-next-line(block-timestamp)
         if (block.timestamp < p.eta) revert TimelockNotElapsed(p.eta);
+        // forge-lint: disable-next-line(block-timestamp)
+        if (block.timestamp > uint256(p.eta) + GRACE_PERIOD) revert ProposalExpired(proposalId);
+        bytes32 target = targetOf(proposalId);
+        uint256 last = lastExecutedFor[target];
+        if (last > proposalId) revert SupersededProposal(proposalId, last);
+        lastExecutedFor[target] = proposalId;
         p.executed = true;
         if (p.kind == Kind.PROPOSE_SCHEMA) {
+            // slither-disable-next-line unused-return -- SchemaRegistry assigns and emits the version
             schemas.propose(p.schemaId, p.schemaJsonHash, p.promptHash, p.tolerancesHash, p.crosscheckHash);
         } else if (p.kind == Kind.REVOKE_SCHEMA) {
             schemas.revoke(p.schemaId, p.version);
@@ -184,6 +212,15 @@ contract ClerkVoting is AccessControl {
     }
 
     function getProposal(uint256 proposalId) external view returns (Proposal memory) { return _proposal(proposalId); }
+
+    /// @notice Execution-order key: every SET_CLASS_MIX shares one target, PROPOSE_SCHEMA proposals share their
+    ///         schema id, and a REVOKE_SCHEMA targets one (schemaId, version).
+    function targetOf(uint256 proposalId) public view returns (bytes32) {
+        Proposal storage p = _proposal(proposalId);
+        if (p.kind == Kind.SET_CLASS_MIX) return keccak256(abi.encode(Kind.SET_CLASS_MIX));
+        if (p.kind == Kind.PROPOSE_SCHEMA) return keccak256(abi.encode(Kind.PROPOSE_SCHEMA, p.schemaId));
+        return keccak256(abi.encode(Kind.REVOKE_SCHEMA, p.schemaId, p.version));
+    }
 
     function _proposal(uint256 proposalId) private view returns (Proposal storage p) {
         p = _proposals[proposalId];

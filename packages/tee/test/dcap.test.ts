@@ -11,6 +11,7 @@ const dir=new URL("./fixtures/intel-tdx/",import.meta.url);
 const read=async(name:string)=>new Uint8Array(await readFile(new URL(name,dir)));
 const json=async(name:string)=>JSON.parse(await readFile(new URL(name,dir),"utf8"));
 const same=(a:Uint8Array,b:Uint8Array)=>expect([...a]).toEqual([...b]);
+// nosemgrep: detect-non-literal-regexp -- key is a fixed snapshot field name from this test
 function snapArray(s:string,key:string):number[] {const m=new RegExp(`\\b${key}: \\[([\\s\\S]*?)\\]`).exec(s);if(!m)throw new Error(`snapshot field missing ${key}`);return [...m[1]!.matchAll(/\d+/g)].map(x=>Number(x[0]));}
 describe("Intel TDX DCAP",()=>{
  test("pinned root matches Intel fixture",async()=>{const root=await read("Intel_SGX_Provisioning_Certification_RootCA.cer");same(INTEL_SGX_ROOT_CA_DER,root);expect(bytesToHex(sha256(root))).toBe("0x44a0196b2b99f889b8e149e95b807a350e7424964399e885a7cbb8ccfab674d3");});

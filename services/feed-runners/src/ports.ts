@@ -2,6 +2,7 @@ import type { Address, Hex } from "viem";
 import type { AttestationDoc, IntakeResult } from "@mochi/protocol";
 import type { QuoteVerifier } from "@mochi/tee";
 import type { SchemaId } from "@mochi/core";
+import type { OpenParamsArg, ProvenanceArg } from "@mochi/chain";
 
 export interface FeedJob {
   runner: RunnerName;
@@ -19,7 +20,15 @@ export interface StockTokenReader {
   readMultiplierSchedule(token: Address): Promise<{ uiMultiplier: bigint; newUIMultiplier: bigint; effectiveAt: bigint }>;
   /** Records the pre-change multiplier on StockTokenCrosscheck while a change is pending. Resolves true if a tx was sent. */
   recordBaseline?(tickerKey: Hex, effectiveAt: bigint): Promise<boolean>;
+  /**
+   * StockTokenCrosscheck.observeMultiplier(ticker): the baseline for an immediate (same-block) multiplier change is the
+   * last observation taken before it. Sends a transaction only when the on-chain observation is out of date
+   * ("observed"); "current" means it already records what an observation would record now, "unregistered" that the
+   * crosscheck has no token for the ticker. Rejects on a read failure or a reverted simulation.
+   */
+  observeMultiplier?(tickerKey: Hex, nowSec: bigint): Promise<ObserveOutcome>;
 }
+export type ObserveOutcome = "observed" | "current" | "unregistered";
 export interface EdgarFiling { id: string; accession: string; filingDate: string; summary: string }
 export interface EdgarHttp {
   getAtom(cik: string): Promise<string>;
@@ -34,7 +43,8 @@ export interface ChainPort {
   isActive(address: Address, role: number): Promise<boolean>;
   getJuror(address: Address): Promise<{ measurement: Hex }>;
   computeQueryId(sender: Address, docCommit: Hex, nonce: bigint): Promise<Hex>;
-  openFeed(params: { schemaId: number; n: number; isPublic: boolean; allowPanelDisclosure: boolean; paramsHash: Hex; payerCommit: Hex; refundTo: Address; nonce: bigint }, provenance: { docCommit: Hex; kind: number; originId: Hex; fetchedAt: bigint; tokensK: number; transcriptHash: Hex }, intakeSig: Hex): Promise<Hex>;
+  /** QueryEscrow.openFeed: payment params plus the intake-signed Provenance grant (opener = this feed runner). */
+  openFeed(params: OpenParamsArg, provenance: ProvenanceArg, intakeSig: Hex): Promise<Hex>;
   feedBudget(): Promise<bigint>;
   fundFeedBudget(amount: bigint): Promise<void>;
   usdgBalance(address: Address): Promise<bigint>;

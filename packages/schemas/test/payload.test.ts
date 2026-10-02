@@ -179,3 +179,22 @@ it("matches the hand-assembled SPLIT payload vector", () => {
 it("throws when required agreed data is missing", () => {
   expect(() => buildPayload(getSchema(SchemaId.SPLIT), {}, {}, context)).toThrow();
 });
+
+it("salts a private query's payloadHash and keeps public payload hashing deterministic", async () => {
+  const { privatePayloadHash } = await import("@mochi/core");
+  const { resolveSchema } = await import("../src/defs.ts");
+  const { normalizeParams } = await import("../src/params.ts");
+  const params = { question: "Is the claim supported?", answer_type: "STRING" };
+  const def = resolveSchema(SchemaId.FREEFORM_FACT, params);
+  const normalized = normalizeParams(def, params);
+  if (!normalized.ok) throw new Error("params");
+  const salt = `0x${"5a".repeat(32)}` as Hex;
+  const answers = ["supported", "contradicted", "missing_context", "insufficient_evidence"];
+  const publicHashes = answers.map((v) => buildPayload(def, { answer: { t: "str", v } }, normalized.params, { openedAt: 1_700_000_000n }));
+  for (const built of publicHashes) expect(built.payloadHash).toBe(keccak256(built.payload));
+  const hidden = buildPayload(def, { answer: { t: "str", v: "contradicted" } }, normalized.params, { openedAt: 1_700_000_000n, privateSalt: salt });
+  expect(hidden.payload).toBe(publicHashes[1]!.payload);
+  expect(hidden.payloadHash).toBe(privatePayloadHash(salt, hidden.payload));
+  expect(publicHashes.map((built) => built.payloadHash)).not.toContain(hidden.payloadHash);
+  expect(() => buildPayload(def, { answer: { t: "str", v: "supported" } }, normalized.params, { openedAt: 1n, privateSalt: `0x${"00".repeat(32)}` })).toThrow();
+});

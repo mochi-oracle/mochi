@@ -50,6 +50,8 @@ contract PanelEscalationTest is Test {
         vm.prank(payer);
         token.approve(address(panel), type(uint256).max);
         _setQuery(true, false);
+        // Evaluators must be active warmupTickets tickets before a seal to be drawn for it.
+        vm.roll(block.number + 10);
     }
 
     function _setQuery(bool isPublic, bool consent) internal {

@@ -113,6 +113,29 @@ describe("ConsensusEnclave", () => {
     expect(plaintext.answerJson).toContain('"ticker":{"t":"str","v":"ACME"}');
   });
 
+  test("finding 3: a private on-chain payloadHash is salted, so hashing candidate payloads does not reveal the outcome", async () => {
+    const { buildPayload } = await import("@mochi/schemas");
+    const { privatePayloadHash } = await import("@mochi/core");
+    const { privateResultMismatch } = await import("@mochi/protocol");
+    const h = new Harness(); const kp = x25519.keygen(); h.public = false; h.salt = `0x${"12".repeat(32)}`; h.payerPub = toHex(kp.publicKey);
+    await h.open(); await Promise.all([0, 1, 2].map((i) => h.answer(i)));
+    const response = await h.enclave.closeRound(h.queryId);
+    // What an observer can build from public data (openedAt) and the guessable agreed answer.
+    const candidate = buildPayload(resolveSchema(2), h.body().fields, {}, { openedAt: 1n });
+    expect(response.verdictInput.payloadHash).not.toBe(candidate.payloadHash);
+    expect(response.verdictInput.payloadHash).toBe(privatePayloadHash(h.salt, candidate.payload));
+    const { open } = await import("@mochi/tee");
+    const plain = JSON.parse(new TextDecoder().decode(open(kp.secretKey, response.privateResult! as never, aad.result(response.verdictId as Hex))));
+    expect(plain.payload).toBe(candidate.payload);
+    expect(privateResultMismatch(plain, response.verdictInput)).toBeUndefined();
+    expect(privateResultMismatch({ ...plain, salt: `0x${"13".repeat(32)}` }, response.verdictInput)).toBe("payloadHash");
+  });
+
+  test("a private query needs a non-zero seed salt", async () => {
+    const h = new Harness(); const kp = x25519.keygen(); h.public = false; h.salt = ZERO32; h.payerPub = toHex(kp.publicKey);
+    await expect(h.open()).rejects.toMatchObject({ code: "SALT_MISMATCH", status: 400 });
+  });
+
   test("idempotent open, identical resubmission, and repeated close", async () => {
     const h = new Harness(); await h.open(); await h.open(); await h.answer(0); await h.answer(0); await h.answer(1); await h.answer(2);
     const first = await h.enclave.closeRound(h.queryId); const second = await h.enclave.closeRound(h.queryId);

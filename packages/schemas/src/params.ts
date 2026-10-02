@@ -14,19 +14,21 @@ export function normalizeParams(
     if (!allowedNames.has(name)) errors.push(`unknown parameter: ${name}`);
   }
 
-  const params: Record<string, NormalizedValue | null> = {};
+  // Only own properties of the caller's object count (an inherited raw.toString is not a parameter), and the result is
+  // built with fromEntries so a parameter name can never be treated as a prototype write.
+  const entries: [string, NormalizedValue | null][] = [];
   for (const parameter of definition.params) {
-    const normalized = normalizeValue(parameter, raw[parameter.name]);
+    const normalized = normalizeValue(parameter, Object.hasOwn(raw, parameter.name) ? raw[parameter.name] : undefined);
     if (!normalized.ok) {
       errors.push(`${parameter.name}: ${normalized.error}`);
     } else if (parameter.required && normalized.value === null) {
       errors.push(`${parameter.name} is required`);
     } else {
-      params[parameter.name] = normalized.value;
+      entries.push([parameter.name, normalized.value]);
     }
   }
 
-  return errors.length > 0 ? { ok: false, errors } : { ok: true, params };
+  return errors.length > 0 ? { ok: false, errors } : { ok: true, params: Object.fromEntries(entries) };
 }
 
 /** Hashes normalized parameters, using ZERO32 when every parameter is null. */

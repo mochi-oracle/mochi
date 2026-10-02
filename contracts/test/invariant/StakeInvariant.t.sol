@@ -87,16 +87,12 @@ contract StakeInvariantTest is Test {
         targetContract(address(handler));
     }
 
-    /// forge-config: default.invariant.runs = 256
-    /// forge-config: default.invariant.depth = 50
     function invariant_totalStakedEqualsSumOfStakeOf() public view {
         uint256 sum;
         for (uint256 i; i < 4; ++i) sum += staking.stakeOf(address(actors[i]));
         assertEq(staking.totalStaked(), sum);
     }
 
-    /// forge-config: default.invariant.runs = 256
-    /// forge-config: default.invariant.depth = 50
     function invariant_stakingDoesNotCreateRewards() public view {
         uint256 accounted = handler.rewardsPaid() + staking.undistributed();
         for (uint256 i; i < 4; ++i) accounted += staking.earned(address(actors[i]));
@@ -107,8 +103,6 @@ contract StakeInvariantTest is Test {
         assertLe(accounted, handler.rewardsNotified());
     }
 
-    /// forge-config: default.invariant.runs = 256
-    /// forge-config: default.invariant.depth = 50
     function invariant_aVoteLockedStakeCannotBeRemovedBeforeExpiry() public view {
         assertFalse(handler.lockedUnstakeSucceeded());
     }

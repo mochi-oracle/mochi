@@ -3,6 +3,7 @@ import { z } from 'zod';
 import type { ClaimReview, EvidenceBundle, Researcher } from './types.ts';
 import type { PublicClaimStore } from './store.ts';
 import { isCrossOriginPost } from './origin.ts';
+import { withSecurityHeaders } from './security-headers.ts';
 
 const key = () => randomBytes(32).toString('hex');
 const digest = (value: string) => createHash('sha256').update(value).digest();
@@ -24,6 +25,8 @@ export interface ClaimsOptions {
   now?: () => Date;
   maxActionsPerDay?: number;
   maxConcurrent?: number;
+  /** False once any juror's local daily model budget is spent; reviews are then refused before an action is used. */
+  providerBudgetAvailable?: () => boolean;
 }
 
 /** Private bundles/results are ephemeral. Publishing is a separate consented action. */
@@ -58,7 +61,9 @@ export function createClaimsHandler(options: ClaimsOptions) {
     return JSON.parse(Buffer.concat(chunks).toString('utf8'));
   }
   const fullReview = (entry: ReviewEntry) => Response.json({ review: entry.review, reviewToken: entry.reviewToken });
-  return async (request: Request): Promise<Response> => {
+  // Every pilot response, including early errors, carries strict security headers (CSP, HSTS, nosniff, no framing).
+  return async (request: Request): Promise<Response> => withSecurityHeaders(await handle(request));
+  async function handle(request: Request): Promise<Response> {
     clean();
     const url = new URL(request.url);
     const path = url.pathname;
@@ -100,6 +105,7 @@ export function createClaimsHandler(options: ClaimsOptions) {
         if (entry.result) return fullReview(entry.result);
         if (entry.pending) return fullReview(await entry.pending);
         if (active >= concurrency) return fail('BUSY', 'The pilot is busy. Try again shortly.', 429);
+        if (options.providerBudgetAvailable && !options.providerBudgetAvailable()) return fail('DAILY_LIMIT', 'The pilot has reached its daily model budget.', 429);
         if (!reserve()) return fail('DAILY_LIMIT', 'The pilot has reached its daily review limit.', 429);
         active++;
         const pending = (async () => {
@@ -143,5 +149,5 @@ export function createClaimsHandler(options: ClaimsOptions) {
     } catch { response = fail('RESEARCH_FAILED', 'Research could not be completed. No payment was collected.', 502); }
     response.headers.set('Cache-Control', 'no-store');
     return response;
-  };
+  }
 }

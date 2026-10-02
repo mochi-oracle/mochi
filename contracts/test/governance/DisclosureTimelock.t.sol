@@ -7,16 +7,32 @@ import {SchemaRegistry} from "@mochi/SchemaRegistry.sol";
 import {MochiRoles} from "@mochi/libraries/MochiRoles.sol";
 
 contract DisclosureTimelockTest is Test {
-    function testDisclosureFirstWriteWinsAndIsPermissionless() public {
+    /// Permissionless, first write wins per discloser, and one party's record never blocks or changes another's.
+    function testDisclosureFirstWriteWinsPerDiscloser() public {
         DisclosureRegistry disclosures = new DisclosureRegistry();
         bytes32 verdict = keccak256("verdict");
         bytes32 recipient = keccak256("recipient-key");
-        vm.prank(address(0xA1));
+        address payer = address(0xA1);
+        address other = address(0xB2);
+        vm.warp(1_800_000_000);
+        vm.prank(other);
+        disclosures.disclose(verdict, recipient, keccak256("junk"));
+        vm.warp(1_800_000_060);
+        vm.prank(payer);
         disclosures.disclose(verdict, recipient, keccak256("envelope-one"));
-        uint64 first = disclosures.disclosedAt(verdict, recipient);
-        vm.prank(address(0xB2));
-        disclosures.disclose(verdict, recipient, keccak256("envelope-two"));
-        assertEq(disclosures.disclosedAt(verdict, recipient), first);
+        vm.warp(1_800_000_120);
+        vm.recordLogs();
+        vm.prank(payer);
+        disclosures.disclose(verdict, recipient, keccak256("envelope-two")); // no-op
+        assertEq(vm.getRecordedLogs().length, 0);
+        DisclosureRegistry.Disclosure memory d = disclosures.disclosureOf(verdict, recipient, payer);
+        assertEq(d.envelopeHash, keccak256("envelope-one"));
+        assertEq(d.disclosedAt, 1_800_000_060);
+        assertEq(disclosures.disclosedAt(verdict, recipient, payer), 1_800_000_060);
+        assertEq(disclosures.disclosureOf(verdict, recipient, other).envelopeHash, keccak256("junk"));
+        assertEq(disclosures.disclosedAt(verdict, recipient, address(0xC3)), 0);
+        vm.expectRevert(DisclosureRegistry.ZeroEnvelopeHash.selector);
+        disclosures.disclose(verdict, keccak256("other-recipient"), bytes32(0));
     }
 
     function testTimelockSchedulesAndExecutesSchemaProposalAfter60Seconds() public {

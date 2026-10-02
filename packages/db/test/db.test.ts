@@ -31,7 +31,7 @@ const cols: Record<string, string[]> = {
   payer_result_keys: ["payer_commit","pub","created_at"],
   chain_cursors: ["name","block"],
   disagreement_model: ["bucket","window","schema_id","field","model_id","disagree_rate","samples","disagree_count"],
-  disclosures: ["verdict_id","recipient_key_hash","envelope","created_at"],
+  disclosures: ["verdict_id","recipient_key_hash","envelope_hash","envelope","created_at"],
   feed_subscriptions: ["feed_id","consumer","until","paid"],
   panel_payloads: ["case_id","panel_index","evaluator","payload_hash","payload","answer_json","created_at"],
 };
@@ -49,7 +49,7 @@ afterAll(async () => {
 describe("database package", () => {
   test("migrations are repeatable, create hypertables, and use required primary keys", async () => {
     const migrationRows = await client.sql`SELECT name FROM _mochi_migrations`;
-    expect(migrationRows.map((r) => r.name)).toEqual(["0001_init.sql", "0002_services.sql", "0003_receipt_anchor_nullable.sql", "0004_doc_completion.sql", "0005_payer_result_keys.sql"]);
+    expect(migrationRows.map((r) => r.name)).toEqual(["0001_init.sql", "0002_services.sql", "0003_receipt_anchor_nullable.sql", "0004_doc_completion.sql", "0005_payer_result_keys.sql", "0006_disclosure_envelopes.sql"]);
     const hypertables = await client.sql`SELECT hypertable_name FROM timescaledb_information.hypertables WHERE hypertable_schema = ${schemaName}`;
     expect(hypertables.map((r) => r.hypertable_name).sort()).toEqual(["disagreement", "disagreement_model", "verdicts"]);
     const pks = await client.sql`
@@ -71,6 +71,7 @@ describe("database package", () => {
     expect(byTable.anchors).toEqual(["root"]);
     expect(byTable.disagreement).toEqual(["schema_id", "field", "class", "window", "bucket"]);
     expect(byTable.feeds).toEqual(["feed_id", "key"]);
+    expect(byTable.disclosures).toEqual(["verdict_id", "recipient_key_hash", "envelope_hash"]);
   });
 
   test("privacy check and exact column allowlist", async () => {

@@ -2,6 +2,7 @@ import { readFileSync } from "node:fs";
 import { createPublicClient, http, keccak256, toHex, type Address, type Hex } from "viem";
 import { chainFor } from "@mochi/chain";
 import { assertMochiTokenDecimals } from "./token-policy.ts";
+import { panelWiringProblems, readPanelWiring, recordedPanelEscalation } from "./panel-escalation.ts";
 
 const path = process.argv[2];
 if (!path) throw new Error("usage: bun scripts/verify-ownership.ts <deployment.json>");
@@ -10,6 +11,7 @@ const deployment = JSON.parse(readFileSync(path, "utf8")) as {
   paused?: boolean; contracts: Record<string, Address>; privacy?: { entrypoint: Address };
   roles?: Record<string, Record<string, Address[]>>;
   tokenSource?: { kind: "external" | "test-deployment"; decimals: number };
+  panelEscalation?: "off" | "on";
 };
 if (deployment.tokenSource && !["external", "test-deployment"].includes(deployment.tokenSource.kind)) throw new Error("deployment tokenSource.kind is unsupported");
 const dep = { chainId: deployment.chainId, rpcUrl: deployment.rpcUrl, startBlock: deployment.startBlock, contracts: deployment.contracts };
@@ -39,7 +41,7 @@ const entries: { name: string; address: Address; roles: string[]; owner?: boolea
   { name: "QueryEscrow", address: deployment.contracts.queryEscrow!, roles: ["DEFAULT_ADMIN_ROLE", "GOVERNOR_ROLE", "GUARDIAN_ROLE", "FEED_RUNNER_ROLE"] },
   { name: "JurorRegistry", address: deployment.contracts.jurorRegistry!, roles: ["DEFAULT_ADMIN_ROLE", "GOVERNOR_ROLE", "ATTESTOR_ROLE", "SLASHER_ROLE"] },
   { name: "SchemaRegistry", address: deployment.contracts.schemaRegistry!, roles: ["DEFAULT_ADMIN_ROLE", "GOVERNOR_ROLE"] },
-  { name: "MochiStaking", address: deployment.contracts.staking!, roles: ["DEFAULT_ADMIN_ROLE", "LOCKER_ROLE"] },
+  { name: "MochiStaking", address: deployment.contracts.staking!, roles: ["DEFAULT_ADMIN_ROLE", "GOVERNOR_ROLE", "LOCKER_ROLE"] },
   { name: "MochiVerdicts", address: deployment.contracts.verdicts!, roles: ["DEFAULT_ADMIN_ROLE", "GOVERNOR_ROLE"] },
   { name: "PanelEscalation", address: deployment.contracts.panel!, roles: ["DEFAULT_ADMIN_ROLE", "GOVERNOR_ROLE", "FEED_RUNNER_ROLE"] },
   { name: "Feeds", address: deployment.contracts.feeds!, roles: ["DEFAULT_ADMIN_ROLE", "GOVERNOR_ROLE"] },
@@ -62,6 +64,12 @@ for (const account of [deployment.owner, deployment.guardian, deployment.timeloc
 // Deployment metadata deliberately records the deployer address without disclosing its key.
 const deployerAddress = (JSON.parse(readFileSync(path, "utf8")) as { deployer?: Address }).deployer;
 if (deployerAddress) candidates.add(deployerAddress);
+/**
+ * Admin-class roles that are normally unheld: MochiStaking's GOVERNOR_ROLE only sweeps dust, and no one holds it until
+ * DEFAULT_ADMIN grants it (to the timelock) for a sweep. Any holder other than the timelock still fails, but the timelock
+ * is not required to hold it.
+ */
+const OPTIONAL_TIMELOCK_ROLES = new Set(["MochiStaking:GOVERNOR_ROLE"]);
 const rows: string[] = ["Contract | Role | Expected holders | Deployer | Status", "---|---|---|---|---"];
 const failures: string[] = [];
 const roleMapKey: Record<string, string> = {
@@ -87,11 +95,12 @@ for (const entry of entries) {
       for (const allowedHolder of (entry.name === "PrivacyPoolsEntrypoint" && roleName === "DEFAULT_ADMIN_ROLE" ? [] : allowed)) {
         try {
           const held = await publicClient.readContract({ address: entry.address, abi: aclAbi, functionName: "hasRole", args: [roleId, allowedHolder] });
-          if (!held && allowedHolder === (deployment.timelock ?? deployment.contracts.timelock)) failures.push(`${entry.name} ${roleName}: timelock does not hold role`);
+          if (!held && allowedHolder === (deployment.timelock ?? deployment.contracts.timelock) && !OPTIONAL_TIMELOCK_ROLES.has(`${entry.name}:${roleName}`)) failures.push(`${entry.name} ${roleName}: timelock does not hold role`);
         } catch { /* non-AccessControl targets are reported with the rest of the table */ }
       }
     }
-    rows.push(`${entry.name} | ${roleName} | ${expected.join(", ") || "—"} | ${depHolds ? "YES" : "no"} | ${holders.length ? holders.join(", ") : "none found"}`);
+    const expectedText = expected.join(", ") || (OPTIONAL_TIMELOCK_ROLES.has(`${entry.name}:${roleName}`) ? "none (or only the timelock)" : "—");
+    rows.push(`${entry.name} | ${roleName} | ${expectedText} | ${depHolds ? "YES" : "no"} | ${holders.length ? holders.join(", ") : "none found"}`);
   }
   try {
     const owner = await publicClient.readContract({ address: entry.address, abi: aclAbi, functionName: "owner" });
@@ -143,6 +152,22 @@ if (deployerAddress) {
   rows.push(`MochiToken | metadataAdmin() | timelock or frozen | ${deployerAddress && metadataAdmin.toLowerCase() === deployerAddress.toLowerCase() ? "YES" : "no"} | ${metadataAdmin} ${ok ? "OK" : "FAIL"}`);
   if (!ok) failures.push(`MochiToken metadataAdmin is ${metadataAdmin}, expected the timelock or address(0)`);
 }
+}
+{
+  const mode = recordedPanelEscalation(deployment);
+  const wiring = await readPanelWiring(publicClient, deployment.contracts.queryEscrow!);
+  const problems = panelWiringProblems(mode, deployment.contracts.panel, wiring);
+  const expected = mode === "off" ? "panel 0x0, reserve 0" : mode === "on" ? `panel ${deployment.contracts.panel}, reserve > 0` : "not recorded; consistency only";
+  rows.push(`QueryEscrow | panel escalation ${mode ?? "(unrecorded)"} | ${expected} | n/a | panel ${wiring.panel}, reserve ${wiring.panelReserveBps} ${problems.length ? "FAIL" : "OK"}`);
+  failures.push(...problems);
+}
+{
+  // The panel's fixed references and MochiVerdicts' authorised panel must be this deployment's contracts in every mode.
+  const { panelBindingProblems, readPanelBindings } = await import("./panel-escalation.ts");
+  const bindings = await readPanelBindings(publicClient, deployment.contracts.panel!, deployment.contracts.verdicts!);
+  const problems = panelBindingProblems(deployment.contracts as never, bindings);
+  rows.push(`PanelEscalation | bindings | escrow, verdicts, usdg, randomness; MochiVerdicts.panel | n/a | ${problems.length ? "FAIL" : "OK"}`);
+  failures.push(...problems);
 }
 if (deployment.paused) {
   const paused = await publicClient.readContract({ address: deployment.contracts.queryEscrow!, abi: aclAbi, functionName: "paused" });

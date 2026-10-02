@@ -5,6 +5,7 @@ import {StockTokenCrosscheck} from "@mochi/StockTokenCrosscheck.sol";
 import {MockStockToken} from "@mochi/mocks/MockStockToken.sol";
 import {MochiTypes} from "@mochi/libraries/MochiTypes.sol";
 import {IStockTokenMultiplier} from "@mochi/interfaces/IStockTokenMultiplier.sol";
+import {SafeCast} from "@openzeppelin/contracts/utils/math/SafeCast.sol";
 
 contract RevertingStockToken {
     function newUIMultiplier() external pure returns (uint256) {
@@ -103,7 +104,7 @@ contract StockTokenCrosscheckTest is Test {
     }
 
     function testTokenReadFailureHandled() public {
-        crosscheck.setToken(ticker, address(new RevertingStockToken()));
+        vm.etch(address(token), address(new RevertingStockToken()).code); // the registered token's reads now revert
         MochiTypes.SplitBody memory b = MochiTypes.SplitBody(ticker, AT, 2, 1);
         (bool ok, bytes32 reason) = crosscheck.check(0, ticker, 2, _payload(abi.encode(b)));
         assertFalse(ok);
@@ -150,13 +151,105 @@ contract StockTokenCrosscheckTest is Test {
         assertEq(reason, bytes32("RATIO_MISMATCH"));
     }
 
-    function testSplitAfterEffectiveWithoutBaselineFailsClosed() public {
+    /// No recordBaseline() while pending: the observation taken at registration (before the change) is used.
+    function testSplitAfterEffectiveFallsBackToLastObservation() public {
         token.updateMultiplier(2e18, AT);
         vm.warp(AT);
+        (bool ok, bytes32 reason) = crosscheck.check(0, ticker, 2, _split(2, 1));
+        assertTrue(ok);
+        // forge-lint: disable-next-line(unsafe-typecast)
+        assertEq(reason, bytes32("OK"));
+        (ok, reason) = crosscheck.check(0, ticker, 2, _split(4, 1));
+        assertFalse(ok);
+        // forge-lint: disable-next-line(unsafe-typecast)
+        assertEq(reason, bytes32("RATIO_MISMATCH"));
+    }
+
+    /// Registered only after the change took effect: nothing observed before it, so the check fails closed.
+    function testSplitAfterEffectiveWithoutBaselineFailsClosed() public {
+        MockStockToken late = new MockStockToken();
+        late.updateMultiplier(2e18, AT);
+        vm.warp(AT);
+        crosscheck.setToken(ticker, address(late));
         (bool ok, bytes32 reason) = crosscheck.check(0, ticker, 2, _split(2, 1));
         assertFalse(ok);
         // forge-lint: disable-next-line(unsafe-typecast)
         assertEq(reason, bytes32("BASELINE_UNKNOWN"));
+    }
+
+    /// Keeper flow across two immediate changes (the issuer's one-argument updateMultiplier): each later observation
+    /// first turns the previous one into the baseline of the change that happened in between.
+    function testObservationsCarryBaselinesAcrossImmediateChanges() public {
+        uint256 t = AT;
+        vm.warp(t);
+        crosscheck.observeMultiplier(ticker); // 1.0, nothing pending
+        t += 1 days;
+        vm.warp(t);
+        uint256 first = t;
+        token.updateMultiplier(2e18, first); // 2:1, effective immediately
+        t += 1 hours;
+        vm.warp(t);
+        vm.expectEmit(true, true, false, true, address(crosscheck));
+        emit StockTokenCrosscheck.BaselineRecorded(ticker, address(token), first, 1e18);
+        vm.prank(address(0xCAFE));
+        crosscheck.observeMultiplier(ticker);
+        assertEq(crosscheck.baselineOf(ticker, first), 1e18);
+        StockTokenCrosscheck.Observation memory o = crosscheck.observationOf(ticker);
+        assertEq(o.multiplier, 2e18);
+        assertEq(o.observedAt, t);
+        assertEq(o.scheduledAt, first);
+        assertTrue(_checkSplit(2, 1, first));
+
+        t += 30 days;
+        vm.warp(t);
+        uint256 second = t;
+        token.updateMultiplier(6e18, second); // 3:1, effective immediately
+        assertTrue(_checkSplit(3, 1, second)); // view fallback before any keeper call
+        assertFalse(_checkSplit(6, 1, second));
+        t += 1;
+        vm.warp(t);
+        crosscheck.observeMultiplier(ticker);
+        assertEq(crosscheck.baselineOf(ticker, second), 2e18);
+        crosscheck.observeMultiplier(ticker); // later observations never rewrite a recorded baseline
+        assertEq(crosscheck.baselineOf(ticker, second), 2e18);
+        assertTrue(_checkSplit(3, 1, second));
+    }
+
+    /// Observed while a different change was pending: if that one took effect too, the observation is two changes
+    /// old, so it is not used for a later change.
+    function testObservationDuringAnotherPendingChangeIsNotABaseline() public {
+        vm.warp(AT - 2 days);
+        token.updateMultiplier(2e18, AT - 1 days);
+        crosscheck.observeMultiplier(ticker); // pending: records the baseline for AT - 1 days, observes 1.0
+        assertEq(crosscheck.baselineOf(ticker, AT - 1 days), 1e18);
+        vm.warp(AT);
+        token.updateMultiplier(4e18, AT); // the first change took effect; this one is immediate
+        (bool ok, bytes32 reason) = crosscheck.check(0, ticker, 2, _split(2, 1));
+        assertFalse(ok);
+        // forge-lint: disable-next-line(unsafe-typecast)
+        assertEq(reason, bytes32("BASELINE_UNKNOWN"));
+        vm.warp(AT + 1);
+        crosscheck.observeMultiplier(ticker);
+        assertEq(crosscheck.baselineOf(ticker, AT), 0);
+    }
+
+    function testObserveUnknownTickerRevertsAndSetTokenRejectsBrokenTokens() public {
+        // forge-lint: disable-next-line(unsafe-typecast)
+        bytes32 missing = bytes32("MISSING");
+        vm.expectRevert(abi.encodeWithSelector(StockTokenCrosscheck.UnknownTicker.selector, missing));
+        crosscheck.observeMultiplier(missing);
+        address broken = address(new RevertingStockToken());
+        vm.expectRevert(abi.encodeWithSelector(StockTokenCrosscheck.TokenReadFailed.selector, missing, broken));
+        crosscheck.setToken(missing, broken); // never registered without its first observation
+        assertEq(crosscheck.tokenOf(missing), address(0));
+        vm.expectRevert(abi.encodeWithSelector(StockTokenCrosscheck.UnknownTicker.selector, missing));
+        crosscheck.observeMultiplier(missing);
+    }
+
+    function _checkSplit(uint32 num, uint32 den, uint256 effective) private view returns (bool ok) {
+        uint64 date = SafeCast.toUint64(effective);
+        MochiTypes.SplitBody memory b = MochiTypes.SplitBody(ticker, date, num, den);
+        (ok,) = crosscheck.check(0, ticker, 2, abi.encode(ticker, date, abi.encode(b)));
     }
 
     function testRecordBaselineRevertsAndIsFirstWriteWins() public {

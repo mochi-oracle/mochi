@@ -70,26 +70,34 @@ library MochiTypes {
 
     // ─────────────────────────────── structs ───────────────────────────────
 
-    /// @notice Signed by an INTAKE enclave key (EIP-712, domain = QueryEscrow).
+    /// @notice Signed by an INTAKE enclave key (EIP-712, domain = QueryEscrow): a single-use grant to open ONE query.
+    ///         The first six fields describe the document the intake measured. The rest bind the grant to the open
+    ///         the document owner asked for (they were sealed to the intake together with the document), so a copied
+    ///         (provenance, signature) pair cannot open a query for anyone else, with other params, consent flags or a
+    ///         different result key. queryId = computeQueryId(opener, docCommit, nonce) is fixed by the grant, so it
+    ///         can open at most one query (a second open reverts QueryExists). It expires at `expiry`.
     struct Provenance {
         bytes32 docCommit; // keccak256(abi.encodePacked(salt, docHash)); salt = 0 for public queries
         uint8 kind; // ProvenanceKind
         bytes32 originId; // keccak256(bytes(lowercase origin host)), 0 for SUBMITTED
         uint64 fetchedAt; // unix seconds, 0 for SUBMITTED
         uint32 tokensK; // document size in 1k-token units after OCR (ceil), >= 1
-        bytes32 transcriptHash; // hash of the TLS transcript / cert chain, 0 for SUBMITTED
-    }
-
-    /// @notice Caller-supplied parameters for opening a query.
-    struct OpenParams {
+        bytes32 transcriptHash; // SUBMITTED: H(salt, contentType, text, params); FETCHED: TLS transcript, salted H(salt, tls) if private
+        address opener; // the only msg.sender allowed to open with this grant (payer wallet, relayer or feed runner)
         uint32 schemaId;
-        uint8 n; // 3, 5, 7 or 9
+        uint16 schemaVersion; // the intake's schema version; must equal SchemaRegistry.latest(schemaId) at open
+        bytes32 paramsHash; // keccak256 of canonical query params JSON (e.g. consensus EPS), computed by the intake
+        bytes32 payerCommit; // commitment to the payer's result key (private queries), 0 for public queries
         bool isPublic;
         bool allowPanelDisclosure; // payer consents to human-panel escalation seeing the document
-        bytes32 paramsHash; // keccak256 of canonical query params JSON (e.g. consensus EPS), 0 if none
-        bytes32 payerCommit; // opaque payer commitment (shielded path), 0 otherwise
+        uint64 nonce; // opener-chosen; makes queryId unique
+        uint64 expiry; // unix seconds; open reverts after it
+    }
+
+    /// @notice Caller-supplied payment parameters for opening a query. Everything else comes from the signed Provenance.
+    struct OpenParams {
+        uint8 n; // 3, 5, 7 or 9
         address refundTo; // where refunds go; must be non-zero
-        uint64 nonce; // caller-chosen; makes queryId unique
     }
 
     /// @notice Stored per query by QueryEscrow.
@@ -106,7 +114,7 @@ library MochiTypes {
         ProvenanceKind provenanceKind;
         bytes32 originId;
         uint32 tokensK;
-        bytes32 provenanceHash; // EIP-712 struct hash of the Provenance
+        bytes32 provenanceHash; // EIP-712 struct hash of the Provenance (unique per query; intake keys its record by it)
         bytes32 paramsHash;
         bytes32 payerCommit;
         address payer; // msg.sender of open (relayer for shielded path)
@@ -138,7 +146,10 @@ library MochiTypes {
         uint32 dissentMask; // bit i = seat i dissented on a required field or timed out
         uint32 timeoutMask; // bit i = seat i timed out
         bytes32 answerHash; // keccak256(canonical JSON of the agreed answer incl. salt)
-        bytes32 payloadHash; // keccak256(payload); 0 when status == HUNG
+        // Public query: keccak256(payload) (Feeds re-checks it). Private query: keccak256(abi.encodePacked(
+        // "mochi/private-payload/v1", salt, keccak256(payload))) with the query's secret salt, so the outcome cannot be
+        // found by hashing candidate payloads. 0 when status == HUNG.
+        bytes32 payloadHash;
         bytes32 evidenceRoot; // merkle root over agreed-field span hashes
     }
 
@@ -168,13 +179,16 @@ library MochiTypes {
         bytes32 payerCommit;
     }
 
-    /// @notice EIP-712 voucher signed by Anonyma's settlement key (domain = QueryEscrow).
+    /// @notice EIP-712 voucher signed by Anonyma's settlement key (domain = QueryEscrow). It pays for exactly one query:
+    ///         its open to jury size n (openWithVoucher) or its expansion to n (expandWithVoucher). Anonyma computes
+    ///         queryId = QueryEscrow.computeQueryId(opener, docCommit, nonce) from the open binding it seals for the
+    ///         intake (opener = the relaying gateway, nonce = the grant's nonce), so nobody else's grant can spend it.
     struct AnonymaVoucher {
         bytes32 voucherId;
-        bytes32 docCommit;
+        bytes32 queryId;
         uint32 schemaId;
         uint8 n;
-        uint256 maxAmount; // USDG ceiling for this query
+        uint256 maxAmount; // USDG ceiling for this open or expansion
         uint8 tier; // NYMA holder tier (recorded only; discount is absorbed by Anonyma)
         uint64 expiry;
     }
@@ -266,7 +280,7 @@ library MochiTypes {
 
 
     bytes32 internal constant PROVENANCE_TYPEHASH = keccak256(
-        "Provenance(bytes32 docCommit,uint8 kind,bytes32 originId,uint64 fetchedAt,uint32 tokensK,bytes32 transcriptHash)"
+        "Provenance(bytes32 docCommit,uint8 kind,bytes32 originId,uint64 fetchedAt,uint32 tokensK,bytes32 transcriptHash,address opener,uint32 schemaId,uint16 schemaVersion,bytes32 paramsHash,bytes32 payerCommit,bool isPublic,bool allowPanelDisclosure,uint64 nonce,uint64 expiry)"
     );
 
     bytes32 internal constant JUROR_ANSWER_TYPEHASH = keccak256(
@@ -278,18 +292,31 @@ library MochiTypes {
     );
 
     bytes32 internal constant ANONYMA_VOUCHER_TYPEHASH = keccak256(
-        "AnonymaVoucher(bytes32 voucherId,bytes32 docCommit,uint32 schemaId,uint8 n,uint256 maxAmount,uint8 tier,uint64 expiry)"
+        "AnonymaVoucher(bytes32 voucherId,bytes32 queryId,uint32 schemaId,uint8 n,uint256 maxAmount,uint8 tier,uint64 expiry)"
     );
 
+    /// @dev Every member is a static atomic type, so abi.encode(struct) is exactly the EIP-712 encodeData of its
+    ///      members in declaration order (each one 32-byte word).
     function hashProvenance(Provenance memory p) internal pure returns (bytes32) {
-        return keccak256(
-            abi.encode(PROVENANCE_TYPEHASH, p.docCommit, p.kind, p.originId, p.fetchedAt, p.tokensK, p.transcriptHash)
-        );
+        return keccak256(abi.encode(PROVENANCE_TYPEHASH, p));
+    }
+
+    /// @dev Same hash, read straight from the calldata words of the (static) struct. A non-canonical encoding (dirty
+    ///      high bits) hashes differently from what the intake signed, so it fails signature recovery, and any member
+    ///      read through Solidity is still range-checked.
+    function hashProvenanceCalldata(Provenance calldata p) internal pure returns (bytes32 h) {
+        bytes32 typehash = PROVENANCE_TYPEHASH;
+        assembly ("memory-safe") {
+            let ptr := mload(0x40)
+            mstore(ptr, typehash)
+            calldatacopy(add(ptr, 0x20), p, 0x1e0) // 15 members x 32 bytes
+            h := keccak256(ptr, 0x200)
+        }
     }
 
     function hashAnonymaVoucher(AnonymaVoucher memory v) internal pure returns (bytes32) {
         return keccak256(
-            abi.encode(ANONYMA_VOUCHER_TYPEHASH, v.voucherId, v.docCommit, v.schemaId, v.n, v.maxAmount, v.tier, v.expiry)
+            abi.encode(ANONYMA_VOUCHER_TYPEHASH, v.voucherId, v.queryId, v.schemaId, v.n, v.maxAmount, v.tier, v.expiry)
         );
     }
 

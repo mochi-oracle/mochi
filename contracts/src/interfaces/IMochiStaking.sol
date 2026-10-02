@@ -26,7 +26,11 @@ interface IMochiStaking {
     function requestUnstake(uint256 amount) external;
     function withdraw() external;
     /// @notice Pulls `amount` USDG from msg.sender and streams it plus any active-period leftover and unstaked
-    ///         elapsed rewards over `rewardDuration`. Accrual while totalStaked == 0 is carried in `undistributed`.
+    ///         elapsed rewards until a new periodFinish: `rewardDuration` from now without an active stream; otherwise
+    ///         the reward-weighted mean of the current periodFinish (for the leftover) and now + `rewardDuration` (for
+    ///         the rest), floored to whole seconds. A dust notify therefore leaves the finish where it is, and moving
+    ///         it far takes a notify about as large as what is left to stream (paid to stakers). Accrual while
+    ///         totalStaked == 0 is carried in `undistributed` and re-streamed like new rewards.
     function notifyReward(uint256 amount) external;
     function claim() external returns (uint256);
     function lockForVote(address account, uint64 until) external;
@@ -38,10 +42,13 @@ interface IMochiStaking {
     function stakeAt(address account, uint48 timepoint) external view returns (uint256);
     /// @notice Returns total active stake at a past timestamp; the current timestamp is not a past timepoint.
     function totalStakedAt(uint48 timepoint) external view returns (uint256);
+    /// @notice Cumulative USDG base units per MOCHI wei, scaled by 1e36 (6-decimal reward over 18-decimal stake).
     function rewardPerToken() external view returns (uint256);
     /// @notice USDG per second scaled by 1e18 (so small per-verdict fees don't round to a zero rate).
     function rewardRate() external view returns (uint256);
     function periodFinish() external view returns (uint64);
+    /// @notice Whole USDG base units carried into the next notifyReward (streamed while nothing was staked, plus the
+    ///         rate's truncation remainder).
     function undistributed() external view returns (uint256);
     function lockedUntil(address account) external view returns (uint64);
     function rewardDuration() external view returns (uint64);

@@ -3,16 +3,26 @@ on:
   push:
   pull_request:
 
+# Read-only token for every job; no job pushes, comments or writes packages.
+permissions:
+  contents: read
+
+# Third-party actions are pinned to full commit SHAs (tag in the trailing comment). Bun comes from package.json
+# "packageManager"; Foundry stays on v1.7.1.
 jobs:
   contracts:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
-        with: { submodules: recursive }
-      - uses: foundry-rs/foundry-toolchain@v1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: foundry-rs/foundry-toolchain@908c540300062bd5a7e473851cdb4282204cee09 # v1.9.1
         with:
           version: v1.7.1
-      - uses: oven-sh/setup-bun@v2
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version-file: package.json
       # Solidity deps of the vendored Privacy Pools code resolve from node_modules (lifecycle scripts never run).
       - run: bun install --frozen-lockfile --ignore-scripts
       - name: Build (sizes must stay under EIP-170)
@@ -21,12 +31,20 @@ jobs:
       - name: Test
         working-directory: contracts
         run: forge test
+      - name: Deep invariants (1600 runs x depth 64)
+        working-directory: contracts
+        env:
+          FOUNDRY_PROFILE: deep
+        run: forge test --match-test '^invariant_'
 
   typescript:
-    runs-on: ubuntu-latest
+    name: typescript (typecheck, tests, website build)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
     services:
       timescale:
-        image: timescale/timescaledb:latest-pg17
+        # 2.30.2-pg17 (what latest-pg17 pointed to on 2026-09-29), pinned by index digest.
+        image: timescale/timescaledb:2.30.2-pg17@sha256:b346edcdb51a1fd6020e3965e0bd1c9f3406fa6d5fbce1e28f4852587ef934e2
         env:
           POSTGRES_USER: mochi
           POSTGRES_PASSWORD: mochi
@@ -35,9 +53,13 @@ jobs:
         options: >-
           --health-cmd "pg_isready -U mochi" --health-interval 5s --health-timeout 5s --health-retries 20
     steps:
-      - uses: actions/checkout@v4
-      - uses: oven-sh/setup-bun@v2
-      - uses: foundry-rs/foundry-toolchain@v1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version-file: package.json
+      - uses: foundry-rs/foundry-toolchain@908c540300062bd5a7e473851cdb4282204cee09 # v1.9.1
         with:
           version: v1.7.1
       - run: bun install --frozen-lockfile --ignore-scripts
@@ -48,7 +70,14 @@ jobs:
       - name: Generated ABIs/bytecode match the contracts
         run: bun scripts/gen-abis.ts && git diff --exit-code packages/chain/src/abis.ts
       - name: Typecheck
-        run: bunx tsc --noEmit -p tsconfig.json
+        run: bun run typecheck
+      # web/test serves web/site/dist, so the website is built before the tests run.
+      - name: Install website dependencies
+        working-directory: web/site
+        run: bun install --frozen-lockfile --ignore-scripts
+      - name: Build website
+        working-directory: web/site
+        run: bun run build
       - name: Test every package and service
         env:
           DATABASE_URL: postgres://mochi:mochi@127.0.0.1:55432/mochi
@@ -59,18 +88,9 @@ jobs:
             (cd "$d" && bun test)
             echo "::endgroup::"
           done
+      # Path arguments (leading ./) select directories; bare words would be substring filters.
+      - name: Test scripts, web and root tests
+        run: bun test ./scripts ./web ./test
       - name: Privacy guard — no plaintext logging of documents/answers
         run: |
           ! grep -rnE 'log\([^)]*(docB64|docText|plain\.text|answerJson|salt)' services/*/src packages/*/src
-
-  website:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: oven-sh/setup-bun@v2
-      - run: bun install --frozen-lockfile --ignore-scripts
-      - run: bun install --frozen-lockfile --ignore-scripts
-        working-directory: web/site
-      - run: bun run build
-        working-directory: web/site
-      - run: bun test services/claims/test web/test

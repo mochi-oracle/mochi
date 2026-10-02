@@ -5,7 +5,8 @@
 //   bun scripts/owner-console.ts --deployment <deployment.json> --batch <file.json> [--batch <file.json> ...]
 //     [--expect-from 0x...] [--rpc https://...] [--port 4455] [--log <path>]
 //
-// Accepted batch files: scripts/phala-batch.ts output, scripts/owner-timelock.ts output, and transaction lists
+// Accepted batch files: scripts/phala-batch.ts output, scripts/panel-escalation.ts switch-on output,
+// scripts/owner-timelock.ts output, and transaction lists
 // ({chainId, transactions:[{to,data,value,purpose}]}) such as scripts/prepare-production-enrollment.ts output.
 import { appendFileSync, chmodSync, existsSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";

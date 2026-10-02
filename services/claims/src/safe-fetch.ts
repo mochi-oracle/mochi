@@ -1,6 +1,7 @@
 import { lookup as dnsLookup } from 'node:dns/promises';
 import { request as httpsRequest } from 'node:https';
 import type { IncomingMessage } from 'node:http';
+import { elementText, replaceComments, replaceElements, replaceTags, tagNames, truncateUtf16 } from '@mochi/core/html';
 
 export interface FetchedSource { url: string; title: string; text: string; publishedAt?: string }
 export interface SafeFetchOptions {
@@ -58,11 +59,23 @@ function canonical(raw: string): URL {
   u.hash = '';
   return u;
 }
-function textFromHtml(html: string): { title: string; text: string } {
-  const title = decode((html.match(/<title\b[^>]*>([\s\S]*?)<\/title\s*>/i)?.[1] ?? '').replace(/<[^>]*>/g, '')).trim().slice(0, 500);
-  const cleaned = html.replace(/<!--([\s\S]*?)-->/g, ' ').replace(/<(script|style|noscript|svg|template)\b[^>]*>[\s\S]*?<\/\1\s*>/gi, ' ')
-    .replace(/<(br|\/p|\/div|\/li|\/h[1-6]|\/article|\/section|\/tr)\b[^>]*>/gi, '\n').replace(/<[^>]*>/g, ' ');
-  return { title: title || 'Untitled source', text: decode(cleaned).replace(/[\t\r ]+/g, ' ').replace(/ *\n */g, '\n').replace(/\n{3,}/g, '\n\n').trim() };
+// Source pages are untrusted. Every pass below is a linear index scan (@mochi/core/html, no backtracking regex), so a
+// crafted page cannot stall the single-threaded pilot past its retrieval deadline. Raw-text elements (script, style,
+// …) are stripped from the whole fetched page before the extracted text is capped: capping the page first would cut
+// an unclosed <style> or <script> and turn its CSS or JavaScript into "evidence" while dropping the body.
+/** Raw page bound: above the 512 KiB fetch cap, so stripping always sees the whole fetched body. */
+const MAX_HTML_CHARS = 1024 * 1024;
+/** Extracted text bound (after stripping). */
+const MAX_TEXT_CHARS = 128 * 1024;
+const RAW_TEXT_TAGS = tagNames(['script', 'style', 'noscript', 'svg', 'template']);
+const BLOCK_TAGS = tagNames(['br', '/p', '/div', '/li', '/h1', '/h2', '/h3', '/h4', '/h5', '/h6', '/article', '/section', '/tr']);
+export function textFromHtml(source: string): { title: string; text: string } {
+  const html = truncateUtf16(source, MAX_HTML_CHARS);
+  const title = truncateUtf16(decode(replaceTags(elementText(html, 'title') ?? '', null, '')).trim(), 500);
+  const cleaned = replaceTags(replaceTags(replaceElements(replaceComments(html, ' '), RAW_TEXT_TAGS, ' '), BLOCK_TAGS, '\n'), null, ' ');
+  // Linear: the first replace leaves no run of more than one space for / *\n */ to backtrack over.
+  const text = decode(cleaned).replace(/[\t\r ]+/g, ' ').replace(/ *\n */g, '\n').replace(/\n{3,}/g, '\n\n').trim();
+  return { title: title || 'Untitled source', text: truncateUtf16(text, MAX_TEXT_CHARS).trimEnd() };
 }
 function decode(s: string): string {
   return s.replace(/&(#x[\da-f]+|#\d+|amp|lt|gt|quot|apos|nbsp);/gi, (_m, v: string) => {

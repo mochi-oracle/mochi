@@ -1,7 +1,7 @@
 import { afterAll, beforeAll, expect, test } from "bun:test";
 import { createDb, migrate } from "../src/index.ts";
 import {
-  activeFeedSubscribers, getDisclosure, getPanelPayloadByHash, insertDisclosure, insertPanelPayload,
+  activeFeedSubscribers, getDisclosure, getPanelPayloadByHash, insertDisclosure, insertPanelPayload, listDisclosures,
   modelDisagreementSeries, paidVerdictCounts, recordModelDisagreement, upsertFeedSubscription,
 } from "../src/wave3-repo.ts";
 
@@ -21,8 +21,18 @@ test("per-model disagreement merges exactly", async () => {
 });
 
 test("disclosures, subscriptions, panel payloads", async () => {
-  await insertDisclosure(handle.db, h("01"), h("02"), new Uint8Array([1, 2, 3]));
+  await insertDisclosure(handle.db, h("01"), h("02"), h("0a"), new Uint8Array([1, 2, 3]));
   expect((await getDisclosure(handle.db, h("01"), h("02")))?.envelope).toEqual(new Uint8Array([1, 2, 3]));
+  // A second, different envelope for the same verdict and recipient is kept beside the first; reposts are no-ops.
+  await insertDisclosure(handle.db, h("01"), h("02"), h("0b"), new Uint8Array([4]));
+  await insertDisclosure(handle.db, h("01"), h("02"), h("0a"), new Uint8Array([1, 2, 3]));
+  expect((await getDisclosure(handle.db, h("01"), h("02"), h("0b")))?.envelope).toEqual(new Uint8Array([4]));
+  expect((await getDisclosure(handle.db, h("01"), h("02")))?.envelopeHash).toBe(h("0a")); // oldest
+  const listed = await listDisclosures(handle.db, h("01"), h("02"));
+  expect(listed.total).toBe(2);
+  expect(listed.envelopes.map((e) => e.envelopeHash)).toEqual([h("0a"), h("0b")]);
+  expect((await listDisclosures(handle.db, h("01"), h("02"), 1)).envelopes).toHaveLength(1);
+  expect(await getDisclosure(handle.db, h("01"), h("02"), h("0c"))).toBeNull();
   await upsertFeedSubscription(handle.db, h("03"), `0x${"ab".repeat(20)}`, new Date(Date.now() + 86400e3), 10n);
   expect(await activeFeedSubscribers(handle.db, new Date())).toBe(1);
   await insertPanelPayload(handle.db, { caseId: h("04"), panelIndex: 0, evaluator: `0x${"cd".repeat(20)}`, payloadHash: h("05"), payload: new Uint8Array([9]) });

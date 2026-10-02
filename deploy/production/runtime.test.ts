@@ -21,7 +21,7 @@ const config = () => ({
   },
   identities: {
     intake: { address: a(11), operator: a(31), measurement: h(101) }, consensus: { address: a(12), operator: a(32), measurement: h(102) },
-    jurors: models.map(([modelId, lineage], i) => ({ address: a(20 + i), operator: a(40 + i), measurement: h(110 + i), class: [0, 0, 1, 1, 2, 2, 3, 4, 4][i], passport: { modelId, lineage, weightsSha256: h(0), openWeights: false, provider: "phala-aci", zdr: false, aciModel: modelId, workload: `reviewed-workload-${i}`, maxTokens: 4096 } })),
+    jurors: models.map(([modelId, lineage], i) => ({ address: a(20 + i), operator: a(40 + i), measurement: h(110 + i), class: [0, 0, 1, 1, 2, 2, 3, 4, 4][i], passport: { modelId, lineage, weightsSha256: h(0), openWeights: false, provider: "phala-aci", zdr: false, aciModel: modelId, workload: `os:${String(i + 1).padStart(2, "0").repeat(32)}`, maxTokens: 4096 } })),
   },
   serviceRoleAddresses: { attestor: a(61), indexer: a(62), orchestrator: a(63), feedRunner: a(64), postman: a(65) },
   aciApiKeyEnv: "ACI_API_KEY", attestorAdminTokenEnv: "ATTESTOR_ADMIN_TOKEN",
@@ -86,8 +86,22 @@ describe("production runtime config", () => {
     expect(() => validateLaunchConfig(missingSeat)).toThrow("exactly nine");
     const stub = config(); (stub as any).identities.jurors[0].passport.modelId = "stub-model";
     expect(() => validateLaunchConfig(stub)).toThrow("reviewed Phala ACI model");
+    for (const workload of ["reviewed-workload-0", "os:short", `workload:x,model:${"m"}`]) {
+      const unpinned = config(); (unpinned as any).identities.jurors[3].passport.workload = workload;
+      expect(() => validateLaunchConfig(unpinned)).toThrow("attested os: or compose: pin");
+    }
     const publicBind = config(); (publicBind as any).endpoints.intake = "http://0.0.0.0:3001";
     expect(() => validateLaunchConfig(publicBind)).toThrow("loopback");
+  });
+
+  test("the Intel TCB policy is explicit: UpToDate by default, a reviewed wider list allowed, Revoked never", () => {
+    expect(validateLaunchConfig(config()).tdxAllowedTcbStatuses).toBeUndefined();
+    const relaxed = config(); (relaxed as any).tdxAllowedTcbStatuses = ["UpToDate", "SWHardeningNeeded", "OutOfDate"];
+    expect(validateLaunchConfig(relaxed).tdxAllowedTcbStatuses).toEqual(["UpToDate", "SWHardeningNeeded", "OutOfDate"]);
+    for (const bad of [[], ["OutOfDate"], ["UpToDate", "Revoked"], ["UpToDate", "UpToDate"], ["UpToDate", "Bogus"], "UpToDate"]) {
+      const c = config(); (c as any).tdxAllowedTcbStatuses = bad;
+      expect(() => validateLaunchConfig(c)).toThrow("tdxAllowedTcbStatuses");
+    }
   });
 
   test("startup failure reasons keep our message but drop credentials and key-like values", () => {

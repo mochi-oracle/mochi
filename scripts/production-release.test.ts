@@ -260,3 +260,31 @@ test("zero-bond shared-control release prepares exact juror approvals and preser
   expect(batch.delaySeconds).toBe(60);
   expect(() => buildProductionRelease({ ...valid(), mochiToken: addr(25), minimumJurorBondMochi: 0 }, { deployment: releaseDeployment({ minJurorBond: "1" }) })).toThrow("does not match");
 });
+
+test("preflight verifies the recorded panel escalation mode against QueryEscrow wiring", async () => {
+  const input = { ...valid(), mochiToken: addr(20), usdg: addr(31) };
+  const base = (wiring: { panel: Address; panelReserveBps: number } | undefined): ReadOnlyReader => ({
+    async chainId() { return 4663; }, async code() { return "0x6000"; },
+    async decimals(token) { return token.toLowerCase() === addr(31) ? 6 : 18; },
+    async hasRole() { return true; }, async nativeBalance() { return 1n; },
+    async jurorInfo(key) { const ids = identitiesFixture(); const identity = [ids.intake, ids.consensus, ...ids.jurors].find((x) => x.address.toLowerCase() === key.toLowerCase())!; const role = key === ids.intake.address ? 2 : key === ids.consensus.address ? 3 : 1; return { operator: identity.operator, measurement: identity.measurement, role, jurorClass: (identity as { class?: number }).class ?? 0, bond: role === 1 ? 25_000n * 10n ** 18n : 0n }; },
+    async isActive() { return true; }, async feedBudget() { return 10_000_000n; }, async paused() { return true; },
+    ...(wiring ? { async panelWiring() { return wiring; } } : {}),
+  });
+  const off = { ...deploymentFixture(), panelEscalation: "off" as const };
+  const zero = `0x${"00".repeat(20)}` as Address;
+  const ok = await runReadOnlyPreflight(off, input, base({ panel: zero, panelReserveBps: 0 }), identitiesFixture());
+  expect(ok.checks.find((c) => c.id === "panel-escalation")).toMatchObject({ ok: true });
+  expect(ok.checksPassed).toBe(true);
+  const wired = await runReadOnlyPreflight(off, input, base({ panel: addr(28), panelReserveBps: 2500 }), identitiesFixture());
+  expect(wired.checks.find((c) => c.id === "panel-escalation")).toMatchObject({ ok: false });
+  expect(wired.checksPassed).toBe(false);
+  const unreadable = await runReadOnlyPreflight(off, input, base(undefined), identitiesFixture());
+  expect(unreadable.checks.find((c) => c.id === "panel-escalation")?.ok).toBe(false);
+  const unrecorded = await runReadOnlyPreflight(deploymentFixture(), input, base(undefined), identitiesFixture());
+  expect(unrecorded.checks.some((c) => c.id === "panel-escalation")).toBe(false);
+  const legacyWired = await runReadOnlyPreflight(deploymentFixture(), input, base({ panel: addr(28), panelReserveBps: 2500 }), identitiesFixture());
+  expect(legacyWired.checks.find((c) => c.id === "panel-escalation")).toMatchObject({ ok: false });
+  const legacyOff = await runReadOnlyPreflight(deploymentFixture(), input, base({ panel: zero, panelReserveBps: 0 }), identitiesFixture());
+  expect(legacyOff.checks.find((c) => c.id === "panel-escalation")?.detail).toContain("expected; not recorded");
+});

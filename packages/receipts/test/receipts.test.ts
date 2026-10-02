@@ -88,6 +88,13 @@ describe("Anonyma-compatible verdict receipts", () => {
     expect("answer_json" in receipt).toBe(false);
   });
 
+  test("32-byte hex fields must be exactly 32 bytes", () => {
+    for (const bad of [`0x${"ab".repeat(31)}`, `0x${"ab".repeat(33)}`, `0x${"ab".repeat(31)}a`, "0x", `0x${"zz".repeat(32)}`]) {
+      expect(() => buildVerdictReceipt({ ...receiptInput, queryId: bad as Hex }, { keyId: "k" })).toThrow("queryId must be");
+    }
+    expect(buildVerdictReceipt({ ...receiptInput, queryId: `0x${"AB".repeat(32)}` }, { keyId: "k" }).query_id).toBe(`0x${"ab".repeat(32)}`);
+  });
+
   test("validates numeric safety and verifies signatures through envelope lookup", () => {
     expect(() => buildVerdictReceipt({ ...receiptInput, round: Number.MAX_SAFE_INTEGER + 1 }, { keyId: "k" })).toThrow();
     const signer = createReceiptSigner();

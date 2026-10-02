@@ -20,6 +20,10 @@ export interface ChainPort {
   seal(id: Hex): Promise<Hex>; reseal(id: Hex): Promise<Hex>; expire(id: Hex): Promise<Hex>;
   expand(id: Hex, n: number): Promise<Hex>; escalate(id: Hex): Promise<Hex>;
   panelFee(): Promise<bigint>; usdgApprove(spender: Address, amount: bigint): Promise<Hex>;
+  /** QueryEscrow.panel(): zero while panel escalation is off (docs/PANEL-ESCALATION.md). */
+  escrowPanel(): Promise<Address>;
+  /** USDG allowance from the account that approves and escalates (the feed runner key) to `spender`. */
+  usdgAllowance(spender: Address): Promise<bigint>;
   post(v: VerdictInputArg, votes: JurorVoteArg[], sig: Hex): Promise<Hex>;
   feedsUpdate(feedId: Hex, key: Hex, verdictId: Hex, payload: Hex): Promise<Hex>;
 }

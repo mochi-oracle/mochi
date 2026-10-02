@@ -1,0 +1,164 @@
+name: security
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+# Read-only token. Results go to the job log and step summary, not to code scanning (no security-events: write).
+permissions:
+  contents: read
+
+# Actions are pinned to full commit SHAs (tag in the trailing comment). Every tool is pinned: release binaries by
+# version and SHA-256, Python tools by hash-locked requirements (.github/requirements/*.txt), rules by commit.
+#
+# Gating: gitleaks fails the build on any unallowlisted finding. Semgrep fails a pull request only on findings the
+# pull request introduces. Slither fails on any Medium or High finding that is not triaged; Aderyn fails on any High
+# finding that is not triaged (Low findings of both are report-only). Triage is recorded next to the code
+# (`// slither-disable-next-line <detector> -- <reason>`, `// aderyn-fp-next-line(<detector>) <reason>`) or, for code
+# that cannot carry an annotation yet, in contracts/slither.db.json and contracts/aderyn-baseline.json.
+jobs:
+  gitleaks:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    env:
+      GITLEAKS_VERSION: 8.30.1
+      GITLEAKS_SHA256: 551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb # gitleaks_8.30.1_linux_x64.tar.gz
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0 # scan every reachable commit, not just the tip
+          persist-credentials: false
+      - name: Install gitleaks
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP"
+          curl -fsSL -o gitleaks.tar.gz \
+            "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          echo "${GITLEAKS_SHA256}  gitleaks.tar.gz" | sha256sum -c -
+          mkdir -p bin && tar -xzf gitleaks.tar.gz -C bin gitleaks
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+      # Allowlists (including forge-std's public Infura key) are documented in .gitleaks.toml; reviewed historical
+      # false positives are in .gitleaksignore.
+      - name: Scan git history
+        run: gitleaks git --config .gitleaks.toml --gitleaks-ignore-path .gitleaksignore --redact --verbose .
+
+  slither:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: foundry-rs/foundry-toolchain@908c540300062bd5a7e473851cdb4282204cee09 # v1.9.1
+        with:
+          version: v1.7.1
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version-file: package.json
+      # Remappings for the vendored Privacy Pools code resolve from node_modules (lifecycle scripts never run).
+      - run: bun install --frozen-lockfile --ignore-scripts
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          version: "0.12.21"
+          enable-cache: false
+      - name: Install Slither (hash-locked)
+        run: |
+          set -euo pipefail
+          uv venv "$RUNNER_TEMP/slither" --python 3.12
+          VIRTUAL_ENV="$RUNNER_TEMP/slither" uv pip install --require-hashes -r .github/requirements/slither.txt
+          echo "$RUNNER_TEMP/slither/bin" >> "$GITHUB_PATH"
+      # Scope (lib/, vendor/, node_modules/, tests and mocks filtered) is in contracts/slither.config.json. crytic-compile
+      # builds with forge and skips test/ and script/. Triaged findings are suppressed by inline slither-disable comments
+      # and by the triage database contracts/slither.db.json (matched by finding id), which Slither reads from the
+      # working directory.
+      - name: Slither (fails on untriaged Medium or High)
+        working-directory: contracts
+        run: slither . --fail-medium
+
+  aderyn:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      ADERYN_VERSION: 0.6.8
+      ADERYN_SHA256: ffd6ca658962e211a3ac821c646f69c8e14bf1b1001cbfe091bcd4535a691e46 # aderyn-x86_64-unknown-linux-gnu.tar.xz
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: foundry-rs/foundry-toolchain@908c540300062bd5a7e473851cdb4282204cee09 # v1.9.1
+        with:
+          version: v1.7.1
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version-file: package.json
+      - run: bun install --frozen-lockfile --ignore-scripts
+      - name: Install Aderyn
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP"
+          curl -fsSL -o aderyn.tar.xz \
+            "https://github.com/Cyfrin/aderyn/releases/download/aderyn-v${ADERYN_VERSION}/aderyn-x86_64-unknown-linux-gnu.tar.xz"
+          echo "${ADERYN_SHA256}  aderyn.tar.xz" | sha256sum -c -
+          mkdir -p aderyn && tar -xJf aderyn.tar.xz -C aderyn --strip-components=1
+          echo "$RUNNER_TEMP/aderyn" >> "$GITHUB_PATH"
+      # Scope and the disabled Low detectors are in contracts/aderyn.toml (src/ only; mocks and the vendor import shim
+      # excluded). Aderyn exits non-zero only when it cannot compile or crashes and has no fail-on-severity option, so
+      # scripts/aderyn-gate.ts reads the JSON report and fails on any High instance that is not accepted in
+      # contracts/aderyn-baseline.json (inline aderyn-fp/aderyn-ignore comments never reach the report). The Markdown
+      # report goes to the step summary.
+      - name: Aderyn (report)
+        working-directory: contracts
+        run: |
+          set -euo pipefail
+          aderyn . --output "$RUNNER_TEMP/aderyn-report.md"
+          cat "$RUNNER_TEMP/aderyn-report.md" >> "$GITHUB_STEP_SUMMARY"
+          aderyn . --output "$RUNNER_TEMP/aderyn-report.json"
+      - name: Aderyn gate (fails on untriaged High)
+        run: bun scripts/aderyn-gate.ts "$RUNNER_TEMP/aderyn-report.json" contracts/aderyn-baseline.json contracts
+
+  semgrep:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      # semgrep/semgrep-rules (Semgrep Rules License v1.0), develop as of 2026-09-22. Only the security rule
+      # subtrees for JavaScript, TypeScript and Solidity are used, mirroring the registry's p/javascript and
+      # p/typescript packs.
+      SEMGREP_RULES_SHA: a84ff9cc2453ca91d581380de4b8b3f272f6f4be
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0 # the pull-request baseline needs the base commit
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          version: "0.12.21"
+          enable-cache: false
+      - name: Install Semgrep (hash-locked)
+        run: |
+          set -euo pipefail
+          uv venv "$RUNNER_TEMP/semgrep" --python 3.12
+          VIRTUAL_ENV="$RUNNER_TEMP/semgrep" uv pip install --require-hashes -r .github/requirements/semgrep.txt
+          echo "$RUNNER_TEMP/semgrep/bin" >> "$GITHUB_PATH"
+      - name: Fetch pinned rules
+        run: |
+          set -euo pipefail
+          rules="$RUNNER_TEMP/semgrep-rules"
+          git init -q "$rules"
+          git -C "$rules" fetch -q --depth 1 https://github.com/semgrep/semgrep-rules.git "$SEMGREP_RULES_SHA"
+          git -C "$rules" checkout -q FETCH_HEAD
+          test "$(git -C "$rules" rev-parse HEAD)" = "$SEMGREP_RULES_SHA"
+      # Exclusions are in .semgrepignore. The full scan reports every finding; on pull requests a second, diff-aware
+      # scan fails only on findings that are new relative to the base commit.
+      - name: Semgrep
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          set -euo pipefail
+          rules="$RUNNER_TEMP/semgrep-rules"
+          config=()
+          while IFS= read -r dir; do config+=(--config "$dir"); done < <(
+            find "$rules/javascript" "$rules/typescript" "$rules/solidity" -type d -name security | sort)
+          semgrep scan --metrics=off --disable-version-check "${config[@]}" --text
+          if [ "$GITHUB_EVENT_NAME" = "pull_request" ]; then
+            semgrep scan --metrics=off --disable-version-check "${config[@]}" --baseline-commit "$BASE_SHA" --error
+          fi

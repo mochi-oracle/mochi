@@ -1,8 +1,8 @@
 import { createHash } from "node:crypto";
 import { answerHash, canonicalJson, docCommit, docHash, verdictId, votesHash } from "@mochi/core";
-import { aad, AttestationDocSchema, JurorAttestationDocSchema, PrivateResultPlainSchema, type JurorVoteJson } from "@mochi/protocol";
+import { aad, AttestationDocSchema, JurorAttestationDocSchema, PrivateResultPlainSchema, ProvenanceJsonSchema, payerCommit, privateResultMismatch, provenanceFromJson, provenanceMatchesBinding, type JurorVoteJson } from "@mochi/protocol";
 import { DcapQuoteVerifier, PcsCollateralSource, keyBinding, open, parseTdxQuote, parseTdxReportData, recoverProvenance, recoverJurorAnswer, recoverVerdictAttestation, seal, tdxMeasurement, type Quote } from "@mochi/tee";
-import { fromHex, keccak256, recoverMessageAddress, type Address, type Hex } from "viem";
+import { fromHex, recoverMessageAddress, type Address, type Hex } from "viem";
 import { passportHash } from "@mochi/protocol";
 import { ROUND_REHEARSAL_FIXTURE, ROUND_REHEARSAL_MODEL_OUTPUT } from "./round.ts";
 import { normalizeParams, paramsHash, resolveSchema } from "@mochi/schemas";
@@ -137,7 +137,9 @@ async function verifyRound(baseUrl: string, pin: Hex, deps: RoundVerifyTestDepen
   const normalizedParams = normalizeParams(resolveSchema(fixture.schemaId as never, fixture.params), fixture.params);
   if (normalizedParams.ok !== true) fail("Fixed fixture parameters failed schema normalization.");
   const expectedParamsHash = paramsHash((normalizedParams as { ok: true; params: Record<string, never> }).params as never);
-  const upload = { v: 1, schemaId: fixture.schemaId, salt: fixture.salt, params: fixture.params, contentType: "text/plain", docB64: Buffer.from(docBytes).toString("base64") };
+  // The open binding is sealed with the document: the fixed private query, committed to this run's payer key.
+  const openBinding = { ...fixture.open, payerCommit: payerCommit(payerPubHex) };
+  const upload = { v: 1, schemaId: fixture.schemaId, salt: fixture.salt, params: fixture.params, contentType: "text/plain", docB64: Buffer.from(docBytes).toString("base64"), open: openBinding };
   const envelope = seal(attestations.intake.encryptionPubKey as Hex, encode(upload), aad.intake());
   const body = JSON.stringify({ envelope, payerResultPubKey: payerPubHex });
   if (Buffer.byteLength(body) > MAX_REQUEST) fail("Synthetic round request exceeds the request limit.");
@@ -159,9 +161,13 @@ async function verifyRound(baseUrl: string, pin: Hex, deps: RoundVerifyTestDepen
   }
   if (intake.docCommit?.toLowerCase() !== expectedDocCommit.toLowerCase() || intake.paramsHash?.toLowerCase() !== expectedParamsHash.toLowerCase()) fail("Intake fixture commitment mismatch.");
   if (intake.identity?.toLowerCase() !== attestations.intake.address.toLowerCase()) fail("Intake provenance identity mismatch.");
-  const provenance = asRecord(intake.provenance);
-  if (provenance.kind !== 0 || provenance.tokensK !== 1 || !/^0x[0-9a-f]{64}$/.test(provenance.originId) || !/^0x[0-9a-f]{64}$/.test(provenance.transcriptHash) || !/^\d+$/.test(provenance.fetchedAt)) fail("Intake provenance is malformed.");
-  const recoveredIntake = await recoverProvenance(fixture.chainId, FIXTURE_ESCROW, { docCommit: expectedDocCommit, kind: provenance.kind, originId: provenance.originId, fetchedAt: BigInt(provenance.fetchedAt), tokensK: provenance.tokensK, transcriptHash: provenance.transcriptHash }, intake.intakeSig as Hex);
+  const parsedProvenance = ProvenanceJsonSchema.safeParse(intake.provenance);
+  if (!parsedProvenance.success) fail("Intake provenance is malformed.");
+  const provenance = parsedProvenance.data!;
+  if (provenance.kind !== 0 || provenance.tokensK !== 1) fail("Intake provenance is malformed.");
+  // The grant must open exactly the fixture query this verifier sealed: document, schema, params and the open binding.
+  if (provenance.docCommit !== expectedDocCommit.toLowerCase() || provenance.paramsHash !== expectedParamsHash.toLowerCase() || provenance.schemaId !== fixture.schemaId || provenance.schemaVersion !== fixture.schemaVersion || !provenanceMatchesBinding(provenance, openBinding)) fail("Intake provenance does not bind the sealed fixture open.");
+  const recoveredIntake = await recoverProvenance(fixture.chainId, FIXTURE_ESCROW, provenanceFromJson(provenance), intake.intakeSig as Hex);
   if (recoveredIntake.toLowerCase() !== attestations.intake.address.toLowerCase()) fail("Intake provenance signature mismatch.");
 
   const id = verdictId(fixture.queryId as Hex, 0);
@@ -193,7 +199,8 @@ async function verifyRound(baseUrl: string, pin: Hex, deps: RoundVerifyTestDepen
   const field = privateResult.fields[0];
   if (privateResult.fields.length !== 1 || field?.field !== "answer" || field.required !== true || field.agreeBps !== 10_000 || field.hung) fail("Private result does not contain the expected answer.");
   if (privateResult.answerJson !== canonicalJson({ salt: fixture.salt, schemaId: fixture.schemaId, schemaVersion: fixture.schemaVersion, fields: EXPECTED_FIELDS }) || JSON.stringify(field?.value) !== JSON.stringify(EXPECTED_FIELDS.answer) || ROUND_REHEARSAL_MODEL_OUTPUT.fields.answer !== "42") fail("Private result does not contain the expected fixed-fixture answer.");
-  if (keccak256(privateResult.payload as Hex).toLowerCase() !== String(vi.payloadHash).toLowerCase()) fail("Private payload hash mismatch.");
+  // A private verdict's payloadHash is salted with the query salt (privatePayloadHash), not keccak256(payload).
+  if (privateResultMismatch(privateResult, { answerHash: String(vi.answerHash), payloadHash: String(vi.payloadHash) })) fail("Private payload hash mismatch.");
   let realModelPassports: unknown;
   if (mode === "real-aci") {
     setVerifierDiagnostic("post_inference_attestation", "attestation_request");

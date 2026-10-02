@@ -261,12 +261,12 @@ test("weights directory digest is path-order stable and changes when a file chan
 });
 
 test("Passport config defaults stub identity and requires production model metadata", () => {
-  const stub = loadConfig({ MODEL_PROVIDER: "test-provider" });
+  const stub = loadConfig({ QUOTE_VERIFIER: "mock", MODEL_PROVIDER: "test-provider" });
   expect(stub.MODEL_ID).toBe("stub-model");
   expect(stub.MODEL_OPEN_WEIGHTS).toBe(true);
   expect(stub.ZDR).toBe(true);
-  expect(() => loadConfig({ RUNNER: "openai", MODEL_PROVIDER: "host", MODEL_WEIGHTS_SHA256: `0x${"aa".repeat(32)}` })).toThrow("MODEL_ID is required");
-  expect(() => loadConfig({ RUNNER: "openai", MODEL_ID: "org/model", MODEL_PROVIDER: "host" })).toThrow("MODEL_WEIGHTS_SHA256 or MODEL_WEIGHTS_DIR is required");
+  expect(() => loadConfig({ QUOTE_VERIFIER: "mock", RUNNER: "openai", MODEL_PROVIDER: "host", MODEL_WEIGHTS_SHA256: `0x${"aa".repeat(32)}` })).toThrow("MODEL_ID is required");
+  expect(() => loadConfig({ QUOTE_VERIFIER: "mock", RUNNER: "openai", MODEL_ID: "org/model", MODEL_PROVIDER: "host" })).toThrow("MODEL_WEIGHTS_SHA256 or MODEL_WEIGHTS_DIR is required");
 });
 
 describe("juror answer flow", () => {

@@ -8,7 +8,8 @@ const ConfigSchema = z.object({
   TEE_MODE: z.enum(["mock", "tdx", "dstack"]).default("mock"),
   TEE_KEYS: z.enum(["kms", "ephemeral"]).optional(),
   TEE_KEY_LABEL: z.string().min(1).max(64).default("default"),
-  QUOTE_VERIFIER: z.enum(["mock", "dcap"]).default("mock"),
+  // Required, like @mochi/tee quoteVerifierFromEnv: quote verification never defaults to mock.
+  QUOTE_VERIFIER: z.enum(["mock", "dcap"], { error: "QUOTE_VERIFIER must be set explicitly: dcap (or mock for local development only)" }),
   MOCK_TEE_SEED: z.string().regex(/^0x([0-9a-fA-F]{2})+$/).default(`0x${"11".repeat(32)}`),
   MOCK_TEE_MEASUREMENT: z.string().regex(/^0x[0-9a-fA-F]{64}$/).default(`0x${"22".repeat(32)}`),
   MOCK_ROOT_ADDRESS: z.string().regex(/^0x[0-9a-fA-F]{40}$/).default("0x0000000000000000000000000000000000000001"),

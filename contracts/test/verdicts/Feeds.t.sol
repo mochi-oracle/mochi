@@ -12,6 +12,7 @@ import {IMochiVerdicts} from "@mochi/interfaces/IMochiVerdicts.sol";
 import {IFeeds} from "@mochi/interfaces/IFeeds.sol";
 import {MochiTypes} from "@mochi/libraries/MochiTypes.sol";
 import {MochiRoles} from "@mochi/libraries/MochiRoles.sol";
+import {IAccessControl} from "@openzeppelin/contracts/access/IAccessControl.sol";
 
 contract FeedsTest is Test {
     address admin = address(0xA11CE);
@@ -105,9 +106,82 @@ contract FeedsTest is Test {
         _store(bytes32(uint256(12)), v);
         _tryUpdate(bytes32(uint256(12)), old, IFeeds.StaleAsOf.selector);
         v = _verdict(1, true, 1, origin, 2, p);
+        _store(bytes32(uint256(14)), v);
+        // Recorded in the same second as the current verdict (ts 0 both): neither is newer, so the tied verdict
+        // replaces it once and the replaced one is barred from the feed.
+        vm.expectEmit(true, true, true, true, address(feeds));
+        emit IFeeds.VerdictSuperseded(feed, key, bytes32(uint256(10)));
+        assertTrue(feeds.update(feed, key, bytes32(uint256(14)), p));
+        assertTrue(feeds.isBarred(feed, bytes32(uint256(10))));
+        _tryUpdate(bytes32(uint256(10)), p, IFeeds.VerdictBarred.selector);
+        // An equal asOf from a strictly newer verdict is a correction.
+        v.ts = 1;
         _store(bytes32(uint256(13)), v);
         assertTrue(feeds.update(feed, key, bytes32(uint256(13)), p));
         assertEq(_latest(feed, key).verdictId, bytes32(uint256(13)));
+        assertEq(_latest(feed, key).verdictTs, 1);
+        assertFalse(feeds.isBarred(feed, bytes32(uint256(14)))); // superseded by time, not barred
+        _tryUpdate(bytes32(uint256(13)), p, IFeeds.VerdictAlreadyApplied.selector);
+        _tryUpdate(bytes32(uint256(14)), p, IFeeds.StaleCorrection.selector);
+        _tryUpdate(bytes32(uint256(10)), p, IFeeds.VerdictBarred.selector);
+    }
+
+    /// A verdict as MochiVerdicts records it now (ts = block time).
+    function _recorded(uint32 schema, bytes memory payload) internal view returns (MochiTypes.Verdict memory v) {
+        v = _verdict(1, true, 1, origin, schema, payload);
+        v.ts = uint64(block.timestamp);
+    }
+
+    function testAsOfLeadDefaultsBySchemaAndGovernorBound() public {
+        vm.warp(1_800_000_000);
+        uint64 nowTs = uint64(block.timestamp);
+        assertEq(feeds.maxLeadOf(feed), feeds.SCHEDULE_LEAD()); // schema 2 (SPLIT): effective dates are announced ahead
+        bytes32 nav = keccak256("nav");
+        vm.prank(admin);
+        feeds.register(nav, 5, origins, address(0), 100);
+        assertEq(feeds.maxLeadOf(nav), feeds.OBSERVATION_LEAD());
+
+        uint64 splitLimit = nowTs + feeds.SCHEDULE_LEAD();
+        bytes memory late = _payload(key, splitLimit + 1);
+        _store(bytes32(uint256(40)), _recorded(2, late));
+        vm.expectRevert(abi.encodeWithSelector(IFeeds.AsOfTooFarAhead.selector, splitLimit + 1, splitLimit));
+        feeds.update(feed, key, bytes32(uint256(40)), late);
+        // The lead counts from the verdict's own time: pushing it later does not bring it within bounds.
+        vm.warp(nowTs + 30 days);
+        vm.expectRevert(abi.encodeWithSelector(IFeeds.AsOfTooFarAhead.selector, splitLimit + 1, splitLimit));
+        feeds.update(feed, key, bytes32(uint256(40)), late);
+        vm.warp(nowTs);
+        bytes memory scheduled = _payload(key, splitLimit);
+        _store(bytes32(uint256(41)), _recorded(2, scheduled));
+        assertTrue(feeds.update(feed, key, bytes32(uint256(41)), scheduled));
+
+        uint64 navLimit = nowTs + feeds.OBSERVATION_LEAD();
+        bytes memory ahead = _payload(key, navLimit + 1);
+        _store(bytes32(uint256(42)), _recorded(5, ahead));
+        vm.expectRevert(abi.encodeWithSelector(IFeeds.AsOfTooFarAhead.selector, navLimit + 1, navLimit));
+        feeds.update(nav, key, bytes32(uint256(42)), ahead);
+        bytes memory dated = _payload(key, nowTs + 12 hours); // a 00:00 UTC date published from UTC+12
+        _store(bytes32(uint256(43)), _recorded(5, dated));
+        assertTrue(feeds.update(nav, key, bytes32(uint256(43)), dated));
+
+        vm.prank(address(1));
+        vm.expectRevert(abi.encodeWithSelector(IAccessControl.AccessControlUnauthorizedAccount.selector, address(1), MochiRoles.GOVERNOR_ROLE));
+        feeds.setMaxLead(nav, 0);
+        uint64 tooLong = feeds.MAX_LEAD() + 1;
+        vm.prank(admin);
+        vm.expectRevert(abi.encodeWithSelector(IFeeds.MaxLeadTooLong.selector, tooLong));
+        feeds.setMaxLead(nav, tooLong);
+        vm.prank(admin);
+        vm.expectRevert(abi.encodeWithSelector(IFeeds.UnknownFeed.selector, bytes32(uint256(77))));
+        feeds.setMaxLead(bytes32(uint256(77)), 0);
+        vm.prank(admin);
+        vm.expectEmit(true, false, false, true, address(feeds));
+        emit IFeeds.FeedMaxLeadSet(nav, 0);
+        feeds.setMaxLead(nav, 0);
+        bytes memory nextSecond = _payload(key, nowTs + 12 hours + 1);
+        _store(bytes32(uint256(44)), _recorded(5, nextSecond));
+        vm.expectRevert(abi.encodeWithSelector(IFeeds.AsOfTooFarAhead.selector, nowTs + 12 hours + 1, nowTs));
+        feeds.update(nav, key, bytes32(uint256(44)), nextSecond);
     }
 
     function testCrosscheckFailRevertSuccessAndPreservesEntry() public {

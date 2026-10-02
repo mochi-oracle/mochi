@@ -22,6 +22,12 @@ export function createChainAdapter(deployment: Deployment, privateKey?: `0x${str
     },
     getJuror: (key) => chain.getJuror(key),
     isActive: (key, role) => chain.isActive(key, role),
+    measurementAllowed: (measurement, role) => chain.publicClient.readContract({
+      address: deployment.contracts.jurorRegistry,
+      abi: JurorRegistryAbi,
+      functionName: "allowedMeasurement",
+      args: [measurement, role],
+    }) as Promise<boolean>,
     refreshAttestation: (keys, until) => chain.refreshAttestation(keys, until),
     reportAttestationFailure: (key) => chain.reportAttestationFailure(key),
   };

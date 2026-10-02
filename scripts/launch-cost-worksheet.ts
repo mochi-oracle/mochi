@@ -22,6 +22,8 @@ export type LaunchCostInput = {
   };
   /** Reconciled USDG funding actually available to the review product. Null means unknown. */
   verifiedProductFundingUsd: string | null;
+  /** QueryEscrow.panelReserveBps; omitted means the contract default 2500. Launch runs with panel escalation off: 0. */
+  panelReserveBps?: number;
 };
 
 export type LaunchCostWorksheet = {
@@ -81,6 +83,9 @@ function validateInput(input: LaunchCostInput): void {
   if (!input.costsUsd || typeof input.costsUsd !== 'object') throw new TypeError('costsUsd is required');
   for (const key of costKeys) parseUsdMicros(input.costsUsd[key], `costsUsd.${key}`);
   parseUsdMicros(input.verifiedProductFundingUsd, 'verifiedProductFundingUsd');
+  if (input.panelReserveBps !== undefined && (!Number.isInteger(input.panelReserveBps) || input.panelReserveBps < 0 || input.panelReserveBps > 10_000)) {
+    throw new TypeError('panelReserveBps must be an integer from 0 to 10000');
+  }
 }
 
 export function calculateLaunchCostWorksheet(input: LaunchCostInput): LaunchCostWorksheet {
@@ -102,7 +107,8 @@ export function calculateLaunchCostWorksheet(input: LaunchCostInput): LaunchCost
   const variableProtocolFee = jurorFees * BigInt(LAUNCH_PROTOCOL_FEE_BPS) / BPS;
   const protocolFee = variableProtocolFee > LAUNCH_MIN_PROTOCOL_FEE ? variableProtocolFee : LAUNCH_MIN_PROTOCOL_FEE;
   const grossCharge = jurorFees + protocolFee;
-  const panelReserveShare = protocolFee * 2_500n / BPS; // Current contract default; governance can change it.
+  const reserveBps = BigInt(input.panelReserveBps ?? 2_500); // Contract default; launch with panel escalation off uses 0.
+  const panelReserveShare = protocolFee * reserveBps / BPS;
   const postPanelRemainder = protocolFee - panelReserveShare;
   const shortfall = requiredFunding === null || productFunding === null
     ? null
@@ -111,7 +117,7 @@ export function calculateLaunchCostWorksheet(input: LaunchCostInput): LaunchCost
   const notes = [
     'Cost inputs must cover all attempts, failed requests, retries, search failures, settlement gas, hosting allocation, and other uncovered costs; a null input keeps complete totals and shortfall unknown.',
     'Per-review values divide total aggregate cost by total reviews attempted or completed reviews and round up to one USDG atomic unit.',
-    `The ten-cent customer quote is juror fees plus protocol fee. At the current 25% panel-reserve setting, the ${protocolFee}-unit protocol fee splits into ${panelReserveShare} USDG units for panel reserve and ${postPanelRemainder} units for the configured recipient or staking. Neither share is assumed to fund review operations.`,
+    `The ten-cent customer quote is juror fees plus protocol fee. At a ${Number(reserveBps) / 100}% panel-reserve setting (0% at launch: panel escalation is off), the ${protocolFee}-unit protocol fee splits into ${panelReserveShare} USDG units for panel reserve and ${postPanelRemainder} units for the configured recipient or staking. Neither share is assumed to fund review operations.`,
     'This worksheet estimates funding only. It does not initiate or authorize a transaction.',
   ];
   if (!complete || input.totalReviews === 0 || input.completedReviews === 0) {

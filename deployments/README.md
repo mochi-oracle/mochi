@@ -6,16 +6,32 @@ Mainnet deployments also require an explicit owner, real USDG address, shielded 
 
 Mainnet deployment JSON adds `deployer`, `owner`, `timelock`, `guardian`, `paused`, `roles`, `stockTokens`, `tokenSource`, `postman`, and `rehearsal` (plus `mochiRecipient` for test-token deployments only). The deployer address is public metadata; no key material is written. `roles` records the configured final role holders. Optional operational roles without an address are assigned to the timelock so they can be granted later through governance. An omitted Anonyma signer remains zero until set by governance. If `--postman` is omitted, the deployment leaves ASP_POSTMAN vacant after the deployer renounces it; supply a dedicated postman address or rotate one in through the owner role later.
 
-`verify-ownership.ts <deployment.json>` checks the known role constants and ownership surfaces against the recorded actors, escrow pause state, and—only for a test-token deployment—the deployer MOCHI balance. External token verification checks metadata and explicitly leaves custody/admin outside its assertions. AccessControl does not expose member enumeration, so the verifier checks the deployer, owner, guardian, timelock, and every account recorded in `roles`. QueryEscrow's existing `unpause()` is guarded by GUARDIAN_ROLE just like `pause()`, so the timelock also receives GUARDIAN_ROLE; owner initiated unpause transactions still pass through its delay.
+`verify-ownership.ts <deployment.json>` checks the known role constants and ownership surfaces against the recorded actors, escrow pause state, and—only for a test-token deployment—the deployer MOCHI balance. External token verification checks metadata and explicitly leaves custody/admin outside its assertions. AccessControl does not expose member enumeration, so the verifier checks the deployer, owner, guardian, timelock, and every account recorded in `roles`. QueryEscrow's `pause()` needs GUARDIAN_ROLE (the guardian pauses instantly), while `unpause()` needs GOVERNOR_ROLE, which only the timelock holds, so reopening always passes through the timelock delay. The timelock also receives GUARDIAN_ROLE so governance can pause.
 
 `owner-timelock.ts` prints wallet-ready TimelockController calldata by default. `schedule` and `execute` use the same deterministic salt for a target call; pass `--salt 0x…` to both commands when scheduling the same call more than once. `--key-file` sends the operation only for a deployment marked as a chain 46630 rehearsal.
 
 ## Mainnet command shape
 
-Use an audited USDG address and deployer keyfile, and fill operational addresses from the actual production runbooks. The `--yes` flag is intentionally explicit after reviewing the printed parameter summary.
+Use an audited USDG address and deployer keyfile, and fill operational addresses from the actual production runbooks. The `--yes` flag is intentionally explicit after reviewing the printed parameter summary, step plan and pre-flight. Pass a keyed provider URL through `RPC_URL` (never `--rpc`, which shows in the process list); it is never printed or persisted.
 
 ```sh
-bun scripts/deploy-local.ts --mainnet --rpc "$RHC_MAINNET_RPC" --key-file "$MOCHI_DEPLOYER_KEYFILE" --owner "$MOCHI_OWNER_ADDRESS" --usdg "$REAL_USDG_ADDRESS" --mochi-token "$TEAM_MOCHI_TOKEN" --shielded privacy-pools --randomness drand --timelock-delay 86400 --guardian "$MOCHI_GUARDIAN_ADDRESS" --postman "$PRIVACY_POOL_POSTMAN" --attestor "$TEE_ATTESTOR_ADDRESS" --feed-runner "$MOCHI_FEED_RUNNER_ADDRESS" --orchestrator "$MOCHI_ORCHESTRATOR_ADDRESS" --anonyma-signer "$ANONYMA_SIGNER_ADDRESS" --stock-tokens "$STOCK_TOKEN_LIST" --out deployments/mainnet.json --yes
+DEPLOY=(bun scripts/deploy-local.ts --mainnet --key-file "$MOCHI_DEPLOYER_KEYFILE" --owner "$MOCHI_OWNER_ADDRESS" --usdg "$REAL_USDG_ADDRESS" --mochi-token "$TEAM_MOCHI_TOKEN" --shielded privacy-pools --randomness drand --timelock-delay 60 --panel-escalation off --guardian "$MOCHI_GUARDIAN_ADDRESS" --rpc-timeout 60 --receipt-timeout 1800 --out "$OUT/deployment.json")
+# The rehearsed launch path leaves the operational roles (attestor, feed runner, orchestrator, postman, Anonyma signer) to
+# the timelocked configure batch, which grants them to the verified enclave signers. Write the deployment JSON and its
+# progress journal to a private directory ($OUT, mode 700) outside the repository.
+RPC_URL="$RHC_MAINNET_RPC" "${DEPLOY[@]}"         # review: summary, the ordered step ids, predicted addresses, cost pre-flight; sends nothing
+RPC_URL="$RHC_MAINNET_RPC" "${DEPLOY[@]}" --yes   # deploy
 ```
+
+### Interruptions and `--resume`
+
+Every transaction is one step with a stable id (`deploy.QueryEscrow`, `wire.queryEscrow.setVerdicts`, `handover.panel.renounceRole.GOVERNOR_ROLE.deployer`, …). Each is signed once with an explicit nonce, and its hash is written to `deployments/mainnet.json.progress.json` (mode 600, atomic writes) before it is broadcast. A broadcast that times out is retried with the same signed transaction, and the receipt is awaited for up to `--receipt-timeout` seconds (a stalled sequencer is waited out; nothing is re-signed). Before the first transaction the deployer balance must cover the remaining plan (recorded per-step gas from `scripts/deploy-gas-estimate.json` × current gas price × 2); `--allow-low-balance` overrides only that check.
+
+If a run stops for any reason, do not restart blindly and do not delete the journal:
+
+1. `RPC_URL=… "${DEPLOY[@]}" --resume` checks every recorded step on chain (receipt, sender, nonce, calldata, contract code, role held, parameter value) and the deployer's nonce, prints the plan with each step's state and the next step, and sends nothing.
+2. `RPC_URL=… "${DEPLOY[@]}" --resume --yes` continues from the first incomplete step. A recorded transaction that is not mined is re-broadcast unchanged.
+
+`--resume` refuses when the chain contradicts the journal (a recorded transaction missing or different, an address without code, a role or parameter that differs, any deployer transaction the journal does not account for) or when the options, contract artifacts or step order differ from the recorded ones; rerun with exactly the original options. Without `--resume` a run refuses to start while a journal exists, and a new mainnet deployment never starts over an existing `--out` file. A step whose transaction was mined but reverted stops the run; after inspecting it, `--resume --yes --retry-reverted` sends that one step again with the next nonce. The journal holds no key or RPC URL; keep it with the deployment record.
 
 For rehearsal only, use chain 46630 with `--rehearsal`, a throwaway test USDG, and a short timelock. MockUSDG is rejected outside that explicitly flagged rehearsal path.

@@ -43,11 +43,14 @@ export function parseCrl(der: Uint8Array): ParsedCrl {
   };
 }
 
-/** Check CRL issuer, ECDSA signature, and freshness at the supplied time. */
-export function verifyCrl(crl: ParsedCrl, issuer: Cert, now: number): boolean {
+/**
+ * Check CRL issuer, ECDSA signature, and freshness at the supplied time. `expiryGraceSec` (default 0) accepts a CRL up to
+ * that long past its nextUpdate; only a collateral source serving a cached copy through a PCS outage sets it.
+ */
+export function verifyCrl(crl: ParsedCrl, issuer: Cert, now: number, expiryGraceSec = 0): boolean {
   return equalBytes(crl.issuerDer, issuer.subjectDer)
     && crl.thisUpdate <= now
-    && now <= crl.nextUpdate
+    && now <= crl.nextUpdate + Math.max(0, expiryGraceSec)
     && p256.verify(crl.signature, crl.tbs, issuer.publicKey, {
       lowS: false,
       prehash: true,

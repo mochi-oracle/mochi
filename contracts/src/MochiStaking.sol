@@ -8,26 +8,39 @@ import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol
 import {AccessControl} from "@openzeppelin/contracts/access/AccessControl.sol";
 import {Checkpoints} from "@openzeppelin/contracts/utils/structs/Checkpoints.sol";
 import {SafeCast} from "@openzeppelin/contracts/utils/math/SafeCast.sol";
+import {MochiRoles} from "@mochi/libraries/MochiRoles.sol";
 
 /// @title MochiStaking
 /// @notice Stakes MOCHI and streams USDG rewards pro rata through an accumulator.
+/// @dev Reward accounting is exact up to flooring, and every floored fraction is tracked:
+///      notified == claimed + Σ earned + undistributed + dust + unstreamed, where each term is a floor of an exact
+///      scaled value. `dust` is the sum of fractions that no account can ever claim (per-account credit floors and
+///      accumulator floors); only it can be swept.
 contract MochiStaking is IMochiStaking, ReentrancyGuard, AccessControl {
     using SafeERC20 for IERC20;
     using Checkpoints for Checkpoints.Trace208;
     using SafeCast for uint256;
+    /// @dev `rewardRate` and the undistributed carry are USDG base units scaled by SCALE.
     uint256 private constant SCALE = 1e18;
+    /// @dev Reward-per-token scale (USDG base units per MOCHI wei). USDG has 6 decimals and MOCHI 18, so with a 1e18
+    ///      scale a checkpoint over ~10M MOCHI rounded to zero while `lastUpdateTime` advanced, stranding the stream.
+    ///      At 1e36 a checkpoint floors away less than totalStaked / 1e36 base units, and that remainder goes to dust.
+    uint256 private constant PRECISION = SCALE * SCALE;
     bytes32 public constant LOCKER_ROLE = keccak256("mochi.role.LOCKER");
+
+    event DustSwept(address indexed to, uint256 amount);
 
     IERC20 public immutable mochi;
     IERC20 public immutable usdg;
     uint64 public immutable override cooldown;
     uint64 public immutable override rewardDuration;
     uint256 public override totalStaked;
-    uint256 private _rewardPerTokenStored;
-    uint256 public override rewardRate;
+    uint256 private _rewardPerTokenStored; // PRECISION-scaled
+    uint256 public override rewardRate; // SCALE-scaled USDG per second
     uint64 public override periodFinish;
     uint64 public lastUpdateTime;
-    uint256 public override undistributed;
+    uint256 private _undistributedScaled; // SCALE-scaled; streamed while nothing was staked, plus rate truncation
+    uint256 private _dustScaled; // PRECISION-scaled; floored fractions that no account can claim
     mapping(address => uint256) public override stakeOf;
     mapping(address => Checkpoints.Trace208) private _stakeCheckpoints;
     Checkpoints.Trace208 private _totalStakedCheckpoints;
@@ -38,6 +51,7 @@ contract MochiStaking is IMochiStaking, ReentrancyGuard, AccessControl {
     mapping(address => uint64) public override lockedUntil;
 
     /// @notice Initializes stake/reward tokens, unstake cooldown, and stream duration (normally seven days).
+    ///         GOVERNOR_ROLE (dust sweep only) is not granted here; DEFAULT_ADMIN grants it when a sweep is wanted.
     constructor(address admin, IERC20 mochi_, IERC20 usdg_, uint64 cooldown_, uint64 rewardDuration_) {
         if (rewardDuration_ == 0) revert InvalidRewardDuration();
         mochi = mochi_;
@@ -95,18 +109,28 @@ contract MochiStaking is IMochiStaking, ReentrancyGuard, AccessControl {
         if (amount == 0) revert ZeroAmount();
         _checkpoint(address(0));
         usdg.safeTransferFrom(msg.sender, address(this), amount);
+        // Everything is SCALE-scaled (USDG has 6 decimals, so an unscaled per-second rate for a per-verdict fee would
+        // round to 0): the unstreamed rest of the current period, the new amount and the carry are re-streamed
+        // exactly, and the rate's truncation remainder (< duration / 1e18 base units) is carried again.
         // forge-lint: disable-next-line(block-timestamp)
-        // rewardRate is scaled by SCALE (1e18): USDG has 6 decimals, so an unscaled per-second rate for a typical
-        // per-verdict fee (thousands of base units over a 7-day stream) would round to 0 and strand the reward.
-        uint256 leftover = block.timestamp < periodFinish
-            ? uint256(periodFinish - uint64(block.timestamp)) * rewardRate / SCALE
-            : 0;
-        uint256 distribution = amount + leftover + undistributed;
-        rewardRate = distribution * SCALE / rewardDuration;
-        // Carry the rounding remainder instead of dropping it.
-        undistributed = distribution - rewardRate * rewardDuration / SCALE;
+        uint256 remaining = block.timestamp < periodFinish ? uint256(periodFinish - uint64(block.timestamp)) : 0;
+        uint256 leftover = remaining * rewardRate;
+        uint256 added = amount * SCALE + _undistributedScaled;
+        uint256 distribution = added + leftover;
+        // notifyReward is permissionless (QueryEscrow and the Feeds treasury both call it), so a notify must not cheaply
+        // push the rewards already streaming further out. The new finish is the reward-weighted mean of the current
+        // finish (for the leftover) and now + rewardDuration (for the new amount and the carry), floored: a dust notify
+        // moves it by less than a second, i.e. not at all, and a notify as large as the leftover moves it at most
+        // halfway to now + rewardDuration, at the cost of paying stakers that much. It never moves earlier, and without
+        // an active stream it is now + rewardDuration. duration >= min(remaining, rewardDuration) >= 1.
+        // slither-disable-next-line divide-before-multiply -- floored to whole seconds; a weighted mean, not a share
+        uint256 duration = (leftover * remaining + added * rewardDuration) / distribution;
+        // slither-disable-next-line divide-before-multiply -- remainder kept in _undistributedScaled; exact
+        uint256 rate = distribution / duration;
+        rewardRate = rate;
+        _undistributedScaled = distribution - rate * duration;
         lastUpdateTime = uint64(block.timestamp);
-        periodFinish = uint64(block.timestamp) + rewardDuration;
+        periodFinish = (block.timestamp + duration).toUint64();
         emit RewardNotified(msg.sender, amount);
     }
 
@@ -126,16 +150,36 @@ contract MochiStaking is IMochiStaking, ReentrancyGuard, AccessControl {
         emit RewardClaimed(msg.sender, amount);
     }
 
+    /// @notice GOVERNOR. Sends the whole USDG base units of `dust` to `to`. Dust is only ever the floored fractions
+    ///         that no account can claim, so a sweep never touches accrued, streaming or undistributed rewards.
+    function sweepDust(address to) external nonReentrant onlyRole(MochiRoles.GOVERNOR_ROLE) returns (uint256 amount) {
+        // slither-disable-next-line divide-before-multiply -- sweeps whole units; the rest stays in dust
+        amount = _dustScaled / PRECISION;
+        _dustScaled -= amount * PRECISION;
+        if (amount != 0) usdg.safeTransfer(to, amount);
+        emit DustSwept(to, amount);
+    }
+
+    /// @notice Whole USDG base units floored away so far and claimable by no account (sweepable).
+    function dust() external view returns (uint256) {
+        return _dustScaled / PRECISION;
+    }
+
+    /// @inheritdoc IMochiStaking
+    function undistributed() external view override returns (uint256) {
+        return _undistributedScaled / SCALE;
+    }
+
     /// @inheritdoc IMochiStaking
     function rewardPerToken() public view override returns (uint256) {
         uint64 applicable = _lastTimeRewardApplicable();
         if (totalStaked == 0 || applicable <= lastUpdateTime) return _rewardPerTokenStored;
-        return _rewardPerTokenStored + (uint256(applicable - lastUpdateTime) * rewardRate / totalStaked);
+        return _rewardPerTokenStored + uint256(applicable - lastUpdateTime) * rewardRate * SCALE / totalStaked;
     }
 
     /// @inheritdoc IMochiStaking
     function earned(address account) external view override returns (uint256) {
-        return rewards[account] + stakeOf[account] * (rewardPerToken() - userRewardPerTokenPaid[account]) / SCALE;
+        return rewards[account] + stakeOf[account] * (rewardPerToken() - userRewardPerTokenPaid[account]) / PRECISION;
     }
 
     /// @inheritdoc IMochiStaking
@@ -157,7 +201,9 @@ contract MochiStaking is IMochiStaking, ReentrancyGuard, AccessControl {
 
     function _writeStakeCheckpoints(address account) private {
         uint48 timepoint = uint48(block.timestamp);
+        // slither-disable-next-line unused-return -- push returns the previous and new values; not needed
         _stakeCheckpoints[account].push(timepoint, stakeOf[account].toUint208());
+        // slither-disable-next-line unused-return -- push returns the previous and new values; not needed
         _totalStakedCheckpoints.push(timepoint, totalStaked.toUint208());
     }
 
@@ -169,13 +215,27 @@ contract MochiStaking is IMochiStaking, ReentrancyGuard, AccessControl {
     function _checkpoint(address account) private {
         uint64 applicable = _lastTimeRewardApplicable();
         if (applicable > lastUpdateTime) {
-            uint256 elapsed = applicable - lastUpdateTime;
-            if (totalStaked == 0) undistributed += elapsed * rewardRate / SCALE;
-            else _rewardPerTokenStored += elapsed * rewardRate / totalStaked;
+            uint256 streamed = uint256(applicable - lastUpdateTime) * rewardRate; // SCALE-scaled
+            uint256 staked = totalStaked;
+            if (staked == 0) {
+                _undistributedScaled += streamed;
+            } else {
+                uint256 scaled = streamed * SCALE; // PRECISION-scaled
+                // slither-disable-next-line divide-before-multiply -- floored remainder is added to dust
+                uint256 increment = scaled / staked;
+                _rewardPerTokenStored += increment;
+                _dustScaled += scaled - increment * staked;
+            }
             lastUpdateTime = applicable;
         }
         if (account != address(0)) {
-            rewards[account] += stakeOf[account] * (_rewardPerTokenStored - userRewardPerTokenPaid[account]) / SCALE;
+            uint256 accrued = stakeOf[account] * (_rewardPerTokenStored - userRewardPerTokenPaid[account]);
+            if (accrued != 0) {
+                // slither-disable-next-line divide-before-multiply -- floored remainder is added to dust
+                uint256 credit = accrued / PRECISION;
+                rewards[account] += credit;
+                _dustScaled += accrued - credit * PRECISION;
+            }
             userRewardPerTokenPaid[account] = _rewardPerTokenStored;
         }
     }

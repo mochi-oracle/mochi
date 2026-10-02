@@ -32,7 +32,7 @@ contract DrandSelectionTest is Harness {
         drand.postBeacon(query.sealBlock, _testSignature(query.sealBlock));
         bytes32 seed = drand.seed(keccak256(abi.encode(queryId, query.docCommit, query.round)), query.sealBlock);
         address[] memory previous = new address[](0);
-        address[] memory expectedJurors = registry.selectJurors(seed, 0, query.n, previous);
+        address[] memory expectedJurors = registry.selectJurors(address(escrow), queryId, seed, 0, query.n, previous);
         escrow.seal(queryId);
         address[] memory jurors = escrow.jurorsOf(queryId);
         assertEq(jurors.length, expectedJurors.length);

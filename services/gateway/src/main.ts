@@ -1,5 +1,5 @@
 import { createDb } from "@mochi/db";
-import { createChain, FeedsAbi, loadDeployment, QueryEscrowAbi } from "@mochi/chain";
+import { createChain, DisclosureRegistryAbi, FeedsAbi, loadDeployment, QueryEscrowAbi } from "@mochi/chain";
 import { seal } from "@mochi/tee";
 import { aad } from "@mochi/protocol";
 import { type Hex } from "viem";
@@ -17,7 +17,9 @@ const relayerChain = config.RELAYER_KEY ? createChain(deployment, { privateKey: 
 const deps: GatewayDeps = {
   intake: createIntakeClient(config.INTAKE_URL, config.HTTP_TIMEOUT_MS),
   chain: {
+    chainId: deployment.chainId,
     escrow: deployment.contracts.queryEscrow,
+    isActive: (key, role) => chain.isActive(key, role),
     ...(relayerChain?.account ? { relayer: relayerChain.account.address } : {}),
     quote: (schemaId, n, tokensK) => chain.quote(schemaId, n, tokensK),
     computeQueryId: (sender, docCommit, nonce) => chain.computeQueryId(sender, docCommit, nonce),
@@ -30,6 +32,11 @@ const deps: GatewayDeps = {
     feedSchemaId: async (feedId) => Number((await chain.publicClient.readContract({
       address: deployment.contracts.feeds, abi: FeedsAbi, functionName: "getFeed", args: [feedId],
     }) as { schemaId: number }).schemaId),
+    ...(deployment.contracts.disclosureRegistry ? {
+      disclosedEnvelopeHash: async (verdictId: Hex, recipientKeyHash: Hex, discloser: Hex) => (await chain.publicClient.readContract({
+        address: deployment.contracts.disclosureRegistry!, abi: DisclosureRegistryAbi, functionName: "disclosureOf", args: [verdictId, recipientKeyHash, discloser],
+      }) as { envelopeHash: Hex }).envelopeHash,
+    } : {}),
     openWithVoucher: async (params, provenance, sig, voucher, voucherSig) => {
       if (!relayerChain?.walletClient || !relayerChain.account) throw new Error("Relayer key is not configured");
       const { request } = await relayerChain.publicClient.simulateContract({ account: relayerChain.account, address: deployment.contracts.queryEscrow, abi: QueryEscrowAbi, functionName: "openWithVoucher", args: [params, provenance, sig, voucher, voucherSig] as never });
@@ -77,4 +84,4 @@ const deps: GatewayDeps = {
   },
 };
 const { app } = createGatewayApp(deps);
-Bun.serve({ hostname: process.env.HOST ?? "127.0.0.1", port: config.PORT, fetch: (request) => new URL(request.url).pathname === "/health" && request.method === "GET" ? Response.json({ ok: true }) : app.fetch(request) });
+Bun.serve({ hostname: process.env.HOST ?? "127.0.0.1", port: config.PORT, fetch: (request, server) => new URL(request.url).pathname === "/health" && request.method === "GET" ? Response.json({ ok: true }) : app.fetch(request, { peer: server.requestIP(request)?.address }) });

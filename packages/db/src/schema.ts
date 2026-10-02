@@ -88,12 +88,18 @@ export const disagreementModel = pgTable("disagreement_model", {
   samples: integer("samples").notNull(),
   disagreeCount: integer("disagree_count").notNull(),
 }, (t) => [primaryKey({ columns: [t.schemaId, t.field, t.modelId, t.window, t.bucket] })]);
+/** One row per distinct envelope (migrations/0006_disclosure_envelopes.sql): envelopeHash = keccak256(envelope), the
+ *  envelope's canonical JSON bytes. */
 export const disclosures = pgTable("disclosures", {
   verdictId: text("verdict_id").notNull(),
   recipientKeyHash: text("recipient_key_hash").notNull(),
+  envelopeHash: text("envelope_hash").notNull(),
   envelope: bytea("envelope").notNull(),
   createdAt: timestamp("created_at", { withTimezone: true, mode: "date" }).notNull().defaultNow(),
-}, (t) => [primaryKey({ columns: [t.verdictId, t.recipientKeyHash] })]);
+}, (t) => [
+  primaryKey({ columns: [t.verdictId, t.recipientKeyHash, t.envelopeHash] }),
+  index("disclosures_recipient_created_idx").on(t.verdictId, t.recipientKeyHash, t.createdAt),
+]);
 export const feedSubscriptions = pgTable("feed_subscriptions", {
   feedId: text("feed_id").notNull(),
   consumer: text("consumer").notNull(),

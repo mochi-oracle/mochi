@@ -46,11 +46,14 @@ contract QueryEscrowPrivacyPoolIntegrationTest is Test {
     function testOpenShieldedCreditsQueryAndHoldsQuote() public {
         bytes32 docCommit = bytes32(uint256(111));
         uint64 nonce = 7;
-        MochiTypes.Provenance memory prov = MochiTypes.Provenance(docCommit, 0, bytes32(uint256(9)), 0, 2, bytes32(0));
+        MochiTypes.Provenance memory prov = MochiTypes.Provenance(
+            docCommit, 0, bytes32(uint256(9)), 0, 2, bytes32(0), address(this), 1, 1, bytes32(0), keccak256("payer key"),
+            false, false, nonce, uint64(block.timestamp + 15 minutes)
+        );
         bytes32 digest = keccak256(abi.encodePacked("\x19\x01", escrow.domainSeparator(), MochiTypes.hashProvenance(prov)));
         (uint8 v, bytes32 r, bytes32 s) = vm.sign(INTAKE_PK, digest);
         bytes memory intakeSig = abi.encodePacked(r, s, v);
-        MochiTypes.OpenParams memory params = MochiTypes.OpenParams(1, 3, false, false, bytes32(0), bytes32(0), address(this), nonce);
+        MochiTypes.OpenParams memory params = MochiTypes.OpenParams(3, address(this));
         (uint256 jurorFees, uint256 protocolFee) = escrow.quote(1, 3, 2);
         uint256 total = jurorFees + protocolFee;
         bytes32 queryId = escrow.computeQueryId(address(this), docCommit, nonce);

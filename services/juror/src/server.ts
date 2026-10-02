@@ -9,8 +9,8 @@ import { OpenAICompatibleRunner, PhalaAciRunner, StubRunner } from "./runner.ts"
 import { emitTimingEvent } from "@mochi/protocol";
 import { warmupModel } from "./warmup.ts";
 import { AciClient } from "@mochi/aci";
-import { quoteVerifierFromEnv, teeProviderFromEnv, FileSealedStore } from "@mochi/tee";
-import { phalaDcap } from "./phala-dcap.ts";
+import { quoteVerifierFromEnv, teeProviderFromEnv, tdxPolicyFromEnv, FileSealedStore } from "@mochi/tee";
+import { createPhalaDcap } from "./phala-dcap.ts";
 import { loadDeployment } from "@mochi/chain";
 import { hashWeightsDirectory } from "./weights.ts";
 
@@ -26,8 +26,11 @@ export async function startJurorServer(env: Record<string, string | undefined>):
     mockRoot: root,
   }, { role: "juror" });
   if (tee.kind === "tdx") console.info({ tee: "tdx", address: tee.signer().address, measurement: tee.measurement() });
+  // One Intel TCB policy (TDX_ALLOWED_TCB_STATUSES, default UpToDate) for MOCHI quotes and the ACI gateway's quote.
+  const tdxPolicy = tdxPolicyFromEnv(env);
   const aci = config.MODEL_PROVIDER === "phala-aci" ? new AciClient({
-    baseUrl: config.PHALA_ACI_BASE_URL, apiKey: config.PHALA_AI_API_KEY!, dcap: phalaDcap,
+    // The seat's environment locates the shared, persisted PCS collateral cache beside its sealed store.
+    baseUrl: config.PHALA_ACI_BASE_URL, apiKey: config.PHALA_AI_API_KEY!, dcap: createPhalaDcap({ env }),
     allowedWorkloads: config.PHALA_ACI_ALLOWED_WORKLOADS?.split(",").map(value => value.trim()).filter(Boolean),
   }) : undefined;
   const warmupController = new AbortController();
@@ -38,6 +41,7 @@ export async function startJurorServer(env: Record<string, string | undefined>):
         timeoutMs: config.MODEL_TIMEOUT_MS,
         maxAttempts: config.MODEL_MAX_ATTEMPTS,
         attemptCapMs: config.MODEL_ATTEMPT_CAP_MS,
+        allowedTcbStatuses: tdxPolicy.allowedStatuses,
       })
     : config.RUNNER === "openai"
     ? new OpenAICompatibleRunner({
@@ -82,7 +86,7 @@ export async function startJurorServer(env: Record<string, string | undefined>):
   const { app } = createJurorApp(juror, config.JUROR_OPERATOR ? () => enrollmentProof(
     tee, deployment.chainId, deployment.contracts.jurorRegistry, config.JUROR_OPERATOR as `0x${string}`, config.JUROR_CLASS,
   ) : undefined);
-  if (aci) await warmupModel(aci, config.PHALA_ACI_MODEL!, warmupController.signal, emitTimingEvent);
+  if (aci) await warmupModel(aci, config.PHALA_ACI_MODEL!, warmupController.signal, emitTimingEvent, { allowedTcbStatuses: tdxPolicy.allowedStatuses });
   const server = Bun.serve({ idleTimeout: 130, hostname: env.HOST ?? "127.0.0.1", port: config.PORT, fetch: (request) => new URL(request.url).pathname === "/health" && request.method === "GET" ? Response.json({ ok: true }) : app.fetch(request) });
   return { port: config.PORT, stop: () => { warmupController.abort(); server.stop(true); } };
 }

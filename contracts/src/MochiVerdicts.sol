@@ -28,6 +28,7 @@ contract MochiVerdicts is IMochiVerdicts, EIP712, AccessControl, ReentrancyGuard
         _grantRole(MochiRoles.GOVERNOR_ROLE, admin);
     }
 
+    // aderyn-ignore-next-line(state-change-without-event) governor-only; the timelock's CallScheduled logs it
     function setPanel(address panel_) external onlyRole(MochiRoles.GOVERNOR_ROLE) {
         panel = panel_;
     }
@@ -41,9 +42,11 @@ contract MochiVerdicts is IMochiVerdicts, EIP712, AccessControl, ReentrancyGuard
         MochiTypes.JurorVote[] calldata votes,
         bytes calldata consensusSig
     ) external override nonReentrant returns (bytes32 verdictId) {
+        // aderyn-fp-next-line(reentrancy-state-change) view call (staticcall): cannot reenter or change state
         MochiTypes.Query memory q = escrow.getQuery(v.queryId);
         if (q.status != MochiTypes.QueryStatus.SEALED) revert WrongQueryStatus(v.queryId, q.status);
         if (v.round != q.round) revert WrongRound(q.round, v.round);
+        // aderyn-fp-next-line(reentrancy-state-change) view call (staticcall): cannot reenter or change state
         address[] memory seats = escrow.jurorsOf(v.queryId);
         _validateSeatData(v, votes, seats, q.n);
         _validateSignatures(v, votes, seats, q, consensusSig);
@@ -88,6 +91,7 @@ contract MochiVerdicts is IMochiVerdicts, EIP712, AccessControl, ReentrancyGuard
         if (votes.length != seats.length || seats.length != n) {
             revert SeatCountMismatch(seats.length, votes.length);
         }
+        // slither-disable-next-line uninitialized-local -- bitmask accumulator, starts empty
         uint32 derivedTimeouts;
         for (uint256 i; i < seats.length; ++i) {
             if (votes[i].juror != seats[i]) revert SeatJurorMismatch(i, seats[i], votes[i].juror);
@@ -121,12 +125,14 @@ contract MochiVerdicts is IMochiVerdicts, EIP712, AccessControl, ReentrancyGuard
                 votes[i].spansRoot,
                 votes[i].quoteHash
             );
+            // slither-disable-next-line unused-return -- err is checked; the third value only details err
             (address recovered, ECDSA.RecoverError err,) = ECDSA.tryRecover(_hashTypedDataV4(sh), votes[i].sig);
             if (err != ECDSA.RecoverError.NoError || recovered != seats[i]) revert BadJurorSignature(i);
             if (!registry.isActive(seats[i], MochiTypes.Role.JUROR)) revert InactiveJuror(i, seats[i]);
         }
         MochiTypes.JurorVote[] memory copiedVotes = votes;
         bytes32 digest = _hashTypedDataV4(MochiTypes.hashVerdictAttestation(v, MochiTypes.hashVotes(copiedVotes)));
+        // slither-disable-next-line unused-return -- err is checked; the third value only details err
         (address signer, ECDSA.RecoverError consensusErr,) = ECDSA.tryRecover(digest, consensusSig);
         // Signature is supplied in calldata; passed through the temporary setter-free helper below.
         if (consensusErr != ECDSA.RecoverError.NoError) revert BadConsensusSignature();
@@ -195,11 +201,13 @@ contract MochiVerdicts is IMochiVerdicts, EIP712, AccessControl, ReentrancyGuard
         returns (bytes32 verdictId)
     {
         if (msg.sender != panel) revert NotPanel(msg.sender);
+        // aderyn-fp-next-line(reentrancy-state-change) view call (staticcall): cannot reenter or change state
         MochiTypes.Query memory q = escrow.getQuery(queryId);
         if (q.status != MochiTypes.QueryStatus.ESCALATED) revert WrongQueryStatus(queryId, q.status);
         require(answerHash != 0 && payloadHash != 0, "zero panel result");
         verdictId = MochiTypes.computeVerdictId(queryId, MochiTypes.PANEL_ROUND);
         if (_verdicts[verdictId].status != 0) revert VerdictExists(verdictId);
+        // aderyn-fp-next-line(reentrancy-state-change) view call (staticcall): cannot reenter or change state
         address[] memory seats = escrow.jurorsOf(queryId);
         _verdicts[verdictId] = MochiTypes.Verdict({
             queryId: queryId,
@@ -246,7 +254,9 @@ contract MochiVerdicts is IMochiVerdicts, EIP712, AccessControl, ReentrancyGuard
         bytes32 hashB = MochiTypes.hashJurorAnswer(
             queryId, docCommit, schemaId, schemaVersion, answerB[0], answerB[1], answerB[2]
         );
+        // slither-disable-next-line unused-return -- err is checked; the third value only details err
         (address signerA, ECDSA.RecoverError errA,) = ECDSA.tryRecover(_hashTypedDataV4(hashA), sigA);
+        // slither-disable-next-line unused-return -- err is checked; the third value only details err
         (address signerB, ECDSA.RecoverError errB,) = ECDSA.tryRecover(_hashTypedDataV4(hashB), sigB);
         if (
             errA != ECDSA.RecoverError.NoError || errB != ECDSA.RecoverError.NoError || signerA == address(0)

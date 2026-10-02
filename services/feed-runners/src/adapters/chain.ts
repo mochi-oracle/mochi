@@ -1,5 +1,6 @@
 import { createChain, loadDeployment, QueryEscrowAbi, StockTokenCrosscheckAbi } from "@mochi/chain";
-import type { ChainPort } from "../ports.ts";
+import type { ChainPort, ObserveOutcome, StockTokenReader } from "../ports.ts";
+import { observationIsCurrent } from "../observation.ts";
 import { erc20Abi, type Address, type Hex } from "viem";
 
 export function createFeedChain(deploymentPath: string, privateKey: Hex, confirmations = 1): ChainPort {
@@ -38,12 +39,20 @@ const multiplierAbi = [
 ] as const;
 
 /** Stock Token reads (ABI verified on RHC testnet; see IStockTokenMultiplier). With a key, also records the pre-change
- *  multiplier on StockTokenCrosscheck while a change is pending (permissionless; the contract reads the token itself). */
-export function createStockTokenReader(deploymentPath: string, privateKey?: Hex, confirmations = 1): import("../ports.ts").StockTokenReader {
+ *  multiplier on StockTokenCrosscheck while a change is pending and keeps its multiplier observations current
+ *  (both permissionless; the contract reads the token itself). */
+export function createStockTokenReader(deploymentPath: string, privateKey?: Hex, confirmations = 1): StockTokenReader {
   const dep = loadDeployment(deploymentPath);
   const chain = createChain(dep, privateKey ? { privateKey } : undefined);
   const client = chain.publicClient;
   const crosscheck = dep.contracts.stockTokenCrosscheck;
+  const send = async (functionName: "recordBaseline" | "observeMultiplier", tickerKey: Hex) => {
+    // Simulate first: a revert (unknown ticker, no pending change, token read failure) costs no gas.
+    const { request } = await client.simulateContract({ account: chain.account!, address: crosscheck, abi: StockTokenCrosscheckAbi, functionName, args: [tickerKey] });
+    const hash = await chain.walletClient!.writeContract(request as never);
+    const receipt = await client.waitForTransactionReceipt({ hash, confirmations });
+    if (receipt.status !== "success") throw new Error(`${functionName} reverted`);
+  };
   return {
     readMultiplierSchedule: async (token) => {
       const [uiMultiplier, newUIMultiplier, effectiveAt] = await Promise.all([
@@ -57,11 +66,21 @@ export function createStockTokenReader(deploymentPath: string, privateKey?: Hex,
       recordBaseline: async (tickerKey: Hex, effectiveAt: bigint) => {
         const recorded = await client.readContract({ address: crosscheck, abi: StockTokenCrosscheckAbi, functionName: "baselineOf", args: [tickerKey, effectiveAt] });
         if (recorded !== 0n) return false;
-        const { request } = await client.simulateContract({ account: chain.account!, address: crosscheck, abi: StockTokenCrosscheckAbi, functionName: "recordBaseline", args: [tickerKey] });
-        const hash = await chain.walletClient!.writeContract(request as never);
-        const receipt = await client.waitForTransactionReceipt({ hash, confirmations });
-        if (receipt.status !== "success") throw new Error("recordBaseline reverted");
+        await send("recordBaseline", tickerKey);
         return true;
+      },
+      observeMultiplier: async (tickerKey: Hex, nowSec: bigint): Promise<ObserveOutcome> => {
+        // Compare with the token the crosscheck has registered for the ticker (the one observeMultiplier reads).
+        const token = await client.readContract({ address: crosscheck, abi: StockTokenCrosscheckAbi, functionName: "tokenOf", args: [tickerKey] });
+        if (/^0x0{40}$/i.test(token)) return "unregistered";
+        const [observation, uiMultiplier, effectiveAt] = await Promise.all([
+          client.readContract({ address: crosscheck, abi: StockTokenCrosscheckAbi, functionName: "observationOf", args: [tickerKey] }),
+          client.readContract({ address: token, abi: multiplierAbi, functionName: "uiMultiplier" }),
+          client.readContract({ address: token, abi: multiplierAbi, functionName: "effectiveAt" }),
+        ]);
+        if (observationIsCurrent({ observedAt: BigInt(observation.observedAt), scheduledAt: BigInt(observation.scheduledAt), multiplier: BigInt(observation.multiplier) }, { uiMultiplier, effectiveAt }, nowSec)) return "current";
+        await send("observeMultiplier", tickerKey);
+        return "observed";
       },
     } : {}),
   };

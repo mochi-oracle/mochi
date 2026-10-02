@@ -7,7 +7,7 @@ import { loadConfig } from "../src/config.ts";
 const imageAvailable = spawnSync("docker", ["image", "inspect", "mochi-ocr:1"], { stdio: "ignore" }).status === 0;
 describe("real OCR container", () => {
   (imageAvailable ? test : test.skip)(imageAvailable ? "extracts text layer and OCR from real fixtures" : "skipped: docker image mochi-ocr:1 is not available", async () => {
-    const config = loadConfig({ PDF_OCR: "docker" });
+    const config = loadConfig({ QUOTE_VERIFIER: "mock", PDF_OCR: "docker" });
     const extractor = new OcrPdfTextExtractor({ command: config.pdfOcrCommand! });
     const textPdf = new Uint8Array(await readFile(new URL("./fixtures/text.pdf", import.meta.url)));
     const scanPdf = new Uint8Array(await readFile(new URL("./fixtures/scan.pdf", import.meta.url)));

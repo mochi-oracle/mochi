@@ -1,12 +1,13 @@
 import { privateKeyToAccount } from "viem/accounts";
 import { loadDeployment } from "@mochi/chain";
-import { FileSealedStore, quoteVerifierFromEnv, teeProviderFromEnv } from "@mochi/tee";
+import { quoteVerifierFromEnv, teeProviderFromEnv } from "@mochi/tee";
 import { createIntakeChain } from "./adapters/chain.ts";
 import { createIntakeApp } from "./app.ts";
 import { loadConfig } from "./config.ts";
 import { NodeHttpGetter } from "./fetcher.ts";
 import { IntakeEnclave } from "./intake.ts";
 import { OcrPdfTextExtractor } from "./extract.ts";
+import { createIntakeSealedStore } from "./sealed-store.ts";
 
 const config = loadConfig();
 const deployment = loadDeployment(config.deploymentPath);
@@ -14,7 +15,7 @@ const root = privateKeyToAccount(config.mockRootKey);
 const tee = await teeProviderFromEnv(process.env, { seed: config.mockTeeSeed, measurement: config.mockTeeMeasurement, mockRoot: root }, { role: "intake" });
 if (tee.kind === "tdx") console.info({ tee: "tdx", address: tee.signer().address, measurement: tee.measurement() });
 const intake = new IntakeEnclave({
-  tee, chain: createIntakeChain(deployment), store: new FileSealedStore(config.sealedStoreDir, tee),
+  tee, chain: createIntakeChain(deployment), store: createIntakeSealedStore(config.sealedStoreDir, tee),
   fetchPolicy: config.fetchPolicy, httpGetter: new NodeHttpGetter(), quoteVerifier: quoteVerifierFromEnv(process.env, { rootAddress: config.mockRootAddress }),
   chainId: deployment.chainId, escrowAddress: deployment.contracts.queryEscrow, clock: { nowSeconds: () => Math.floor(Date.now() / 1000) },
   ...(config.pdfOcrCommand ? { pdfTextExtractor: new OcrPdfTextExtractor({ command: config.pdfOcrCommand }) } : {}),

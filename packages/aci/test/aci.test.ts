@@ -3,7 +3,7 @@ import { ed25519 } from "@noble/curves/ed25519.js";
 import { sha256, sha384 } from "@noble/hashes/sha2.js";
 import { bytesToHex, hexToBytes } from "@noble/hashes/utils.js";
 import { readFile } from "node:fs/promises";
-import { AciClient, AciVerificationError, attestationStatement, jcsBytes, reportData, verifyAciReceipt, verifyAciReport, verifyComposeMeasurement, workloadKeysetDigest } from "../src/index.ts";
+import { AciClient, AciVerificationError, aciOsMeasurement, attestationStatement, parseAciPolicy, jcsBytes, reportData, verifyAciReceipt, verifyAciReport, verifyComposeMeasurement, workloadKeysetDigest } from "../src/index.ts";
 
 const enc = new TextEncoder();
 const fixturePath = new URL("./fixtures/aci_report.json", import.meta.url);
@@ -47,7 +47,7 @@ async function replay(events: Array<{ imr: number; digest: string }>) {
 describe("Phala ACI verifier parity", () => {
   test("requires confidential routing before network access and keeps only bounded HTTP diagnostics", async () => {
     let currentData = "", requests = 0;
-    const client = new AciClient({ baseUrl: "https://aci.test/v1", apiKey: "test-key", now: () => 1_700_000_000,
+    const client = new AciClient({ allowUnpinned: true, baseUrl: "https://aci.test/v1", apiKey: "test-key", now: () => 1_700_000_000,
       dcap: (q) => callback(bytes(currentData))(q),
       fetch: (async (input: string | URL, init?: RequestInit) => {
         requests++;
@@ -78,21 +78,69 @@ describe("Phala ACI verifier parity", () => {
     const f = structuredClone(rawFixture); const nonce = "ab".repeat(32);
     const fixtureBound = { ...f, attestation: { ...f.attestation, report_data: reportData(f.workload_keyset_digest, nonce) } };
     const qdata = bytes(fixtureBound.attestation.report_data); const dcap = callback(qdata);
-    expect((await verifyAciReport(fixtureBound, { nonce, dcap, now: 1_700_000_000 })).workloadId).toBe(f.workload_keyset_digest);
+    expect((await verifyAciReport(fixtureBound, { allowUnpinned: true, nonce, dcap, now: 1_700_000_000 })).workloadId).toBe(f.workload_keyset_digest);
     const changedKeyset = { ...fixtureBound, attestation: { ...fixtureBound.attestation, workload_keyset: { ...f.attestation.workload_keyset, not_after: 1_999_999_999 } } };
-    await expect(verifyAciReport(changedKeyset, { nonce, dcap, now: 1_700_000_000 })).rejects.toMatchObject({ code: "report_binding" });
-    await expect(verifyAciReport(fixtureBound, { nonce: "cd".repeat(32), dcap, now: 1_700_000_000 })).rejects.toMatchObject({ code: "report_binding" });
+    await expect(verifyAciReport(changedKeyset, { allowUnpinned: true, nonce, dcap, now: 1_700_000_000 })).rejects.toMatchObject({ code: "report_binding" });
+    await expect(verifyAciReport(fixtureBound, { allowUnpinned: true, nonce: "cd".repeat(32), dcap, now: 1_700_000_000 })).rejects.toMatchObject({ code: "report_binding" });
     const staleKeyset = { ...f.attestation.workload_keyset, not_after: 1_600_000_000 };
     const stale = report(nonce, staleKeyset);
-    await expect(verifyAciReport(stale, { nonce, dcap: callback(bytes(stale.attestation.report_data)), now: 1_700_000_000 })).rejects.toMatchObject({ code: "report_stale" });
+    await expect(verifyAciReport(stale, { allowUnpinned: true, nonce, dcap: callback(bytes(stale.attestation.report_data)), now: 1_700_000_000 })).rejects.toMatchObject({ code: "report_stale" });
     const badPadding = new Uint8Array(64); badPadding.set(qdata); badPadding[63] = 1;
-    await expect(verifyAciReport(fixtureBound, { nonce, dcap: callback(badPadding) })).rejects.toMatchObject({ code: "quote_binding" });
-    await expect(verifyAciReport(fixtureBound, { nonce, dcap: callback(qdata, { reportType: "sgx" }) })).rejects.toMatchObject({ code: "quote_binding" });
+    await expect(verifyAciReport(fixtureBound, { allowUnpinned: true, nonce, dcap: callback(badPadding) })).rejects.toMatchObject({ code: "quote_binding" });
+    await expect(verifyAciReport(fixtureBound, { allowUnpinned: true, nonce, dcap: callback(qdata, { reportType: "sgx" }) })).rejects.toMatchObject({ code: "quote_binding" });
   });
-  test("uses top-level workload_id and enforces allow-lists", async () => {
+  test("uses top-level workload_id and enforces allow-lists only together with an attested pin", async () => {
     const nonce = "ef".repeat(32); const r = report(nonce, KEYSET, { workload_id: "sha256:" + "aa".repeat(32) });
-    expect((await verifyAciReport(r, { nonce, dcap: callback(bytes(r.attestation.report_data)), allowedWorkloads: [r.workload_id] })).workloadId).toBe(r.workload_id);
-    await expect(verifyAciReport(r, { nonce, dcap: callback(bytes(r.attestation.report_data)), allowedWorkloads: ["other"] })).rejects.toMatchObject({ code: "workload_not_allowed" });
+    const td = { reportData: new Uint8Array(64), mrTd: new Uint8Array(48).fill(1), rtmr: [2, 3, 4, 5].map((v) => new Uint8Array(48).fill(v)) };
+    const os = aciOsMeasurement(td)!;
+    const dcap = callback(bytes(r.attestation.report_data), { tdReport: td });
+    expect((await verifyAciReport(r, { nonce, dcap, allowedWorkloads: [r.workload_id, `os:${os}`] })).workloadId).toBe(r.workload_id);
+    await expect(verifyAciReport(r, { nonce, dcap, allowedWorkloads: ["other", `os:${os}`] })).rejects.toMatchObject({ code: "workload_not_allowed" });
+    // workload_id is outside the quoted report data: on its own it would admit any TDX VM, so it fails closed.
+    await expect(verifyAciReport(r, { nonce, dcap, allowedWorkloads: [r.workload_id] })).rejects.toMatchObject({ code: "workload_unpinned" });
+  });
+  test("unpinned verification must be requested explicitly: by default any TDX VM's report is refused", async () => {
+    const nonce = "ab".repeat(32), r = report(nonce), dcap = callback(bytes(r.attestation.report_data));
+    for (const options of [{}, { allowUnpinned: false }, { allowedWorkloads: [] }, { allowedWorkloads: ["model:vendor/model-a"] }, { allowedWorkloads: ["workload-id"], allowUnpinned: true }]) {
+      await expect(verifyAciReport(r, { nonce, dcap, ...options })).rejects.toMatchObject({ code: "workload_unpinned" });
+    }
+    expect((await verifyAciReport(r, { nonce, dcap, allowUnpinned: true })).workloadId).toBe(workloadKeysetDigest(KEYSET));
+    const fetch = (async () => { throw new Error("no network expected"); }) as unknown as typeof globalThis.fetch;
+    for (const options of [{}, { allowedWorkloads: ["model:vendor/model-a"] }, { allowedWorkloads: ["workload-id"], allowUnpinned: true }]) {
+      expect(() => new AciClient({ baseUrl: "https://aci.test/v1", apiKey: "k", fetch, dcap, ...options })).toThrow("workload_unpinned");
+    }
+    expect(() => new AciClient({ baseUrl: "https://aci.test/v1", apiKey: "k", fetch, dcap, allowedWorkloads: [`os:${"ab".repeat(32)}`] })).not.toThrow();
+    expect(() => new AciClient({ baseUrl: "https://aci.test/v1", apiKey: "k", fetch, dcap, allowedWorkloads: [`compose:${"ab".repeat(32)}`] })).not.toThrow();
+    expect(() => new AciClient({ baseUrl: "https://aci.test/v1", apiKey: "k", fetch, dcap, allowUnpinned: true })).not.toThrow();
+  });
+  test("pins the quoted OS measurement and fails closed when configured", async () => {
+    const nonce = "0e".repeat(32); const r = report(nonce);
+    const td = { reportData: new Uint8Array(64), mrTd: new Uint8Array(48).fill(7), rtmr: [8, 9, 10, 11].map((v) => new Uint8Array(48).fill(v)) };
+    const os = aciOsMeasurement(td)!;
+    expect(os).toBe(bytesToHex(sha256(Uint8Array.from([...td.mrTd, ...td.rtmr[0]!, ...td.rtmr[1]!, ...td.rtmr[2]!]))));
+    const dcap = callback(bytes(r.attestation.report_data), { tdReport: td });
+    const established = await verifyAciReport(r, { nonce, dcap, allowedWorkloads: [`os:0x${os.toUpperCase()}`] });
+    expect(established.osMeasurement).toBe(os);
+    // Any other TDX VM (different firmware or boot chain) is rejected, as is a quote without TD registers.
+    const otherVm = { ...td, rtmr: [new Uint8Array(48).fill(99), ...td.rtmr.slice(1)] };
+    await expect(verifyAciReport(r, { nonce, dcap: callback(bytes(r.attestation.report_data), { tdReport: otherVm }), allowedWorkloads: [`os:${os}`] })).rejects.toMatchObject({ code: "os_measurement" });
+    await expect(verifyAciReport(r, { nonce, dcap: callback(bytes(r.attestation.report_data)), allowedOsMeasurements: [os] })).rejects.toMatchObject({ code: "os_measurement" });
+    // A compose pin without event-log evidence fails closed.
+    await expect(verifyAciReport(r, { nonce, dcap, allowedWorkloads: [`compose:${"ab".repeat(32)}`] })).rejects.toMatchObject({ code: "compose_measurement" });
+    for (const bad of ["os:1234", "compose:zz", "model:", `os:${"ab".repeat(33)}`]) {
+      await expect(verifyAciReport(r, { nonce, dcap, allowedWorkloads: [bad] })).rejects.toMatchObject({ code: "invalid_policy" });
+    }
+    expect(parseAciPolicy([" workload:w1 ", "plain", `compose:${"AB".repeat(32)}`, "model:m/1", ""])).toEqual({ workloads: ["w1", "plain"], composeHashes: ["ab".repeat(32)], osMeasurements: [], models: ["m/1"] });
+  });
+  test("AciClient enforces allowed model IDs before any network access and on the signed receipt", async () => {
+    let requests = 0;
+    const fetch = (async () => { requests++; return new Response("{}", { status: 500 }); }) as unknown as typeof globalThis.fetch;
+    const client = new AciClient({ allowUnpinned: true, baseUrl: "https://aci.test/v1", apiKey: "test-key", fetch, dcap: callback(new Uint8Array(64)), allowedModels: ["vendor/model-a"] });
+    await expect(client.chat({ model: "vendor/model-b" })).rejects.toMatchObject({ code: "model_not_allowed" });
+    const typed = new AciClient({ allowUnpinned: true, baseUrl: "https://aci.test/v1", apiKey: "test-key", fetch, dcap: callback(new Uint8Array(64)), allowedWorkloads: ["model:vendor/model-a"] });
+    await expect(typed.chat({ model: "vendor/model-b" })).rejects.toMatchObject({ code: "model_not_allowed" });
+    expect(requests).toBe(0);
+    expect(() => new AciClient({ baseUrl: "https://aci.test/v1", apiKey: "k", fetch, dcap: callback(new Uint8Array(64)), allowedWorkloads: ["os:not-hex"] })).toThrow();
   });
   test("verifies Ed25519 receipts and rejects altered signatures, keys, algorithms, bindings and body hashes", async () => {
     const request = enc.encode('{"model":"demo"}'); const response = enc.encode('{"choices":[]}'); const est = established();
@@ -157,7 +205,7 @@ describe("Phala ACI verifier parity", () => {
       receiptCount++; if (receiptCount <= 2) return new Response("pending", { status: 404 });
       return Response.json(signedReceipt(requestBytes, responseBytes, { model: receiptModel }, "r1", currentKeyset));
     }) as typeof globalThis.fetch;
-    const client = new AciClient({ baseUrl: "https://aci.test/v1", apiKey: "test-key", fetch, now: () => now, dcap: (q) => failDcap ? { ok: false, status: "Invalid", reportType: "tdx", reportData: new Uint8Array() } : { ok: q[0] === 0xaa, status: "UpToDate", reportType: "tdx", reportData: callback(bytes(currentReportData))(q).reportData } });
+    const client = new AciClient({ allowUnpinned: true, baseUrl: "https://aci.test/v1", apiKey: "test-key", fetch, now: () => now, dcap: (q) => failDcap ? { ok: false, status: "Invalid", reportType: "tdx", reportData: new Uint8Array() } : { ok: q[0] === 0xaa, status: "UpToDate", reportType: "tdx", reportData: callback(bytes(currentReportData))(q).reportData } });
     const result = await client.chat({ model: "demo", messages: [] }); expect(result.receipt.receiptId).toBe("rcpt-1"); expect(receiptCount).toBe(3); expect(attestCount).toBe(1);
     expect(redirectModes.every((mode) => mode === "error")).toBe(true);
     receiptModel = "wrong-model";
@@ -175,7 +223,7 @@ describe("Phala ACI verifier parity", () => {
       inferenceCalls++;
       return new Response(new ReadableStream<Uint8Array>({ pull() { return new Promise<void>(() => {}); }, cancel() { bodyCancelled = true; } }), { headers: { "x-receipt-id": "rcpt-1" } });
     }) as typeof globalThis.fetch;
-    const client = new AciClient({ baseUrl: "https://aci.test/v1", apiKey: "test-key", fetch, now: () => 1_700_000_000, dcap: (q) => callback(bytes(currentData))(q) });
+    const client = new AciClient({ allowUnpinned: true, baseUrl: "https://aci.test/v1", apiKey: "test-key", fetch, now: () => 1_700_000_000, dcap: (q) => callback(bytes(currentData))(q) });
     const controller = new AbortController();
     const pending = client.chat({ model: "demo" }, { signal: controller.signal, maxResponseBytes: 8 });
     while (inferenceCalls === 0) await new Promise((resolve) => setTimeout(resolve, 0));
@@ -189,7 +237,7 @@ describe("Phala ACI verifier parity", () => {
       if (String(input).endsWith("chat/completions")) { largeCalls++; return new Response("12345", { headers: { "x-receipt-id": "unused" } }); }
       throw new Error("receipt must not be requested");
     }) as typeof globalThis.fetch;
-    const bounded = new AciClient({ baseUrl: "https://aci.test/v1", apiKey: "test-key", fetch: oversizedFetch, now: () => 1_700_000_000, dcap: (q) => callback(bytes(currentData))(q) });
+    const bounded = new AciClient({ allowUnpinned: true, baseUrl: "https://aci.test/v1", apiKey: "test-key", fetch: oversizedFetch, now: () => 1_700_000_000, dcap: (q) => callback(bytes(currentData))(q) });
     await expect(bounded.chat({ model: "demo" }, { maxResponseBytes: 4 })).rejects.toMatchObject({ code: "response_too_large" });
     expect(largeCalls).toBe(1);
   });
@@ -203,7 +251,7 @@ describe("Phala ACI verifier parity", () => {
       if (url.endsWith("chat/completions")) { requestBytes = new Uint8Array(init?.body as ArrayBuffer); responseBytes = enc.encode('{"choices":[{"message":{"content":"{}"}}]}'); return new Response(responseBytes, { headers: { "x-receipt-id": "rcpt-1" } }); }
       receiptReached(); return new Response("pending", { status: 404 });
     }) as typeof globalThis.fetch;
-    const client = new AciClient({ baseUrl: "https://aci.test/v1", apiKey: "test-key", fetch, now: () => 1_700_000_000, dcap: (q) => callback(bytes(currentData))(q) });
+    const client = new AciClient({ allowUnpinned: true, baseUrl: "https://aci.test/v1", apiKey: "test-key", fetch, now: () => 1_700_000_000, dcap: (q) => callback(bytes(currentData))(q) });
     const controller = new AbortController();
     const pending = client.chat({ model: "demo" }, { signal: controller.signal });
     await reached;
@@ -222,9 +270,16 @@ describe("Phala ACI verifier parity", () => {
       inferenceCalls++;
       return new Response("{}", { headers: { "x-receipt-id": "unused" } });
     }) as typeof globalThis.fetch;
-    const stale = new AciClient({ baseUrl: "https://aci.test/v1", apiKey: "test-key", fetch: statusFetch, now: () => 1_700_000_000, dcap: (q) => ({ ...callback(bytes(currentData))(q), status: "OutOfDate" }) });
+    const stale = new AciClient({ allowUnpinned: true, baseUrl: "https://aci.test/v1", apiKey: "test-key", fetch: statusFetch, now: () => 1_700_000_000, dcap: (q) => ({ ...callback(bytes(currentData))(q), status: "OutOfDate" }) });
     await expect(stale.chat({ model: "demo" }, { requireUpToDate: true })).rejects.toMatchObject({ code: "tcb_status" });
+    // Requiring UpToDate is the default: a caller that omits the option is refused too.
+    await expect(stale.chat({ model: "demo" })).rejects.toMatchObject({ code: "tcb_status" });
+    await expect(stale.chat({ model: "demo" }, {})).rejects.toMatchObject({ code: "tcb_status" });
     expect(inferenceCalls).toBe(0);
+    // Only an explicit opt-out reaches inference (which then fails here on the fake receipt).
+    await expect(stale.chat({ model: "demo" }, { requireUpToDate: false })).rejects.toBeDefined();
+    expect(inferenceCalls).toBeGreaterThan(0);
+    inferenceCalls = 0;
 
     let attestationRequests = 0; let redirectedInferenceRequests = 0;
     const redirectedFetch = (async (input: string | URL, init?: RequestInit) => {
@@ -235,7 +290,7 @@ describe("Phala ACI verifier parity", () => {
       Object.defineProperty(response, "redirected", { value: true });
       return response;
     }) as typeof globalThis.fetch;
-    const redirected = new AciClient({ baseUrl: "https://aci.test/v1", apiKey: "test-key", fetch: redirectedFetch, now: () => 1_700_000_000, dcap: (q) => callback(bytes(currentData))(q) });
+    const redirected = new AciClient({ allowUnpinned: true, baseUrl: "https://aci.test/v1", apiKey: "test-key", fetch: redirectedFetch, now: () => 1_700_000_000, dcap: (q) => callback(bytes(currentData))(q) });
     await expect(redirected.chat({ model: "demo" })).rejects.toMatchObject({ code: "inference_redirect" });
     expect(attestationRequests).toBe(1);
     expect(redirectedInferenceRequests).toBe(1);

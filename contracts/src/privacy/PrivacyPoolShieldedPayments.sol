@@ -33,6 +33,7 @@ contract PrivacyPoolShieldedPayments is IShieldedPayments, ReentrancyGuard {
         if (address(pool_) == address(0) || address(usdg_) == address(0) || escrow_ == address(0)) {
             revert ZeroAddress();
         }
+        // aderyn-fp-next-line(reentrancy-state-change) view call (staticcall): cannot reenter or change state
         address actualAsset = pool_.ASSET();
         if (actualAsset != address(usdg_)) revert WrongPoolAsset(address(usdg_), actualAsset);
         pool = pool_;
@@ -59,6 +60,10 @@ contract PrivacyPoolShieldedPayments is IShieldedPayments, ReentrancyGuard {
         uint256 proofAmount = withdrawalProof.pubSignals[2];
         if (proofAmount != amount) revert AmountSignalMismatch(amount, proofAmount);
 
+        // The balance delta is the check that the pool paid. pool.withdraw only staticcalls the Entrypoint and the
+        // Groth16 verifier, then transfers USDG (no transfer hooks) to this adapter; spend is nonReentrant and
+        // escrow-only, so nothing else can move this balance between the two reads.
+        // slither-disable-next-line reentrancy-balance -- no reentrant path; the delta check is the defence
         uint256 balanceBefore = usdg.balanceOf(address(this));
         pool.withdraw(withdrawal, withdrawalProof);
         uint256 balanceAfter = usdg.balanceOf(address(this));

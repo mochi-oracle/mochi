@@ -39,7 +39,11 @@ describe("tdx-common", () => {
     const r = (b: number) => new Uint8Array(48).fill(b);
     const config = new Uint8Array(48); config[0] = 2; config.fill(1, 1, 33);
     const regs = { mrtd: r(1), rtmr: [r(2), r(3), r(4), r(5)] as const, mrConfigId: config };
-    const invalid = [new Uint8Array(47), new Uint8Array(48), (() => { const x = config.slice(); x[0] = 3; return x; })(), (() => { const x = config.slice(); x.fill(0, 1, 33); return x; })(), (() => { const x = config.slice(); x[47] = 1; return x; })()];
+    const invalid = [new Uint8Array(47), new Uint8Array(48), (() => { const x = config.slice(); x[0] = 4; return x; })(), (() => { const x = config.slice(); x[0] = 0; return x; })(), (() => { const x = config.slice(); x.fill(0, 1, 33); return x; })(), (() => { const x = config.slice(); x[47] = 1; return x; })()];
     for (const mrConfigId of invalid) expect(() => dstackConfigMeasurement({ ...regs, mrConfigId })).toThrow();
+    for (const version of [1, 2, 3]) {
+      const known = config.slice(); known[0] = version;
+      expect(() => dstackConfigMeasurement({ ...regs, mrConfigId: known })).not.toThrow();
+    }
   });
 });

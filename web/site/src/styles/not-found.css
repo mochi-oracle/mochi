@@ -1,0 +1,50 @@
+/* Branded 404 page (404.html, served by web/server.ts for unknown non-API URLs). Self-contained: no Tailwind bundle,
+   no scripts. Colours and type follow the Check and Guide pages. */
+@font-face {
+  font-family: 'Hanken Grotesk';
+  src: url('../../node_modules/@fontsource-variable/hanken-grotesk/files/hanken-grotesk-latin-wght-normal.woff2') format('woff2');
+  font-style: normal;
+  font-weight: 100 900;
+  font-display: swap;
+  size-adjust: 103.1%;
+  ascent-override: 77.56%;
+  descent-override: 19.42%;
+  line-gap-override: 0%;
+}
+*, *::before, *::after { box-sizing: border-box; }
+html { background: #cfb3d4; }
+body { margin: 0; min-height: 100vh; min-height: 100svh; color: #111; background: #cfb3d4; font: 500 17px/1.5 'Hanken Grotesk', system-ui, sans-serif; }
+/* The site frame: lavender outside, orange inside, along the top and left edges. */
+body::before {
+  --bar: 12px;
+  content: '';
+  position: fixed;
+  inset: 0;
+  pointer-events: none;
+  background:
+    linear-gradient(#e94f0b, #e94f0b) var(--bar) var(--bar) / 100% var(--bar) no-repeat,
+    linear-gradient(#e94f0b, #e94f0b) var(--bar) var(--bar) / var(--bar) 100% no-repeat,
+    linear-gradient(#cfb3d4, #cfb3d4) 0 0 / 100% var(--bar) no-repeat,
+    linear-gradient(#cfb3d4, #cfb3d4) 0 0 / var(--bar) 100% no-repeat;
+}
+@media (min-width: 768px) { body::before { --bar: 25px; } }
+a { color: inherit; text-underline-offset: 4px; }
+a:focus-visible { outline: 3px solid #e94f0b; outline-offset: 3px; }
+.nf-shell { display: flex; flex-direction: column; min-height: 100vh; min-height: 100svh; max-width: 1120px; margin: 0 auto; padding: 40px 20px 20px 44px; }
+@media (min-width: 768px) { .nf-shell { padding: 72px 40px 24px 90px; } }
+.nf-header, .nf-footer { display: flex; justify-content: space-between; align-items: center; gap: 16px; flex-wrap: wrap; }
+.nf-header { border-bottom: 1px solid #111; padding-bottom: 14px; }
+.nf-header a { text-decoration: none; }
+.nf-logo { font-size: 24px; font-weight: 700; letter-spacing: -.05em; }
+.nf-logo span { margin-left: 6px; font-size: 11px; letter-spacing: .09em; }
+.nf-main { flex: 1; padding: 56px 0 40px; }
+.nf-mark { display: block; width: 72px; height: auto; margin-bottom: 28px; }
+.nf-kicker { margin: 0; font-size: 11px; letter-spacing: .09em; }
+.nf-main h1 { margin: 18px 0 22px; font-size: clamp(44px, 10vw, 100px); font-weight: 500; line-height: .92; letter-spacing: -.065em; }
+.nf-lead { max-width: 620px; margin: 0 0 30px; font-size: clamp(18px, 2.4vw, 22px); }
+.nf-actions { display: flex; flex-wrap: wrap; gap: 12px; }
+.nf-button { display: inline-block; padding: 14px 22px; border: 1px solid #111; color: #fff; background: #e50083; text-decoration: none; }
+.nf-button:hover { color: #111; background: #fff; }
+.nf-button-secondary { color: #111; background: #fff; }
+.nf-button-secondary:hover { color: #fff; background: #111; }
+.nf-footer { border-top: 1px solid #111; padding-top: 14px; font-size: 11px; letter-spacing: .08em; text-transform: uppercase; }

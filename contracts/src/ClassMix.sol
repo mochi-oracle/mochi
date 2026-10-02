@@ -28,6 +28,7 @@ contract ClassMix is IClassMix, AccessControl {
 
     /// @inheritdoc IClassMix
     function setMix(uint8[9] calldata newMix) external override onlyRole(MochiRoles.GOVERNOR_ROLE) {
+        // slither-disable-next-line uninitialized-local -- all-false bitmap, filled below
         bool[5] memory seen;
         for (uint8 i; i < 9; ++i) {
             uint8 class_ = newMix[i];

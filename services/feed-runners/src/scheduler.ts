@@ -11,10 +11,14 @@ import { FeedQueryExecutor, IntakeHttpError } from "./execute.ts";
 import { log } from "./log.ts";
 import { SchemaId } from "@mochi/core";
 import { subjectKey } from "./runners/common.ts";
+import { failureReason } from "./observation.ts";
 
 const RUNNERS: RunnerName[] = ["corp-actions", "earnings", "attestations"];
 /** A multiplier change that took effect longer ago than this is history, not news. */
 const STALE_MULTIPLIER_MS = 7 * 86_400_000;
+/** observeMultiplier backoff after a failure (a revert fails the same way on every poll): 5 min, doubling, capped at 6 h. */
+const OBSERVE_BACKOFF_BASE_MS = 5 * 60_000;
+const OBSERVE_BACKOFF_MAX_MS = 6 * 3_600_000;
 export class FeedScheduler {
   private state: RunnerState = { completed: [], multiplierPairs: {}, edgarSeen: [] };
   private running = false;
@@ -23,6 +27,8 @@ export class FeedScheduler {
     "corp-actions": { lastJobs: 0 }, earnings: { lastJobs: 0 }, attestations: { lastJobs: 0 },
   };
   private lastMultiplierPoll = 0;
+  /** Per-ticker observeMultiplier backoff (in memory: a restart retries once, then backs off again). */
+  private readonly observeRetry = new Map<string, { failures: number; retryAt: number }>();
   private lastEdgarPoll = 0;
   private lastStandardRun = 0;
   constructor(private readonly config: ServiceConfig, private readonly executor: FeedQueryExecutor, private readonly now = () => Date.now(), private readonly sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)), private readonly stockTokens?: StockTokenReader, private readonly edgar?: EdgarHttp) {}
@@ -88,12 +94,16 @@ export class FeedScheduler {
     if (!this.stockTokens) return;
     for (const token of this.config.feeds["corp-actions"].tokens) {
       const pairKey = token.token.toLowerCase();
+      // Every poll, before anything that can skip the ticker: an immediate multiplier change (no pending window) is
+      // ratio-checked against the last observation taken before it, and a pending change gets its baseline here too.
+      await this.observe(token.ticker.toUpperCase());
       try {
         const schedule = await this.stockTokens.readMultiplierSchedule(token.token);
         if (schedule.newUIMultiplier === 0n || schedule.effectiveAt === 0n) continue;
         const effectiveMs = Number(schedule.effectiveAt) * 1000;
         // Stock Tokens stop exposing the pre-change multiplier once effectiveAt passes, so record it on-chain while the
-        // change is pending; a SPLIT feed update posted after the change is then still ratio-checked.
+        // change is pending; a SPLIT feed update posted after the change is then still ratio-checked. observe() above
+        // normally records it already; this is the fallback (no transaction once a baseline exists).
         if (effectiveMs > this.now() && this.stockTokens.recordBaseline) {
           try { await this.stockTokens.recordBaseline(subjectKey(token.ticker.toUpperCase()), schedule.effectiveAt); }
           catch (error) { log("error", "multiplier_baseline_record_failed", { ticker: token.ticker, effectiveAt: schedule.effectiveAt.toString(), error: error instanceof Error ? error.message : "record failed" }); }
@@ -123,6 +133,24 @@ export class FeedScheduler {
           catch (error) { log("error", "multiplier_notice_job_failed", { ticker: token.ticker, effectiveAt: pair.effectiveAt, error: error instanceof Error ? error.message : "runner failed" }); }
         }
       } catch (error) { log("error", "multiplier_schedule_read_failed", { ticker: token.ticker, error: error instanceof Error ? error.message : "read failed" }); }
+    }
+  }
+  /** StockTokenCrosscheck.observeMultiplier for one ticker; never throws. Failures back off per ticker instead of
+   *  re-simulating (and logging) the same revert every poll. */
+  private async observe(ticker: string): Promise<void> {
+    if (!this.stockTokens?.observeMultiplier) return;
+    const retry = this.observeRetry.get(ticker);
+    if (retry && this.now() < retry.retryAt) return;
+    try {
+      const outcome = await this.stockTokens.observeMultiplier(subjectKey(ticker), BigInt(Math.floor(this.now() / 1000)));
+      if (outcome === "unregistered") throw new Error("ticker has no token on StockTokenCrosscheck");
+      if (retry) log("info", "multiplier_observe_recovered", { ticker, failures: retry.failures });
+      this.observeRetry.delete(ticker);
+    } catch (error) {
+      const failures = (retry?.failures ?? 0) + 1;
+      const backoffMs = Math.min(OBSERVE_BACKOFF_MAX_MS, OBSERVE_BACKOFF_BASE_MS * 2 ** (failures - 1));
+      this.observeRetry.set(ticker, { failures, retryAt: this.now() + backoffMs });
+      log("warn", "multiplier_observe_failed", { ticker, failures, backoffMs, error: failureReason(error) });
     }
   }
   async pollEdgar(): Promise<void> {

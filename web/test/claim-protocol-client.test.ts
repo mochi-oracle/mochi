@@ -2,11 +2,12 @@ import { expect, test } from 'bun:test';
 import { MockTeeProvider, MockQuoteVerifier, signProvenance } from '@mochi/tee';
 import { privateKeyToAccount } from 'viem/accounts';
 import { docCommit, docHash } from '@mochi/core';
-import { aad } from '@mochi/protocol';
-import { SchemaId } from '@mochi/core';
+import { aad, provenanceFromJson } from '@mochi/protocol';
+import { QueryStatus, SchemaId } from '@mochi/core';
 import { zeroHash } from 'viem';
 import { normalizeParams, paramsHash, resolveSchema } from '@mochi/schemas';
-import { createProtocolClient, loadProtocolConfig, parseClaimRecovery, payForClaimReview, preparePaidClaimReview, waitForPaidClaimReview } from '../site/src/claim-protocol-client.js';
+import { PaymentNotSentError, createProtocolClient, loadProtocolConfig, parseClaimRecovery, payForClaimReview, preparePaidClaimReview, waitForPaidClaimReview } from '../site/src/claim-protocol-client.js';
+import { PAYMENT_STAGE, paymentNotSent } from '../site/src/live-client.js';
 
 const h = c => `0x${c.repeat(64)}`;
 const a = c => `0x${c.repeat(40)}`;
@@ -43,9 +44,13 @@ test('prepares a private FREEFORM_FACT quote through verified LiveClient intake'
       plain = JSON.parse(new TextDecoder().decode(tee.decryptEnvelope(envelope, aad.intake())));
       const bytes = Uint8Array.from(atob(plain.docB64), c => c.charCodeAt(0));
       const commit = docCommit(plain.salt, docHash(bytes));
-      const provenance = { docCommit: commit, kind: 0, originId: zeroHash, fetchedAt: BigInt(Math.floor(Date.now() / 1000)), tokensK: 1, transcriptHash: zeroHash };
       const normalized = normalizeParams(resolveSchema(SchemaId.FREEFORM_FACT, plain.params), plain.params);
-      const intake = { provenance: { ...provenance, fetchedAt: String(provenance.fetchedAt) }, docCommit: commit, paramsHash: paramsHash(normalized.params), intake: config.intakeAddress, intakeSig: await signProvenance(tee.signer(), 31337, config.contracts.queryEscrow, provenance), schemaId: SchemaId.FREEFORM_FACT, tokensK: 1 };
+      // The intake signs the sealed open binding (wallet, result-key commitment, consent, nonce) into the grant.
+      const provenance = {
+        docCommit: commit, kind: 0, originId: zeroHash, fetchedAt: String(Math.floor(Date.now() / 1000)), tokensK: 1, transcriptHash: zeroHash,
+        schemaId: SchemaId.FREEFORM_FACT, schemaVersion: 1, paramsHash: paramsHash(normalized.params), expiry: String(Math.floor(Date.now() / 1000) + 900), ...plain.open,
+      };
+      const intake = { provenance, docCommit: commit, paramsHash: paramsHash(normalized.params), intake: config.intakeAddress, intakeSig: await signProvenance(tee.signer(), 31337, config.contracts.queryEscrow, provenanceFromJson(provenance)), schemaId: SchemaId.FREEFORM_FACT, tokensK: 1 };
       return Response.json(intake);
     }
     if (String(path).endsWith('/v1/query')) return Response.json({ queryId: h('8'), to: a('9'), data: '0xdeadbeef' });
@@ -58,6 +63,7 @@ test('prepares a private FREEFORM_FACT quote through verified LiveClient intake'
   expect(prepared.prepared).toMatchObject({ n: 3, isPublic: false, schema: 'FREEFORM_FACT', displayAmount: '0.021' });
   expect(prepared.prepared.secrets.resultPrivateKey).toMatch(/^0x[0-9a-f]{64}$/);
   expect(plain.params.answer_type).toBe('STRING');
+  expect(plain.open).toMatchObject({ opener: a('6'), isPublic: false, allowPanelDisclosure: false });
   expect(plain.params.question).toContain('supported, contradicted, missing_context, insufficient_evidence');
   expect(JSON.stringify(requests)).not.toContain('The board approved the transaction.');
   expect(JSON.stringify(requests)).not.toContain('issuer.example');
@@ -124,4 +130,100 @@ test('an unresolved timed wait can be resumed without invoking payment again and
   const recovery = parseClaimRecovery({ kind: 'MOCHI_QUERY_RECOVERY', chainId: 31337, escrow: config.contracts.queryEscrow, queryId: h('8'), secrets: { salt: h('1'), resultPrivateKey: h('2') } }, config);
   expect(recovery.execution).toBe('submitted_recovery');
   expect(() => parseClaimRecovery({ ...recovery.prepared, kind: 'MOCHI_QUERY_RECOVERY', chainId: 1 }, config)).toThrow('does not match');
+});
+
+test('an expired query returns a distinct terminal EXPIRED result instead of an unresolved wait', async () => {
+  expect(QueryStatus.EXPIRED).toBe(6); // mirrors MochiTypes.QueryStatus.EXPIRED in the contracts
+  let verdictLookups = 0;
+  const client = {
+    read: async (_contract, _abi, method) => {
+      if (method === 'getQuery') return { status: QueryStatus.EXPIRED, schemaId: SchemaId.FREEFORM_FACT, deadline: 1n };
+      verdictLookups++;
+      return `0x${'0'.repeat(64)}`;
+    },
+  };
+  const progress = [];
+  const result = await waitForPaidClaimReview(client, { prepared: { queryId: h('8') } }, { timeoutMs: 1_000, onProgress: p => progress.push(p) });
+  expect(result).toEqual({ execution: 'onchain_protocol', status: 'EXPIRED' });
+  expect(progress).toEqual(['Expired']);
+  expect(verdictLookups).toBe(0);
+});
+
+test('a timed-out wait flags an open query whose one-hour deadline has passed', async () => {
+  const read = deadline => async (_contract, _abi, method) => method === 'getQuery' ? { status: QueryStatus.SEALED, schemaId: SchemaId.FREEFORM_FACT, deadline } : `0x${'0'.repeat(64)}`;
+  const past = BigInt(Math.floor(Date.now() / 1000) - 60);
+  const future = BigInt(Math.floor(Date.now() / 1000) + 3600);
+  expect(await waitForPaidClaimReview({ read: read(past) }, { prepared: { queryId: h('8') } }, { timeoutMs: 20 })).toEqual({ execution: 'onchain_protocol', status: 'unresolved', deadlinePassed: true });
+  expect(await waitForPaidClaimReview({ read: read(future) }, { prepared: { queryId: h('8') } }, { timeoutMs: 20 })).toEqual({ execution: 'onchain_protocol', status: 'unresolved' });
+});
+
+// A LiveClient whose chain, wallet provider and wallet are fakes; `wallet` decides how each transaction request ends.
+function submitFixture({ allowance = 21_000n, createdAt = Date.now(), wallet, receipt = async () => ({ status: 'success' }) } = {}) {
+  const sent = [];
+  const publicClient = {
+    getChainId: async () => 31337,
+    readContract: async ({ functionName }) => functionName === 'quote' ? [20_000n, 1_000n] : functionName === 'allowance' ? allowance : undefined,
+    call: async () => ({}),
+    waitForTransactionReceipt: receipt,
+  };
+  const client = createProtocolClient(config, { publicClient });
+  client.provider = { request: async ({ method }) => method === 'eth_chainId' ? '0x7a69' : [a('6')] };
+  client.wallet = { sendTransaction: async tx => { sent.push(tx.to); return wallet(tx, sent.length); } };
+  const prepared = { chainId: 31337, escrow: config.contracts.queryEscrow, account: a('6'), createdAt, schemaId: SchemaId.FREEFORM_FACT, n: 3, tokensK: 1, amount: 21_000n, displayAmount: '0.021', data: '0xdeadbeef', queryId: h('8') };
+  return { client, prepared, sent };
+}
+const rejected = () => Object.assign(new Error('Transaction execution failed.'), { name: 'TransactionExecutionError', cause: Object.assign(new Error('User rejected the request.'), { name: 'UserRejectedRequestError', code: 4001 }) });
+
+test('submit marks failures before the escrow payment request as definitely not sent', async () => {
+  const expired = submitFixture({ createdAt: Date.now() - 6 * 60 * 1000, wallet: () => h('e') });
+  const error = await expired.client.submit(expired.prepared).catch(e => e);
+  expect(error.message).toContain('Quote expired');
+  expect(error.paymentAttempt).toEqual({ stage: PAYMENT_STAGE.CHECKS });
+  expect(paymentNotSent(error)).toBe(true);
+  expect(expired.sent).toEqual([]);
+  // Rejecting the USDG approval popup also leaves the escrow payment unrequested.
+  const approval = submitFixture({ allowance: 0n, wallet: () => { throw rejected(); } });
+  const approvalError = await approval.client.submit(approval.prepared).catch(e => e);
+  expect(approval.sent).toEqual([config.contracts.usdg]);
+  expect(paymentNotSent(approvalError)).toBe(true);
+});
+
+test('submit separates a rejected payment popup from a payment that may have been broadcast', async () => {
+  const popup = submitFixture({ wallet: () => { throw rejected(); } });
+  const popupError = await popup.client.submit(popup.prepared).catch(e => e);
+  expect(popupError.paymentAttempt.stage).toBe(PAYMENT_STAGE.REQUESTED);
+  expect(paymentNotSent(popupError)).toBe(true);
+  // A transport failure while the wallet holds the payment request is ambiguous: the wallet may have broadcast it.
+  const transport = submitFixture({ wallet: () => { throw new Error('wallet transport stopped'); } });
+  expect(paymentNotSent(await transport.client.submit(transport.prepared).catch(e => e))).toBe(false);
+  // Once a payment hash exists, a later failure never unlocks the quote, and the hash is kept for recovery.
+  const broadcast = submitFixture({ wallet: () => h('f'), receipt: async () => { throw new Error('receipt timeout'); } });
+  const broadcastError = await broadcast.client.submit(broadcast.prepared).catch(e => e);
+  expect(broadcastError.paymentAttempt).toEqual({ stage: PAYMENT_STAGE.BROADCAST, hash: h('f') });
+  expect(paymentNotSent(broadcastError)).toBe(false);
+  expect(paymentNotSent(new Error('untagged'))).toBe(false);
+});
+
+test('a definitive pre-send failure releases the quote; a possibly broadcast payment keeps it locked', async () => {
+  const { client, prepared } = submitFixture({ wallet: () => { throw rejected(); } });
+  const claim = { prepared };
+  const first = await payForClaimReview(client, claim).catch(e => e);
+  expect(first).toBeInstanceOf(PaymentNotSentError);
+  expect(first.paymentSent).toBe(false);
+  expect(first.message).toBe('The wallet request was rejected. No payment was sent.');
+  client.wallet.sendTransaction = async () => h('f');
+  expect(await payForClaimReview(client, claim)).toBe(h('f'));
+  expect(() => payForClaimReview(client, claim)).toThrow('already been submitted or attempted');
+
+  const expired = submitFixture({ createdAt: Date.now() - 6 * 60 * 1000, wallet: () => h('e') });
+  const expiredError = await payForClaimReview(expired.client, { prepared: expired.prepared }).catch(e => e);
+  expect(expiredError).toBeInstanceOf(PaymentNotSentError);
+  expect(expiredError.message).toBe('Quote expired. Prepare a new quote. No payment was sent.');
+
+  const broadcast = submitFixture({ wallet: () => h('f'), receipt: async () => { throw new Error('receipt timeout'); } });
+  const locked = { prepared: broadcast.prepared };
+  const ambiguous = await payForClaimReview(broadcast.client, locked).catch(e => e);
+  expect(ambiguous).not.toBeInstanceOf(PaymentNotSentError);
+  expect(ambiguous.paymentAttempt.hash).toBe(h('f'));
+  expect(() => payForClaimReview(broadcast.client, locked)).toThrow('already been submitted or attempted');
 });

@@ -1,11 +1,13 @@
 import { createClaimReviewProtocolInput } from '../../../packages/sdk/src/claims.ts';
-import { SchemaId, VerdictStatus } from '@mochi/core';
+import { QueryStatus, SchemaId, VerdictStatus } from '@mochi/core';
 import { MochiVerdictsAbi, QueryEscrowAbi } from '../../../packages/chain/src/abis.ts';
-import { LiveClient } from './live-client.js';
+import { LiveClient, isUserRejection, paymentNotSent } from './live-client.js';
 
 const claimBytes = 4_000;
 const excerptBytes = 18_000;
 const aggregateBytes = 64_000;
+/** The limits validateEvidence enforces, so the check form can count and check them before the wallet connects. */
+export const CLAIM_EVIDENCE_LIMITS = Object.freeze({ claimBytes, excerptBytes, aggregateBytes, titleBytes: 2048, urlBytes: 2048, minSources: 1, maxSources: 5 });
 const encoder = new TextEncoder();
 const answers = new Set(['supported', 'contradicted', 'missing_context', 'insufficient_evidence']);
 const submittedQuotes = new WeakSet();
@@ -23,7 +25,7 @@ export function createProtocolClient(config, options) {
   return new LiveClient(config, options);
 }
 
-function validateEvidence(claim, evidence) {
+export function validateEvidence(claim, evidence) {
   if (typeof claim !== 'string' || !claim.trim() || encoder.encode(claim).byteLength > claimBytes) throw new RangeError('Enter one claim up to 4,000 UTF-8 bytes.');
   if (!Array.isArray(evidence) || evidence.length < 1 || evidence.length > 5) throw new RangeError('Provide 1–5 user-submitted source excerpts.');
   let total = 0;
@@ -62,12 +64,26 @@ export async function preparePaidClaimReview(client, { claim, evidence }) {
   return { execution: 'prepared_unsubmitted', provenance: 'SUBMITTED', sourcesFetched: false, prepared };
 }
 
-/** Explicit payment confirmation through the existing exact-allowance LiveClient flow. */
+/** A payment attempt that definitely sent nothing to the escrow; the quote and form may be used again. */
+export class PaymentNotSentError extends Error {
+  constructor(message, options) { super(message, options); this.name = 'PaymentNotSentError'; this.paymentSent = false; }
+}
+
+/**
+ * Explicit payment confirmation through the existing exact-allowance LiveClient flow. A quote stays one-shot once
+ * its payment transaction may have been broadcast. A definitive pre-send failure (checks such as an expired quote,
+ * or a rejected wallet request) releases the quote and rejects with PaymentNotSentError.
+ */
 export function payForClaimReview(client, prepared, onProgress) {
   if (!prepared?.prepared || typeof prepared.prepared !== 'object') throw new TypeError('A prepared claim quote is required.');
   if (submittedQuotes.has(prepared.prepared)) throw new Error('This quote has already been submitted or attempted. Prepare a new quote only after checking the saved query ID.');
   submittedQuotes.add(prepared.prepared);
-  return client.submit(prepared.prepared, onProgress);
+  return (async () => client.submit(prepared.prepared, onProgress))().catch(error => {
+    if (!paymentNotSent(error)) throw error;
+    submittedQuotes.delete(prepared.prepared);
+    const reason = isUserRejection(error) ? 'The wallet request was rejected.' : String(error?.message || 'The payment could not start.');
+    throw new PaymentNotSentError(`${reason} No payment was sent.`, { cause: error });
+  });
 }
 
 export function parseClaimRecovery(value, config) {
@@ -75,16 +91,27 @@ export function parseClaimRecovery(value, config) {
   return { execution: 'submitted_recovery', provenance: 'SUBMITTED', prepared: { queryId: value.queryId, chainId: value.chainId, escrow: value.escrow, secrets: value.secrets } };
 }
 
+/** True while an open query is past its on-chain deadline and can be expired (refund needs an expiry transaction). */
+function deadlinePassed(query, now = Date.now()) {
+  const status = Number(query?.status);
+  if (status !== QueryStatus.OPEN && status !== QueryStatus.SEALED) return false;
+  const deadline = Number(query?.deadline ?? 0);
+  return deadline > 0 && deadline * 1000 < now;
+}
+
 export async function waitForPaidClaimReview(client, prepared, { signal, onProgress = () => {}, timeoutMs = 180_000 } = {}) {
   const deadline = Date.now() + timeoutMs;
+  let lastQuery;
   while (Date.now() < deadline) {
     signal?.throwIfAborted();
     const query = await client.read('queryEscrow', QueryEscrowAbi, 'getQuery', [prepared.prepared.queryId]);
+    lastQuery = query;
     const queryStatus = Number(query.status);
     if (Number(query.schemaId) !== SchemaId.FREEFORM_FACT) return { execution: 'onchain_protocol', status: 'unresolved' };
     onProgress(['Unknown', 'Opened', 'Jury selected', 'Decided', 'HUNG', 'Escalated', 'Expired'][queryStatus] ?? 'Pending');
-    if (queryStatus === 4) return { execution: 'onchain_protocol', status: 'HUNG' };
-    if (queryStatus === 6) return { execution: 'onchain_protocol', status: 'unresolved' };
+    if (queryStatus === QueryStatus.HUNG) return { execution: 'onchain_protocol', status: 'HUNG' };
+    // Terminal: expire() ran on chain after the deadline and refunded the remaining escrow. No outcome exists.
+    if (queryStatus === QueryStatus.EXPIRED) return { execution: 'onchain_protocol', status: 'EXPIRED' };
     const verdictId = await client.read('verdicts', MochiVerdictsAbi, 'latestVerdictOf', [prepared.prepared.queryId]);
     if (verdictId !== `0x${'0'.repeat(64)}`) {
       const requestSignal = signal ? AbortSignal.any([signal, AbortSignal.timeout(30_000)]) : AbortSignal.timeout(30_000);
@@ -108,5 +135,5 @@ export async function waitForPaidClaimReview(client, prepared, { signal, onProgr
       signal?.addEventListener('abort', stop, { once: true });
     });
   }
-  return { execution: 'onchain_protocol', status: 'unresolved' };
+  return { execution: 'onchain_protocol', status: 'unresolved', ...(deadlinePassed(lastQuery) ? { deadlinePassed: true } : {}) };
 }

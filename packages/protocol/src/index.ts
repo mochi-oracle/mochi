@@ -2,8 +2,9 @@
 // Trust model (docs/ARCHITECTURE.md): intake, juror and consensus are attested enclaves; the orchestrator and gateway
 // are untrusted relays. Anything private (document, params, salt, answers, payer result key) travels only inside
 // envelopes sealed to an enclave's attested x25519 key, and is bound to on-chain commitments the enclaves re-check.
-import { encodePacked, keccak256, toHex, type Hex } from "viem";
+import { encodePacked, keccak256, toHex, type Address, type Hex } from "viem";
 import { z } from "zod";
+import { privatePayloadHash, type Provenance } from "@mochi/core";
 
 // ───────────────────────── primitives ─────────────────────────
 
@@ -12,6 +13,8 @@ export const hex32 = z.string().regex(/^0x[0-9a-f]{64}$/, "bytes32 lowercase hex
 export const address = z.string().regex(/^0x[0-9a-f]{40}$/, "lowercase address");
 /** bigint carried as a decimal string in JSON. */
 export const uintString = z.string().regex(/^(0|[1-9][0-9]*)$/, "unsigned decimal string");
+/** uint64 carried as a decimal string in JSON. */
+export const uint64String = uintString.refine((value) => BigInt(value) <= (1n << 64n) - 1n, "uint64 out of range");
 
 export const EnvelopeSchema = z.object({ v: z.literal(1), epk: hex32, nonce: hex, ct: hex });
 export type EnvelopeJson = z.infer<typeof EnvelopeSchema>;
@@ -68,6 +71,23 @@ export function payerCommit(payerResultPubKey: Hex): Hex {
 
 // ───────────────────────── intake (enclave) ─────────────────────────
 
+/**
+ * How the document owner will open the query, sealed to the intake together with the document. The intake signs it
+ * into the Provenance (with schemaId/version, paramsHash and an expiry it sets itself), so the signature only opens
+ * this exact query: from `opener`, with this result-key commitment, these consent flags and this queryId nonce.
+ * Public queries use payerCommit = ZERO32 and salt = ZERO32; private ones need a non-zero salt and payerCommit.
+ */
+export const OpenBindingSchema = z.object({
+  /** msg.sender of the open call: the payer's wallet, the shielded/voucher relayer, or the feed runner. */
+  opener: address,
+  payerCommit: hex32,
+  isPublic: z.boolean(),
+  allowPanelDisclosure: z.boolean(),
+  /** queryId nonce (uint64): queryId = computeQueryId(opener, docCommit, nonce). Use a fresh random value. */
+  nonce: uint64String,
+});
+export type OpenBinding = z.infer<typeof OpenBindingSchema>;
+
 /** Plaintext sealed to the intake key (aad.intake()) — upload form. salt = ZERO32 for public queries. */
 export const IntakeUploadPlainSchema = z.object({
   v: z.literal(1),
@@ -76,6 +96,7 @@ export const IntakeUploadPlainSchema = z.object({
   params: z.record(z.string(), z.unknown()).default({}),
   contentType: z.string().min(1),
   docB64: z.string(),
+  open: OpenBindingSchema,
 });
 /** Plaintext sealed to the intake key (aad.intake()) — URL form (intake fetches from an allow-listed origin). */
 export const IntakeUrlPlainSchema = z.object({
@@ -84,6 +105,7 @@ export const IntakeUrlPlainSchema = z.object({
   salt: hex32,
   params: z.record(z.string(), z.unknown()).default({}),
   url: z.string().url(),
+  open: OpenBindingSchema,
 });
 export type IntakeUploadPlain = z.infer<typeof IntakeUploadPlainSchema>;
 export type IntakeUrlPlain = z.infer<typeof IntakeUrlPlainSchema>;
@@ -91,26 +113,69 @@ export type IntakeUrlPlain = z.infer<typeof IntakeUrlPlainSchema>;
 /** POST /v1/intake/upload and /v1/intake/url body. */
 export const IntakeReqSchema = z.object({ envelope: EnvelopeSchema });
 
+/** The signed EIP-712 Provenance (core `Provenance`) with uint64 members as decimal strings. */
 export const ProvenanceJsonSchema = z.object({
   docCommit: hex32,
   kind: z.union([z.literal(0), z.literal(1)]),
   originId: hex32,
-  fetchedAt: uintString,
+  fetchedAt: uint64String,
   tokensK: z.number().int().min(1),
   transcriptHash: hex32,
+  opener: address,
+  schemaId: z.number().int().min(1),
+  schemaVersion: z.number().int().min(1).max(65535),
+  paramsHash: hex32,
+  payerCommit: hex32,
+  isPublic: z.boolean(),
+  allowPanelDisclosure: z.boolean(),
+  nonce: uint64String,
+  expiry: uint64String,
 });
 export type ProvenanceJson = z.infer<typeof ProvenanceJsonSchema>;
 
+/** ProvenanceJson → the viem/EIP-712 message and the QueryEscrow `prov` argument. */
+export function provenanceFromJson(json: ProvenanceJson): Provenance {
+  return {
+    ...json, docCommit: json.docCommit as Hex, originId: json.originId as Hex, transcriptHash: json.transcriptHash as Hex,
+    opener: json.opener as Address, paramsHash: json.paramsHash as Hex, payerCommit: json.payerCommit as Hex,
+    fetchedAt: BigInt(json.fetchedAt), nonce: BigInt(json.nonce), expiry: BigInt(json.expiry),
+  };
+}
+
+/** True when the signed grant is exactly the open the caller sealed (fields the intake did not choose itself). */
+export function provenanceMatchesBinding(prov: ProvenanceJson, binding: OpenBinding): boolean {
+  return prov.opener === binding.opener.toLowerCase() && prov.payerCommit === binding.payerCommit.toLowerCase()
+    && prov.isPublic === binding.isPublic && prov.allowPanelDisclosure === binding.allowPanelDisclosure
+    && BigInt(prov.nonce) === BigInt(binding.nonce);
+}
+
 export const IntakeResultSchema = z.object({
-  provenance: ProvenanceJsonSchema,
+  provenance: ProvenanceJsonSchema, // pass as the `prov` argument of open*; OpenParams carries only n and refundTo
   intakeSig: hex, // EIP-712 Provenance signature (domain MochiQueryEscrow)
   intake: address,
   docCommit: hex32,
-  paramsHash: hex32, // the caller must pass this as OpenParams.paramsHash
+  paramsHash: hex32, // == provenance.paramsHash
   schemaId: z.number().int().min(1),
   tokensK: z.number().int().min(1),
+  /**
+   * maskDocHash(salt, docHash) of the bytes the intake committed to (the plain docHash for a public query). Unsigned,
+   * but the requester unmasks it with its own salt and checks docCommit == keccak256(salt ‖ docHash): a URL-mode grant
+   * the relay obtained for another request (its own salt) cannot pass. Optional only for older intake builds.
+   */
+  maskedDocHash: hex32.optional(),
 });
 export type IntakeResult = z.infer<typeof IntakeResultSchema>;
+
+/**
+ * docHash XOR keccak256(abi.encodePacked("mochi/doc-hash-mask/v1", salt)), or docHash itself when salt = ZERO32. An
+ * involution: the same call unmasks. The relay between requester and intake sees only the masked value, so a private
+ * document's hash (which the salted docCommit keeps off-chain) is not revealed to it.
+ */
+export function maskDocHash(salt: Hex, docHashOrMasked: Hex): Hex {
+  if (/^0x0{64}$/i.test(salt)) return docHashOrMasked.toLowerCase() as Hex;
+  const mask = BigInt(keccak256(encodePacked(["string", "bytes32"], ["mochi/doc-hash-mask/v1", salt])));
+  return `0x${(BigInt(docHashOrMasked) ^ mask).toString(16).padStart(64, "0")}`;
+}
 
 /** POST /v1/dispatch — after seal. Intake re-checks every peer on-chain and against its quote before encrypting. */
 export const DispatchReqSchema = z.object({
@@ -260,6 +325,22 @@ export const PrivateResultPlainSchema = z.object({
   fields: PublicDecisionSchema.shape.fields,
 });
 export type PrivateResultPlain = z.infer<typeof PrivateResultPlainSchema>;
+
+/**
+ * Checks a decrypted (or disclosed) private result against the on-chain verdict record: keccak256(answerJson) ==
+ * answerHash, and payloadHash == privatePayloadHash(salt, payload) for a VERDICT (ZERO32 with an empty payload when
+ * HUNG). Returns the first mismatch, or undefined when both commitments match.
+ */
+export function privateResultMismatch(
+  result: Pick<PrivateResultPlain, "salt" | "answerJson" | "payload">,
+  chain: { answerHash: string; payloadHash: string },
+): "answerHash" | "payloadHash" | undefined {
+  if (keccak256(toHex(result.answerJson)).toLowerCase() !== chain.answerHash.toLowerCase()) return "answerHash";
+  const onChain = chain.payloadHash.toLowerCase();
+  if (/^0x0{64}$/.test(onChain)) return result.payload === "0x" ? undefined : "payloadHash";
+  if (result.payload === "0x" || /^0x0{64}$/i.test(result.salt)) return "payloadHash";
+  return privatePayloadHash(result.salt as Hex, result.payload as Hex).toLowerCase() === onChain ? undefined : "payloadHash";
+}
 
 // ───────────────────────── model Passport (Overview §4) ─────────────────────────
 

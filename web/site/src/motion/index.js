@@ -13,6 +13,7 @@ const ease = 'power3.inOut';
 const elements = (selector, scope = document) => [...scope.querySelectorAll(selector)];
 const attr = (el, key, fallback) => el.dataset[key] ?? fallback;
 const revealTweens = new Map();
+let lenis = null;
 
 function playVisibleReveals() {
   for (const [el, tween] of revealTweens) {
@@ -36,7 +37,39 @@ function bootSmoothScroll() {
   return lenis;
 }
 
-function setupAnchors(lenis) {
+// Back/Forward: the page scrolls inside [data-scroll-wrapper], which browsers do not restore. Remember the wrapper's
+// position per URL for this tab and put it back when the history entry is revisited (not on fresh visits).
+const scrollMemoryKey = () => `mochi:scroll:${location.pathname}${location.search}`;
+function setupScrollMemory() {
+  const wrapper = document.querySelector('[data-scroll-wrapper]');
+  if (!wrapper) return;
+  const save = () => { try { sessionStorage.setItem(scrollMemoryKey(), String(Math.round(wrapper.scrollTop))); } catch {} };
+  window.addEventListener('pagehide', save);
+  document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'hidden') save(); });
+  const entry = performance.getEntriesByType?.('navigation')?.[0];
+  const backForward = entry ? entry.type === 'back_forward' : performance.navigation?.type === 2;
+  if (!backForward) return;
+  let target = 0;
+  try { target = Number(sessionStorage.getItem(scrollMemoryKey())) || 0; } catch {}
+  if (target <= 0) return;
+  // Fonts and late layout can shorten the first attempt; retry until it holds, unless the visitor scrolls first.
+  let interrupted = false;
+  const interrupt = () => { interrupted = true; };
+  for (const type of ['wheel', 'touchstart', 'pointerdown']) wrapper.addEventListener(type, interrupt, { once: true, passive: true });
+  window.addEventListener('keydown', interrupt, { once: true });
+  const restore = () => {
+    if (interrupted || Math.abs(wrapper.scrollTop - target) < 2) return;
+    if (lenis) { lenis.resize(); lenis.scrollTo(target, { immediate: true, force: true }); } else wrapper.scrollTop = target;
+  };
+  restore();
+  document.fonts?.ready.then(restore);
+  window.addEventListener('load', restore, { once: true });
+  return true;
+}
+
+// In-page links (#anchors) inside the custom scroller: scroll the wrapper itself and move focus to the target.
+// restoring: Back/Forward is putting a remembered position back, so the initial deep-link jump is skipped.
+function setupAnchors(restoring = false) {
   const wrapper = document.querySelector('[data-scroll-wrapper]');
   if (!wrapper) return;
   const navigate = hash => {
@@ -66,7 +99,7 @@ function setupAnchors(lenis) {
   // The loader's clip path can temporarily alter element geometry; align deep links after it clears.
   const initial = () => {
     if (root.classList.contains('preloader-complete')) {
-      document.fonts.ready.then(() => navigate(location.hash));
+      if (!restoring) document.fonts.ready.then(() => navigate(location.hash));
       observer.disconnect();
     }
   };
@@ -92,48 +125,66 @@ function setupLazyImages() {
   images.forEach(image => observer.observe(image));
 }
 
+// The splash plays once per browser: later page loads (and every page after the first) show the content at once.
+// Storage can be unavailable (private modes, blocked cookies); then the splash simply plays.
+const SPLASH_SEEN_KEY = 'mochi:splash-seen';
+function splashSeen() {
+  try { return localStorage.getItem(SPLASH_SEEN_KEY) === '1'; } catch { return false; }
+}
+function rememberSplash() {
+  try { localStorage.setItem(SPLASH_SEEN_KEY, '1'); } catch {}
+}
+
+function finishLoader(loader) {
+  root.classList.remove('is-loading');
+  root.classList.add('preloader-complete');
+  loader?.setAttribute('aria-hidden', 'true');
+}
+
 // Start the splash at DOM readiness; image downloads must not delay the animation.
 function completeLoader() {
   root.classList.add('is-loaded');
   const loader = document.querySelector('[data-component="preloader"]');
   if (!loader) {
-    root.classList.remove('is-loading');
-    root.classList.add('preloader-complete');
+    finishLoader(null);
     playVisibleReveals();
     return;
   }
-  if (reduced) {
-    elements('.preloader__layer-inset', loader).forEach(inset => { inset.style.display = 'none'; });
-    root.classList.remove('is-loading');
-    root.classList.add('preloader-complete');
-    loader.setAttribute('aria-hidden', 'true');
+  const insets = elements('.preloader__layer-inset', loader);
+  if (reduced || splashSeen()) {
+    // Same end state as the timeline below: colour fills gone, frame bars and M/O labels in place.
+    insets.forEach(inset => { inset.style.display = 'none'; });
+    finishLoader(loader);
+    if (!reduced) ScrollTrigger.refresh();
     playVisibleReveals();
     return;
   }
+  rememberSplash();
   // The old zero-height clip would conceal the animated layers until completion.
   gsap.set(loader, { clipPath: 'none', transform: 'none' });
   const layers = elements('.preloader__layer', loader);
-  const insets = elements('.preloader__layer-inset', loader);
   const words = elements('.preloader__word', loader);
   gsap.set(words, { opacity: 1 });
   const timeline = gsap.timeline({ defaults: { ease }, onComplete: () => {
-    root.classList.remove('is-loading');
-    root.classList.add('preloader-complete');
-    loader.setAttribute('aria-hidden', 'true');
+    finishLoader(loader);
     gsap.set('[data-page-overlay]', { clearProps: 'clipPath' });
     ScrollTrigger.refresh();
     ScrollTrigger.update();
     playVisibleReveals();
   }});
+  // About 1.9 s in total (it was 4.8 s): the page is uncovered from about 1.4 s.
   timeline
-    .fromTo(layers[0], { xPercent: -100 }, { xPercent: 0, duration: .25 }, 0)
-    .fromTo(layers[1], { xPercent: -100 }, { xPercent: 0, duration: .25 }, .04)
-    .fromTo(layers[2], { xPercent: -100 }, { xPercent: 0, duration: .25 }, .08)
-    .call(() => root.classList.remove('is-loading'), [], .25)
-    .fromTo('main', { visibility: 'hidden', clipPath: 'inset(50% 50% 0 50%)' }, { visibility: 'visible', clipPath: 'inset(0)', duration: .35, clearProps: 'clipPath' }, .25)
-    .fromTo('[data-page-overlay]', { clipPath: 'inset(0 100% 0 0)' }, { clipPath: 'inset(0)', duration: .2 }, .55)
+    .fromTo(layers[0], { xPercent: -100 }, { xPercent: 0, duration: .7 }, 0)
+    .fromTo(layers[1], { xPercent: -100 }, { xPercent: 0, duration: .7 }, .07)
+    .fromTo(layers[2], { xPercent: -100 }, { xPercent: 0, duration: .7 }, .14)
+    .call(() => root.classList.remove('is-loading'), [], .6)
+    .fromTo('main', { visibility: 'hidden', clipPath: 'inset(50% 50% 0 50%)' }, { visibility: 'visible', clipPath: 'inset(0)', duration: .8, ease: 'power3.inOut', clearProps: 'clipPath' }, .6)
+    .to(words, { opacity: 1, duration: .3, stagger: .06 }, .15)
+    .fromTo('[data-page-overlay]', { clipPath: 'inset(0 100% 0 0)' }, { clipPath: 'inset(0 0% 0 0)', duration: .45 }, .9)
+    // Under the full overlay, the full-size colour fills go away. What stays of the layers is their
+    // :before/:after bars: the permanent lavender/orange frame with the M and O labels.
     .set(insets, { display: 'none' })
-    .to('[data-page-overlay]', { clipPath: 'inset(0 0 0 100%)', duration: .25 })
+    .to('[data-page-overlay]', { clipPath: 'inset(0 0 0 100%)', duration: .5, ease }, '+=.05')
     .add(() => gsap.set('[data-page-overlay]', { clearProps: 'clipPath' }));
 }
 
@@ -175,12 +226,15 @@ function wordsInVisualLines(el) {
 }
 
 // Titles marked data-split="lines" are rebuilt as .line-w > .line wrappers, one per visual line, so each line can
-// slide in and carry its own underline (.large-title-underline .line:after). The source markup is kept so a resize
-// can regroup words, including authored <br> breaks.
+// slide in and carry its own underline (.large-title-underline .line:after). A copy of the source nodes is kept so a
+// resize can regroup words, including authored <br> breaks; nodes are cloned, never re-parsed from HTML.
 const lineSources = new WeakMap();
 function splitLines(el) {
-  if (!lineSources.has(el)) lineSources.set(el, el.innerHTML);
-  else { el.innerHTML = lineSources.get(el); delete el.dataset.motionSplitReady; }
+  if (!lineSources.has(el)) lineSources.set(el, Array.from(el.childNodes, node => node.cloneNode(true)));
+  else {
+    el.replaceChildren(...lineSources.get(el).map(node => node.cloneNode(true)));
+    delete el.dataset.motionSplitReady;
+  }
   const groups = visualWordLines(el);
   if (elements('*', el).some(node => !node.matches('[data-motion-word], br'))) return [];
   el.textContent = '';
@@ -273,7 +327,8 @@ function revealFromData(el) {
     tween = gsap.fromTo(el, { y: fromY }, { y: toY, ease: 'none', scrollTrigger: { trigger: target, start: attr(el, 'start', 'top bottom'), end: attr(el, 'end', 'bottom top'), scrub: true, invalidateOnRefresh: true } });
   } else if (type === 'logo-reveal') {
     if (reduced) return;
-    tween = gsap.fromTo(el, { clipPath: 'inset(100% 0 0)' }, { ...common, clipPath: 'inset(0% 0 0)', scrollTrigger: { trigger: el, start: 'top 85%', once: true } });
+    // clamp(): on tall phones the wordmark's top never reaches 85% of the scroller, even at maximum scroll.
+    tween = gsap.fromTo(el, { clipPath: 'inset(100% 0 0)' }, { ...common, clipPath: 'inset(0% 0 0)', scrollTrigger: { trigger: el, start: 'clamp(top 85%)', once: true } });
   } else if (type === 'ambient-move') {
     if (!reduced) setupAmbientMove(el);
   }
@@ -329,6 +384,9 @@ function setupMenu() {
     if (open === next) return;
     open = next;
     root.classList.toggle('menu--opened', open);
+    // The frame strips around the menu sit over the scroller; keep the page underneath still while the menu is open
+    // (fixes.css also locks the wrapper's overflow for native and touch scrolling).
+    if (open) lenis?.stop(); else lenis?.start();
     nav.classList.toggle('mochi-menu-open', open && root.classList.contains('dashboard-document'));
     nav.inert = !open;
     nav.setAttribute('aria-hidden', String(!open));
@@ -374,11 +432,15 @@ function setupCarousels() {
     const prevEl = holder.querySelector('[data-carousel-control="prev"]');
     const contentSwiper = content.swiper || new Swiper(content, {
       modules: [Controller, EffectFade, Navigation],
-      speed: 1200,
+      // Reduced motion: switch slides without the 1.2 s cross-fade.
+      speed: reduced ? 0 : 1200,
       slidesPerView: 1,
       simulateTouch: false,
       allowTouchMove: false,
       effect: 'fade',
+      // Without crossFade Swiper keeps earlier slides at full opacity under the active one, so their text and links
+      // pile up after "Next".
+      fadeEffect: { crossFade: true },
       preventInteractionOnTransition: true,
       navigation: nextEl && prevEl ? { nextEl, prevEl } : undefined,
       controller: imageSwiper ? { control: imageSwiper } : undefined,
@@ -390,6 +452,10 @@ function setupCarousels() {
       if (current) current.textContent = String(contentSwiper.realIndex + 1).padStart(2, '0');
       if (total) total.textContent = String(contentSwiper.slides.length).padStart(2, '0');
     };
+    updateCounter();
+    contentSwiper.on('slideChange', updateCounter);
+    // Reduced motion: no word-by-word exit and entrance; the slide text simply changes with the slide.
+    if (reduced) continue;
     const slideText = elements('.swiper-slide', content).map(slide => elements('[data-text]', slide).flatMap(visualWordLines));
     const animateText = direction => {
       const previous = slideText[contentSwiper.previousIndex] || [];
@@ -399,8 +465,6 @@ function setupCarousels() {
     };
     contentSwiper.on('slideNextTransitionStart', () => animateText('next'));
     contentSwiper.on('slidePrevTransitionStart', () => animateText('prev'));
-    updateCounter();
-    contentSwiper.on('slideChange', updateCounter);
   }
   for (const images of elements('[data-images-carousel]')) {
     if (linkedImages.has(images) || images.swiper) continue;
@@ -555,8 +619,8 @@ function setupCursor() {
 
 function init() {
   if (!document.querySelector('#home, #about-mochi')) root.classList.add('inner-page');
-  const lenis = bootSmoothScroll();
-  setupAnchors(lenis);
+  lenis = bootSmoothScroll();
+  setupAnchors(setupScrollMemory());
   setupLazyImages();
   setupLoadMore();
   document.fonts.ready.then(() => { setupReveals(); ScrollTrigger.refresh(); });

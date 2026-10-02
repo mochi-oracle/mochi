@@ -2,10 +2,13 @@ import { AciClient, AciVerificationError, ProviderCallAborted, ProviderRetryErro
 import type { EvidenceBundle, Juror } from './types.ts';
 import { CLAIMS_MAX_RESPONSE_BYTES, createClaimChatRequest, parseClaimChatResponse, reportedClaimUsage, type ChatJurorTelemetry } from './providers.ts';
 import { phalaDcap } from '../../juror/src/phala-dcap.ts';
+import { estimateCallTokens, ProviderBudgetExceeded, reportedTotalTokens, type ProviderBudget } from './budget.ts';
 
 const DEFAULT_TIMEOUT_MS = 45_000;
 const MAX_TIMEOUT_MS = 120_000;
 const DEFAULT_OUTPUT_TOKENS = 1200;
+/** Provider attempts per assess() call (retries included) unless `maxAttempts` overrides it. */
+export const DEFAULT_ACI_MAX_ATTEMPTS = 3;
 
 export interface AciJurorOptions {
   id: string;
@@ -14,16 +17,57 @@ export interface AciJurorOptions {
   apiKey?: string;
   maxOutputTokens?: number;
   timeoutMs?: number;
+  /** ACI pinning policy (`os:`/`compose:` pins); see parseAciPolicy in @mochi/aci. */
   allowedWorkloads?: string[];
-  client?: AciClient;
+  /**
+   * Local daily call/token budget; every provider attempt reserves from it before it is sent. An attempt is refunded
+   * only when this juror's client provably never dispatched the inference request (see inferenceDispatchTracker).
+   */
+  budget?: ProviderBudget;
+  /**
+   * A prebuilt client (its requests are invisible here, so every reserved attempt stays charged), or a factory that
+   * builds the client on a fetch wrapped with `track`; only then can attempts that never sent anything be refunded.
+   */
+  client?: AciClient | ((track: (fetch: typeof globalThis.fetch) => typeof globalThis.fetch) => AciClient);
   onTelemetry?: (event: ChatJurorTelemetry) => void;
   /** Attempts including the first (1..5, default 3); transient provider failures are retried within timeoutMs. */
   maxAttempts?: number;
   retry?: Partial<Pick<ProviderRetryOptions, 'now' | 'sleep' | 'random' | 'minAttemptMs' | 'attemptCapMs'>>;
 }
 
-function buildClient(options: AciJurorOptions): AciClient {
-  if (options.client) return options.client;
+/**
+ * Counts every request of the juror's AciClient that could carry the inference request. AciClient sends nothing before
+ * the chat body except the body-less GET of the attestation report, so only that request is exempt; the chat POST,
+ * receipt reads and anything unrecognised all count. The count rises before the request is handed to fetch, so an
+ * unchanged count across an attempt proves its request body never left this process. All of the juror's attempts share
+ * the counter: overlapping attempts can only make a refund less likely, never more. `active` stays false (no refunds)
+ * unless the client was actually built on a tracked fetch.
+ */
+function inferenceDispatchTracker() {
+  let dispatched = 0;
+  let active = false;
+  return {
+    track(base: typeof globalThis.fetch): typeof globalThis.fetch {
+      active = true;
+      return ((input: Parameters<typeof globalThis.fetch>[0], init?: Parameters<typeof globalThis.fetch>[1]) => {
+        if (!isAttestationRead(input, init)) dispatched++;
+        return base(input, init);
+      }) as typeof globalThis.fetch;
+    },
+    count: () => dispatched,
+    active: () => active,
+  };
+}
+
+function isAttestationRead(input: Parameters<typeof globalThis.fetch>[0], init?: RequestInit): boolean {
+  if (typeof input !== 'string' && !(input instanceof URL)) return false;
+  if (init?.body !== undefined && init.body !== null) return false;
+  if ((init?.method ?? 'GET').toUpperCase() !== 'GET') return false;
+  try { return new URL(input).pathname.endsWith('/aci/attestation'); } catch { return false; }
+}
+
+function buildClient(options: AciJurorOptions, track: (fetch: typeof globalThis.fetch) => typeof globalThis.fetch): AciClient {
+  if (options.client) return typeof options.client === 'function' ? options.client(track) : options.client;
   if (!options.apiKey) throw new TypeError('ACI API key is required');
   let url: URL;
   try { url = new URL(options.baseUrl); } catch { throw new TypeError('Invalid ACI provider URL'); }
@@ -31,7 +75,12 @@ function buildClient(options: AciJurorOptions): AciClient {
   return new AciClient({
     baseUrl: url.toString().replace(/\/$/u, ''),
     apiKey: options.apiKey,
-    ...(options.allowedWorkloads ? { allowedWorkloads: options.allowedWorkloads } : {}),
+    fetch: track(globalThis.fetch),
+    // With an `attestation` policy the gateway must match its os:/compose: pins. Without one, the pilot explicitly
+    // accepts any DCAP-verified, UpToDate TDX gateway (signed receipts and confidential routing are still verified).
+    ...(options.allowedWorkloads ? { allowedWorkloads: options.allowedWorkloads } : { allowUnpinned: true }),
+    // Each juror requests exactly its configured model; the signed receipt must name it too.
+    allowedModels: [options.model],
     dcap: async (quote) => {
       const result = await phalaDcap(quote);
       const attrs = result.tdReport?.tdAttributes;
@@ -51,9 +100,12 @@ export function createAciJuror(options: AciJurorOptions): Juror {
   const outputTokens = options.maxOutputTokens ?? DEFAULT_OUTPUT_TOKENS;
   if (!options.id || !options.model || !Number.isInteger(outputTokens) || outputTokens < 64 || outputTokens > 8000) throw new TypeError('Invalid juror configuration');
   if (options.timeoutMs !== undefined && (!Number.isInteger(options.timeoutMs) || options.timeoutMs < 1 || options.timeoutMs > MAX_TIMEOUT_MS)) throw new TypeError('Invalid juror timeout');
-  const maxAttempts = options.maxAttempts ?? 3;
+  const maxAttempts = options.maxAttempts ?? DEFAULT_ACI_MAX_ATTEMPTS;
   if (!Number.isInteger(maxAttempts) || maxAttempts < 1 || maxAttempts > 5) throw new TypeError('Invalid juror attempt limit');
-  const client = buildClient(options);
+  const tracker = inferenceDispatchTracker();
+  const client = buildClient(options, tracker.track);
+  // Without a tracked fetch (e.g. a prebuilt client) no attempt can be proven unsent, so none is refunded.
+  const dispatch = tracker.active() ? tracker : undefined;
   return {
     id: options.id,
     model: options.model,
@@ -86,6 +138,7 @@ export function createAciJuror(options: AciJurorOptions): Juror {
         if (controller.signal.aborted) { stage = 'aci_exchange'; errorCode = 'REQUEST_ABORTED'; throw new Error('Provider request unavailable'); }
         stage = 'attestation';
         const body = JSON.parse(request);
+        const estimate = estimateCallTokens(request, outputTokens);
         const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
         // Retry transient provider failures with the identical request, inside the same overall timeout.
         const outcome = await withProviderRetries({
@@ -94,7 +147,23 @@ export function createAciJuror(options: AciJurorOptions): Juror {
           attemptCapMs: Math.max(15_000, Math.floor(timeoutMs * 2 / 3)),
           signal: controller.signal,
           ...options.retry,
-        }, signal => client.chat(body, { signal, maxResponseBytes: CLAIMS_MAX_RESPONSE_BYTES, requireUpToDate: true })).catch((error: unknown) => {
+        }, async signal => {
+          const hold = options.budget?.reserve(estimate);
+          if (options.budget && !hold) throw new ProviderBudgetExceeded();
+          const dispatchedBefore = dispatch?.count();
+          try {
+            const result = await client.chat(body, { signal, maxResponseBytes: CLAIMS_MAX_RESPONSE_BYTES, requireUpToDate: true });
+            hold?.settle(reportedTotalTokens(reportedClaimUsage(result.json)));
+            return result;
+          } catch (error) {
+            // chat() has settled, so it dispatches nothing more. Refund the attempt only if the inference request never
+            // left this process (request policy, attestation, TCB refusal or abort before sending); anything that may
+            // have reached the provider (sent, timed out after sending, failed receipt) keeps the estimate charged.
+            if (dispatch && dispatch.count() === dispatchedBefore) hold?.release();
+            else hold?.settle();
+            throw error;
+          }
+        }).catch((error: unknown) => {
           if (error instanceof ProviderCallAborted) { attemptFailures = error.failures; attempts = error.attemptsStarted; throw error; }
           if (!(error instanceof ProviderRetryError)) throw error;
           attemptFailures = error.failures; attempts = error.failures.length;
@@ -112,7 +181,8 @@ export function createAciJuror(options: AciJurorOptions): Juror {
         return answer;
       } catch (error) {
         if (!errorCode) {
-          if (timeoutTriggered) { stage = 'aci_exchange'; errorCode = 'ACI_TIMEOUT'; }
+          if (error instanceof ProviderBudgetExceeded) { stage = 'request_build'; errorCode = 'BUDGET_EXHAUSTED'; }
+          else if (timeoutTriggered) { stage = 'aci_exchange'; errorCode = 'ACI_TIMEOUT'; }
           else if (controller.signal.aborted || (error instanceof Error && error.name === 'AbortError') || (error instanceof AciVerificationError && error.code === 'aborted')) {
             stage = 'aci_exchange'; errorCode = 'REQUEST_ABORTED';
           } else if (error instanceof AciVerificationError) {

@@ -21,6 +21,7 @@ contract DrandRandomness is IRandomness {
     uint64 public immutable genesisTime;
     uint64 public immutable period;
     uint64 public immutable lookaheadRounds;
+    // aderyn-fp-next-line(state-variable-could-be-immutable) a bytes value cannot be immutable
     bytes private _publicKeyG2;
     mapping(uint64 round => bytes32 value) private _beacons;
 
@@ -90,6 +91,7 @@ contract DrandRandomness is IRandomness {
 
     function _hashToG1(bytes32 message) private view returns (bytes memory) {
         bytes memory dstPrime = bytes.concat(DST, bytes1(uint8(DST.length)));
+        // aderyn-fp-next-line(abi-encode-packed-hash-collision) RFC 9380 xmd layout; dynamic parts are fixed-length
         bytes32 b0 = sha256(abi.encodePacked(new bytes(64), message, uint16(128), bytes1(0), dstPrime));
         bytes32 b1 = sha256(abi.encodePacked(b0, bytes1(uint8(1)), dstPrime));
         bytes32 b2 = sha256(abi.encodePacked(_xor(b0, b1), bytes1(uint8(2)), dstPrime));
@@ -105,6 +107,7 @@ contract DrandRandomness is IRandomness {
     }
 
     function _reduce(bytes memory value) private view returns (bytes memory result) {
+        // aderyn-fp-next-line(abi-encode-packed-hash-collision) EIP-198 MODEXP input for a precompile, not hashed
         bytes memory input = abi.encodePacked(
             uint256(64), uint256(1), uint256(64), value, bytes1(uint8(1)),
             hex"000000000000000000000000000000001a0111ea397fe69a4b1ba7b6434bacd764774b84f38512bf6730d2a0f6b0f6241eabfffeb153ffffb9feffffffffaaab"

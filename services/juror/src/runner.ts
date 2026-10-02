@@ -93,7 +93,11 @@ export class PhalaAciRunner implements ModelRunner {
   lastFailure: { causeCode: string; httpStatus?: number; attempts?: number; attemptFailures?: ProviderAttemptFailure[] } | undefined;
   /** Provider attempts used by the last run, retries included (content-free, for cost and reliability telemetry). */
   lastAttempts = 0;
-  constructor(private readonly options: { client: import("@mochi/aci").AciClient; model: string; timeoutMs: number; maxTokens?: number; maxInputBytes?: number; compactReceiptMetadata?: boolean; maxAttempts?: number; attemptCapMs?: number; retry?: Partial<Pick<ProviderRetryOptions, "now" | "sleep" | "random" | "minAttemptMs">> }) {}
+  private readonly allowedTcbStatuses: readonly string[];
+  /** `allowedTcbStatuses`: the gateway TCB statuses accepted (TDX_ALLOWED_TCB_STATUSES); default UpToDate only. */
+  constructor(private readonly options: { client: import("@mochi/aci").AciClient; model: string; timeoutMs: number; maxTokens?: number; maxInputBytes?: number; compactReceiptMetadata?: boolean; maxAttempts?: number; attemptCapMs?: number; retry?: Partial<Pick<ProviderRetryOptions, "now" | "sleep" | "random" | "minAttemptMs">>; allowedTcbStatuses?: readonly string[] }) {
+    this.allowedTcbStatuses = options.allowedTcbStatuses ?? ["UpToDate"];
+  }
   async run(input: ModelInput, budget?: RunBudget): Promise<unknown> {
     this.lastFailure = undefined;
     this.lastAttempts = 0;
@@ -133,7 +137,9 @@ export class PhalaAciRunner implements ModelRunner {
         minAttemptMs: 35_000,
         signal,
         ...this.options.retry,
-      }, (signal) => this.options.client.chat(requestBody, { signal, requireUpToDate: true, maxResponseBytes: 256 * 1024 })).catch((error: unknown) => {
+      }, (signal) => this.options.client.chat(requestBody, strictTcb(this.allowedTcbStatuses)
+        ? { signal, requireUpToDate: true, maxResponseBytes: 256 * 1024 }
+        : { signal, allowedTcbStatuses: this.allowedTcbStatuses, maxResponseBytes: 256 * 1024 })).catch((error: unknown) => {
         if (error instanceof ProviderCallAborted) { attemptFailures = error.failures; this.lastAttempts = error.attemptsStarted; throw error; }
         if (!(error instanceof ProviderRetryError)) throw error;
         attemptFailures = error.failures;
@@ -142,9 +148,9 @@ export class PhalaAciRunner implements ModelRunner {
       });
       this.lastAttempts = outcome.attempts;
       const result = outcome.value;
-      // ACI checks UpToDate on the freshly attested workload before submitting
-      // chat when requireUpToDate is set. Keep this defense-in-depth check too.
-      if (result.established.tcbStatus !== "UpToDate") throw new RunnerError("TDX TCB status is not allowed", undefined, "tcb_status");
+      // ACI checks the TCB status of the freshly attested workload before submitting chat. Keep this
+      // defense-in-depth check too.
+      if (result.established.tcbStatus === "Revoked" || !this.allowedTcbStatuses.includes(result.established.tcbStatus)) throw new RunnerError("TDX TCB status is not allowed", undefined, "tcb_status");
       const choices = result.json?.choices;
       const message = Array.isArray(choices) ? choices[0]?.message : undefined;
       if (typeof message?.content !== "string") throw new RunnerError("model response has no JSON content", undefined, "response_json");
@@ -171,7 +177,7 @@ export class PhalaAciRunner implements ModelRunner {
         : signal.aborted ? "timeout"
         : error && typeof error === "object" && "code" in error && typeof error.code === "string" && /^[a-z_]+$/u.test(error.code) ? error.code
         : "aci_error";
-      const known = new Set(["aborted", "attestation_http", "attestation_redirect", "inference_http", "inference_redirect", "receipt_header", "receipt_redirect", "receipt_unavailable", "receipt_binding", "receipt_signature", "receipt_model", "body_hash", "upstream_unverified", "response_json", "response_body", "response_too_large", "invalid_report", "report_binding", "report_stale", "quote_missing", "quote_binding", "dcap_failed", "compose_measurement", "tcb_status", "workload_not_allowed", "request_shape", "request_provider", "request_confidentiality", "timeout", "request_too_large", "runner_failed"]);
+      const known = new Set(["aborted", "attestation_http", "attestation_redirect", "inference_http", "inference_redirect", "receipt_header", "receipt_redirect", "receipt_unavailable", "receipt_binding", "receipt_signature", "receipt_model", "body_hash", "upstream_unverified", "response_json", "response_body", "response_too_large", "invalid_report", "report_binding", "report_stale", "quote_missing", "quote_binding", "dcap_failed", "compose_measurement", "os_measurement", "tcb_status", "workload_not_allowed", "request_shape", "request_provider", "request_confidentiality", "timeout", "request_too_large", "runner_failed"]);
       const causeCode = known.has(code) ? code : "aci_error";
       const nested = error instanceof RunnerError ? error.cause : error;
       const httpStatus = nested && typeof nested === "object" && "httpStatus" in nested && typeof nested.httpStatus === "number" && Number.isInteger(nested.httpStatus) && nested.httpStatus >= 100 && nested.httpStatus <= 599 ? nested.httpStatus : undefined;
@@ -186,4 +192,8 @@ export class PhalaAciRunner implements ModelRunner {
 export class StubRunner implements ModelRunner {
   constructor(private readonly fixture: (input: ModelInput) => unknown | Promise<unknown>) {}
   async run(input: ModelInput, budget?: RunBudget): Promise<unknown> { return this.fixture(input); }
+}
+
+function strictTcb(allowed: readonly string[]): boolean {
+  return allowed.length === 1 && allowed[0] === "UpToDate";
 }

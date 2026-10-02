@@ -83,9 +83,10 @@ function safeInt(name: string, value: number): number {
   return value;
 }
 
+const HEX_BYTES = /^0x(?:[0-9a-fA-F]{2})+$/;
+
 function hex(name: string, value: string, bytes?: number): string {
-  const pattern = bytes === undefined ? /^0x(?:[0-9a-fA-F]{2})+$/ : new RegExp(`^0x(?:[0-9a-fA-F]{2}){${bytes}}$`);
-  if (typeof value !== "string" || !pattern.test(value)) {
+  if (typeof value !== "string" || !HEX_BYTES.test(value) || (bytes !== undefined && value.length !== 2 + 2 * bytes)) {
     throw new TypeError(`${name} must be a 0x-prefixed hex string`);
   }
   return value.toLowerCase();

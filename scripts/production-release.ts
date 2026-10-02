@@ -4,6 +4,7 @@ import { createPublicClient, http, keccak256, parseAbi, toHex, type Address, typ
 import { createChain, ROLE_IDS, type Deployment as ChainDeployment } from "@mochi/chain";
 import { buildPhalaBatch, type Deployment as BatchDeployment, type Input as IdentityInput } from "./phala-batch.ts";
 import { deploymentMinJurorBond, isProductionRehearsal, productionChainRule, productionTimelockDelay, REHEARSAL_CHAIN_ID } from "../deploy/production/chain-policy.ts";
+import { panelWiringProblems, readPanelWiring, recordedPanelEscalation, type PanelWiring } from "./panel-escalation.ts";
 
 const SPEC_MIN_JUROR_BOND_MOCHI = 25_000;
 const expectedChain = (deployment: ProductionDeployment): number | undefined => productionChainRule(deployment);
@@ -33,6 +34,7 @@ export type ReleaseInput = {
 export type ProductionDeployment = BatchDeployment & {
   chainId: number; rpcUrl?: string; owner?: Address; guardian?: Address; paused?: boolean; rehearsal?: boolean; minJurorBond?: string;
   tokenSource?: { kind: string; decimals?: number };
+  panelEscalation?: "off" | "on";
   contracts: BatchDeployment["contracts"] & Record<string, Address> & { mochiToken?: Address; usdg?: Address; jurorRegistry: Address; queryEscrow: Address; panel: Address; receiptAnchor: Address; timelock?: Address };
 };
 export interface ReadOnlyReader {
@@ -45,6 +47,8 @@ export interface ReadOnlyReader {
   isActive(key: Address, role: number): Promise<boolean>;
   feedBudget(escrow: Address): Promise<bigint>;
   paused(escrow: Address): Promise<boolean>;
+  /** QueryEscrow panel wiring; required when the deployment records a panel escalation mode. */
+  panelWiring?(escrow: Address): Promise<PanelWiring>;
 }
 export interface TimelockStatusReader {
   chainId(): Promise<number>;
@@ -129,6 +133,15 @@ export async function runReadOnlyPreflight(deployment: ProductionDeployment, inp
   }
   await check("chain-id", async () => { const actual = await reader.chainId(); return { ok: actual === expectedChain(deployment) && actual === deployment.chainId, detail: `RPC=${actual}; deployment=${deployment.chainId}; expected=4663` }; });
   await check("paused", async () => { const paused = await reader.paused(deployment.contracts.queryEscrow); return { ok: paused, detail: `QueryEscrow.paused=${paused}; expected=true before activation` }; });
+  // Launch expects panel escalation off; a deployment without a recorded mode is held to that expectation too.
+  const recordedMode = recordedPanelEscalation(deployment);
+  if (recordedMode || reader.panelWiring) await check("panel-escalation", async () => {
+    const panelMode = recordedMode ?? "off";
+    if (!reader.panelWiring) return { ok: false, detail: "reader cannot read QueryEscrow panel wiring" };
+    const wiring = await reader.panelWiring(deployment.contracts.queryEscrow);
+    const problems = panelWiringProblems(panelMode, deployment.contracts.panel, wiring);
+    return { ok: problems.length === 0, detail: problems.length ? problems.join("; ") : `panel escalation ${panelMode}${recordedMode ? "" : " (expected; not recorded)"}; QueryEscrow.panel=${wiring.panel}; panelReserveBps=${wiring.panelReserveBps}` };
+  });
   const contractEntries = Object.entries(deployment.contracts).filter(([, a]) => typeof a === "string" && ADDRESS.test(a) && !ZERO.test(a)) as [string, Address][];
   if (deployment.privacy?.entrypoint) contractEntries.push(["privacy.entrypoint", deployment.privacy.entrypoint]);
   const checkedAddresses = new Set(contractEntries.map(([, a]) => a.toLowerCase()));
@@ -300,7 +313,7 @@ export function buildProductionRelease(input: ReleaseInput, options: { deploymen
     } : { configuration: null, configurationExecution: null, activation: null, activationExecution: null },
     phases: [
       { id: "validate", order: 1, action: "Read-only verify RPC chain, deployment, token metadata, roles and configured funding." },
-      { id: deployment ? "deploy-already-present" : "deploy-paused", order: 2, action: deployment ? "Review supplied deployment and confirm QueryEscrow is paused on chain." : "Deploy production contracts paused and hand governance to timelock controlled by the reviewed control wallet.", ...(deployment ? {} : { commandTemplate: "bun scripts/deploy-local.ts --mainnet --rpc <HTTPS_RPC> --key-file <PROTECTED_DEPLOYER_KEY_FILE> --owner <CONTROL_WALLET> --guardian <CONTROL_WALLET> --min-juror-bond 0 --timelock-delay 60 --usdg <USDG_CA> --mochi-token <TEAM_MOCHI_CA> --shielded privacy-pools --randomness drand --out deployments/mainnet.json" }), requires: ["phase validate complete"] },
+      { id: deployment ? "deploy-already-present" : "deploy-paused", order: 2, action: deployment ? "Review supplied deployment and confirm QueryEscrow is paused on chain." : "Deploy production contracts paused and hand governance to timelock controlled by the reviewed control wallet.", ...(deployment ? {} : { commandTemplate: "bun scripts/deploy-local.ts --mainnet --rpc <HTTPS_RPC> --key-file <PROTECTED_DEPLOYER_KEY_FILE> --owner <CONTROL_WALLET> --guardian <CONTROL_WALLET> --min-juror-bond 0 --timelock-delay 60 --panel-escalation off --usdg <USDG_CA> --mochi-token <TEAM_MOCHI_CA> --shielded privacy-pools --randomness drand --out deployments/mainnet.json" }), requires: ["phase validate complete"] },
       { id: "configure", order: 3, action: batches ? "Review the generated configuration schedule payload; it is not submitted." : "Build configuration payload from deployment and identity files.", payload: batches ? "reviewPayloads.configuration" : undefined, requires: ["deployment and identities reviewed"], then: `execute through approved control wallet after the recorded ${expectedDelay}-second delay`, irreversible: true },
       { id: "enroll-and-verify", order: 4, action: "Enroll jurors from operator wallets, attest service keys, fund required bonds and feed budget; verify live service readiness while paused." },
       { id: "activate", order: 5, action: batches ? "Review separate activation payload after configuration, enrollment and readiness checks." : "Build a separate activation payload only when deployment and identities are supplied.", payload: batches ? "reviewPayloads.activation" : undefined, requires: ["phase enroll-and-verify complete"], readiness: { readyToSchedule: false, reason: !input.mochiToken ? "external MOCHI CA is missing" : "chain and off-chain activation checks must be completed" }, then: "schedule through approved control wallet, wait full delay, repeat checks and obtain release approval", irreversible: true },
@@ -344,6 +357,7 @@ async function main() {
       isActive: (key, role) => chain.isActive(key, role),
       feedBudget: (escrow) => client.readContract({ address: escrow, abi: escrowBudgetAbi, functionName: "feedBudget" }),
       paused: (escrow) => client.readContract({ address: escrow, abi: pauseAbi, functionName: "paused" }),
+      panelWiring: (escrow) => readPanelWiring(client, escrow),
     };
     const batchInput = deployment && identities ? (() => {
       const salt = (input.salt ?? identities.salt) as Hex | undefined;

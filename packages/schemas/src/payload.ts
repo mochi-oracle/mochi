@@ -9,6 +9,8 @@ import {
 import {
   SchemaId,
   encodePayload,
+  privatePayloadHash,
+  publicPayloadHash,
   toBytes32String,
   type NormalizedValue,
   type SchemaDef,
@@ -161,12 +163,16 @@ function beatResult(value: NormalizedValue | null, consensus: NormalizedValue | 
   return value.e8 > consensus.e8 ? 1 : value.e8 < consensus.e8 ? -1 : 0;
 }
 
-/** Builds the typed schema body and outer feed payload from agreed values. */
+/**
+ * Builds the typed schema body and outer feed payload from agreed values. `payloadHash` is the value posted on-chain:
+ * keccak256(payload) for a public query, or privatePayloadHash(privateSalt, payload) when `privateSalt` (the private
+ * query's secret seed salt) is given, so the outcome of a private query cannot be found by hashing candidates.
+ */
 export function buildPayload(
   definition: SchemaDef,
   agreed: Record<string, NormalizedValue | null>,
   params: Record<string, NormalizedValue | null>,
-  context: { openedAt: bigint },
+  context: { openedAt: bigint; privateSalt?: Hex },
 ) {
   let subjectKey: Hex;
   let asOf: bigint;
@@ -297,7 +303,8 @@ export function buildPayload(
   }
 
   const payload = encodePayload(subjectKey, asOf, body);
-  return { subjectKey, asOf, body, payload, payloadHash: keccak256(payload), derived };
+  const payloadHash = context.privateSalt === undefined ? publicPayloadHash(payload) : privatePayloadHash(context.privateSalt, payload);
+  return { subjectKey, asOf, body, payload, payloadHash, derived };
 }
 
 /** Decodes the outer payload and schema-specific tuple body into named fields. */

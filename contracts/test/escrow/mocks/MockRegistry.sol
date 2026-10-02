@@ -32,13 +32,19 @@ contract MockRegistry {
         return MochiTypes.seatClass(seat);
     }
 
-    function selectJurors(bytes32, uint8 fromSeat, uint8 toSeat, address[] calldata)
+    function openSelection(bytes32, address intakeKey) external view returns (bool) {
+        return active[intakeKey][uint8(MochiTypes.Role.INTAKE)];
+    }
+
+    function selectJurors(address, bytes32, bytes32, uint8 fromSeat, uint8 toSeat, address[] calldata)
         external
         view
         returns (address[] memory out)
     {
+        // nosemgrep: basic-arithmetic-underflow -- test mock; Solidity 0.8 checked arithmetic reverts on underflow
         out = new address[](toSeat - fromSeat);
         for (uint8 i = fromSeat; i < toSeat; ++i) {
+            // nosemgrep: basic-arithmetic-underflow -- test mock; i >= fromSeat and arithmetic is checked
             out[i - fromSeat] = preset[i];
         }
     }

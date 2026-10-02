@@ -1,7 +1,7 @@
 import { createPublicClient, createWalletClient, http, type Address, type Hex } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
 import { loadDeployment, chainFor, PanelEscalationAbi, QueryEscrowAbi, MochiVerdictsAbi, FeedsAbi } from "@mochi/chain";
-import type { ChainPort, PanelCase } from "../ports.ts";
+import type { ChainPort, FeedEntry, PanelCase } from "../ports.ts";
 
 const erc20Abi = [
   { type: "function", name: "approve", stateMutability: "nonpayable", inputs: [{ name: "spender", type: "address" }, { name: "amount", type: "uint256" }], outputs: [{ type: "bool" }] },
@@ -29,6 +29,7 @@ export function createPanelChain(options: { deploymentPath: string; rpcUrl: stri
     queryId: raw.queryId as Hex, status: Number(raw.status), panelIndex: Number(raw.panelIndex), sealBlock: BigInt(raw.sealBlock as bigint),
     commitDeadline: BigInt(raw.commitDeadline as bigint), revealDeadline: BigInt(raw.revealDeadline as bigint), appealDeadline: BigInt(raw.appealDeadline as bigint),
     payer: raw.payer as Address, fee: BigInt(raw.fee as bigint), outcomeAnswerHash: raw.outcomeAnswerHash as Hex, outcomePayloadHash: raw.outcomePayloadHash as Hex,
+    drawDeadline: BigInt(raw.drawDeadline as bigint),
   });
   return {
     dep: { startBlock: dep.startBlock, randomness: dep.randomness, contracts: { panel: c.panel, feeds: c.feeds, randomness: c.randomness } },
@@ -44,7 +45,7 @@ export function createPanelChain(options: { deploymentPath: string; rpcUrl: stri
     },
     async getCase(caseId) { return toPanelCase(await read<Record<string, unknown>>(c.panel, PanelEscalationAbi, "getCase", [caseId])); },
     panelOf: (caseId, panelIndex) => read<Address[]>(c.panel, PanelEscalationAbi, "panelOf", [caseId, panelIndex]),
-    async getQuery(queryId) { const q = await read<Record<string, unknown>>(c.queryEscrow, QueryEscrowAbi, "getQuery", [queryId]); return { schemaId: Number(q.schemaId), schemaVersion: Number(q.schemaVersion), isPublic: Boolean(q.isPublic), status: Number(q.status) }; },
+    async getQuery(queryId) { const q = await read<Record<string, unknown>>(c.queryEscrow, QueryEscrowAbi, "getQuery", [queryId]); return { schemaId: Number(q.schemaId), schemaVersion: Number(q.schemaVersion), isPublic: Boolean(q.isPublic), status: Number(q.status), openedAt: BigInt(q.openedAt as bigint) }; },
     latestVerdictOf: (queryId) => read<Hex>(c.verdicts, MochiVerdictsAbi, "latestVerdictOf", [queryId]),
     async simulateResolve(caseId) {
       try {
@@ -52,16 +53,27 @@ export function createPanelChain(options: { deploymentPath: string; rpcUrl: stri
         return true;
       } catch { return false; }
     },
+    async drawState(caseId) {
+      const d = await read<Record<string, unknown>>(c.panel, PanelEscalationAbi, "drawStateOf", [caseId]);
+      return { eligible: Number(d.eligible), expiry: BigInt(d.expiry as bigint), filled: Number(d.filled) };
+    },
+    async revealOf(caseId, panelIndex, evaluator) {
+      const [answerHash, payloadHash] = await read<readonly [Hex, Hex]>(c.panel, PanelEscalationAbi, "revealOf", [caseId, panelIndex, evaluator]);
+      return { answerHash, payloadHash };
+    },
+    async simulatePrune(maxEntries) {
+      const { result } = await publicClient.simulateContract({ account, address: c.panel, abi: PanelEscalationAbi, functionName: "prune" as never, args: [maxEntries] as never });
+      return BigInt(result as bigint);
+    },
+    prune: (maxEntries) => write(c.panel, PanelEscalationAbi, "prune", [maxEntries]),
     draw: (caseId) => write(c.panel, PanelEscalationAbi, "draw", [caseId]),
     reseal: (caseId) => write(c.panel, PanelEscalationAbi, "reseal", [caseId]),
+    expireDraw: (caseId) => write(c.panel, PanelEscalationAbi, "expireDraw", [caseId]),
     resolve: (caseId) => write(c.panel, PanelEscalationAbi, "resolve", [caseId]),
     finalize: (caseId) => write(c.panel, PanelEscalationAbi, "finalize", [caseId]),
     feedsUpdate: (feedId, key, verdictId, payload) => write(c.feeds, FeedsAbi, "update", [feedId, key, verdictId, payload]),
     async feedLatest(feedId, key) {
-      const result = await read<{ verdictId?: Hex } | readonly unknown[]>(c.feeds, FeedsAbi, "latest", [feedId, key]);
-      if (Array.isArray(result)) return { verdictId: result[0] as Hex };
-      const entry = result as { verdictId?: Hex };
-      return entry.verdictId ? { verdictId: entry.verdictId } : null;
+      return feedEntry(await read<unknown>(c.feeds, FeedsAbi, "latest", [feedId, key]));
     },
     panelStake: (evaluator) => read<bigint>(c.panel, PanelEscalationAbi, "stakeOf", [evaluator]),
     approvePanel: (amount) => write(c.usdg, erc20Abi, "approve", [c.panel, amount]),
@@ -69,4 +81,14 @@ export function createPanelChain(options: { deploymentPath: string; rpcUrl: stri
     commit: (caseId, value) => write(c.panel, PanelEscalationAbi, "commit", [caseId, value]),
     reveal: (caseId, answerHash, payloadHash, salt) => write(c.panel, PanelEscalationAbi, "reveal", [caseId, answerHash, payloadHash, salt]),
   };
+}
+
+/** Decodes Feeds.latest(): Entry(verdictId, asOf, updatedAt, verdictTs, payload). viem returns the struct as an object;
+ *  a positional tuple is accepted too. A key that was never updated has a zero verdictId (null). */
+export function feedEntry(raw: unknown): FeedEntry | null {
+  const [verdictId, asOf, updatedAt, verdictTs] = Array.isArray(raw)
+    ? raw
+    : [(raw as FeedEntry).verdictId, (raw as FeedEntry).asOf, (raw as FeedEntry).updatedAt, (raw as FeedEntry).verdictTs];
+  if (typeof verdictId !== "string" || /^0x0{64}$/i.test(verdictId)) return null;
+  return { verdictId: verdictId as Hex, asOf: BigInt(asOf as bigint), updatedAt: BigInt(updatedAt as bigint), verdictTs: BigInt(verdictTs as bigint) };
 }

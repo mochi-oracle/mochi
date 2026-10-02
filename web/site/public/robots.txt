@@ -1,0 +1,8 @@
+# MOCHI public website
+User-agent: *
+Allow: /
+Disallow: /api/
+Disallow: /rpc
+Disallow: /indexer/
+
+Sitemap: https://mochioracle.com/sitemap.xml

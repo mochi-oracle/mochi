@@ -15,7 +15,7 @@ import { privateKeyToAccount } from "viem/accounts";
 import { Role, SchemaId, ZERO32, docCommit as computeDocCommit, docHash, toBytes32String, verdictId as verdictIdOf } from "@mochi/core";
 import { createDb, migrate, upsertEndpoint } from "@mochi/db";
 import { MockQuoteVerifier, MockTeeProvider, keyBinding, open, recoverProvenance, seal, type Quote } from "@mochi/tee";
-import { PrivateResultPlainSchema, aad, payerCommit } from "@mochi/protocol";
+import { PrivateResultPlainSchema, aad, payerCommit, privateResultMismatch, provenanceFromJson, provenanceMatchesBinding, type OpenBinding, type ProvenanceJson } from "@mochi/protocol";
 import { verifyReceipt } from "@mochi/receipts";
 import { MochiClient } from "@mochi/sdk";
 import { StateTreeSync, commitment as noteCommitment, depositUSDG, generateNote, precommitment as notePrecommitment, type Note } from "@mochi/privacy";
@@ -30,7 +30,8 @@ import { DEV_KEYS } from "./deploy-local.ts";
 const ROOT = join(import.meta.dir, "..");
 const RUN = process.env.MOCHI_E2E_RUN_DIR ?? join(ROOT, ".e2e");
 // The harness runs its own anvil (fresh chain + clock every run) on a dedicated port.
-const ANVIL_PORT = 18545;
+// MOCHI_E2E_ANVIL_PORT moves it off the default when another local node (e.g. a Hardhat node) already uses that port.
+const ANVIL_PORT = Number(process.env.MOCHI_E2E_ANVIL_PORT ?? 18545);
 const RPC = `http://127.0.0.1:${ANVIL_PORT}`;
 const PG_ADMIN = process.env.MOCHI_E2E_PG_ADMIN ?? "postgres://mochi:mochi@127.0.0.1:55432/mochi";
 const DB_URL = process.env.MOCHI_E2E_DATABASE_URL ?? "postgres://mochi:mochi@127.0.0.1:55432/mochi_e2e";
@@ -48,6 +49,15 @@ const ANONYMA_SECRET = "e2e-anonyma-hmac-secret";
 // MOCHI_E2E_MODE=load runs the §7 load targets instead of the functional flows (same stack).
 const MODE = process.env.MOCHI_E2E_MODE ?? "flows";
 const STARTED_AT = Date.now();
+// Split effective dates are 00:00 UTC a fixed number of days after the run starts (the harness anvil starts on this
+// machine's clock), so the multiplier change is still pending when the feed is updated (the crosscheck reads the token's
+// live multiplier) and the asOf stays inside the SPLIT feed's lead, on any calendar date.
+const DAY_SEC = 86_400;
+const utcMidnightAfter = (days: number) => (Math.floor(STARTED_AT / 1000 / DAY_SEC) + days) * DAY_SEC;
+const longDate = (sec: number) => new Date(sec * 1000).toLocaleDateString("en-US", { timeZone: "UTC", month: "long", day: "numeric", year: "numeric" });
+const isoDate = (sec: number) => new Date(sec * 1000).toISOString().slice(0, 10);
+const ACME_EFFECTIVE = utcMidnightAfter(13);
+const PNL_EFFECTIVE = utcMidnightAfter(49);
 const RANDOMNESS_MODE = process.env.MOCHI_E2E_RANDOMNESS === "drand" ? "drand" : "blockhash";
 const DRAND_GENESIS = 1;
 const DRAND_PERIOD = 3;
@@ -63,7 +73,7 @@ const letters = (i: number) => { let s = ""; do { s = String.fromCharCode(65 + (
 const loadTicker = (i: number) => `LD${letters(i)}`;
 const LOAD_DOCS: Record<string, string> = Object.fromEntries(Array.from({ length: LOAD_TICKERS }, (_, i) => [
   `/load/${loadTicker(i)}.txt`,
-  `${loadTicker(i)} Holdings (NASDAQ: ${loadTicker(i)}) today announced a 2-for-1 stock split, effective October 15, 2026.`,
+  `${loadTicker(i)} Holdings (NASDAQ: ${loadTicker(i)}) today announced a 2-for-1 stock split, effective ${longDate(ACME_EFFECTIVE)}.`,
 ]));
 const CLASS_NAMES = ["LARGE_A", "LARGE_B", "DOC_SPECIALIST", "SMALL_FAST", "DISSENTER"];
 
@@ -130,11 +140,11 @@ function startModelServer() {
 }
 
 const SPLIT_NOTICE =
-  "Acme Corp (NASDAQ: ACME) today announced a 2-for-1 stock split, effective October 15, 2026. [DISSENTER-DISAGREES]";
+  `Acme Corp (NASDAQ: ACME) today announced a 2-for-1 stock split, effective ${longDate(ACME_EFFECTIVE)}. [DISSENTER-DISAGREES]`;
 // LARGE_A/LARGE_B read 2-for-1, every other class reads 3-for-1: no value reaches k(N) at N=3,5,7 or 9, so the feed
 // query escalates to the human panel.
 const PANEL_NOTICE =
-  "Panel Co (NASDAQ: PNL) today announced a 2-for-1 stock split, effective November 20, 2026. [PANEL-SPLIT]";
+  `Panel Co (NASDAQ: PNL) today announced a 2-for-1 stock split, effective ${longDate(PNL_EFFECTIVE)}. [PANEL-SPLIT]`;
 function startDocServer() {
   const docs: Record<string, string> = { "/split-notice.txt": SPLIT_NOTICE, "/panel-notice.txt": PANEL_NOTICE, ...LOAD_DOCS };
   return Bun.serve({
@@ -180,6 +190,9 @@ async function main() {
   console.log(`0. Fresh anvil, deploy contracts, fresh database (randomness: ${RANDOMNESS_MODE})`);
   procs.push(spawn(["anvil", "--silent", "--host", "127.0.0.1", "--port", String(ANVIL_PORT), "--hardfork", "prague"], { stdout: "ignore", stderr: "ignore" }));
   await until("anvil up", async () => (await createPublicClient({ transport: http(RPC) }).getChainId()) === 31337, 20_000);
+  // Never deploy to or send through a node this harness did not start: a Hardhat node also reports chain id 31337.
+  const client = String(await createPublicClient({ transport: http(RPC) }).request({ method: "web3_clientVersion" as never }));
+  if (!client.toLowerCase().startsWith("anvil")) throw new Error(`the node on port ${ANVIL_PORT} is not the harness's anvil`);
   if (RANDOMNESS_MODE === "drand") {
     const fakePub = createPublicClient({ transport: http(RPC) });
     const relay = Bun.serve({ hostname: "127.0.0.1", port: PORTS.drand, async fetch(request) {
@@ -248,10 +261,10 @@ async function main() {
   startDocServer();
   const common = { DATABASE_URL: DB_URL };
   const teeEnv = (seed: string) => ({
-    TEE_MODE: "mock", TEE_MOCK_SEED: keccak256(toHex(seed)), TEE_MOCK_MEASUREMENT: MEASUREMENT, TEE_MOCK_ROOT_PRIVATE_KEY: ROOT_KEY,
+    TEE_MODE: "mock", QUOTE_VERIFIER: "mock", TEE_MOCK_SEED: keccak256(toHex(seed)), TEE_MOCK_MEASUREMENT: MEASUREMENT, TEE_MOCK_ROOT_PRIVATE_KEY: ROOT_KEY,
   });
   service("intake", "intake", {
-    PORT: String(PORTS.intake), TEE_MODE: "mock", MOCK_TEE_SEED: keccak256(toHex("e2e-intake")), MOCK_TEE_MEASUREMENT: MEASUREMENT,
+    PORT: String(PORTS.intake), TEE_MODE: "mock", QUOTE_VERIFIER: "mock", MOCK_TEE_SEED: keccak256(toHex("e2e-intake")), MOCK_TEE_MEASUREMENT: MEASUREMENT,
     MOCK_ROOT_KEY: ROOT_KEY, MOCK_ROOT_ADDRESS: root.address, SEALED_STORE_DIR: join(RUN, "sealed-intake"),
     FETCH_ORIGINS: JSON.stringify([{ host: "127.0.0.1" }]), ALLOW_HTTP_HOSTS: "127.0.0.1",
   });
@@ -289,14 +302,14 @@ async function main() {
     ...common, PORT: String(PORTS.panel), RPC_URL: RPC, KEEPER_KEY, INTAKE_URL: `http://127.0.0.1:${PORTS.intake}`, POLL_MS: "500", ...(RANDOMNESS_MODE === "drand" ? { DRAND_RELAYS: DRAND_RELAY } : {}),
   });
   service("indexer", "indexer", { ...common, PORT: String(PORTS.indexer), POLL_MS: "500", ANCHORER_KEY: DEV_KEYS.orchestrator });
-  // ACME Stock Token whose multiplier schedule matches the notice (2-for-1 effective 2026-10-15).
+  // ACME Stock Token whose multiplier schedule matches the notice (2-for-1 effective ACME_EFFECTIVE).
   const tokenHash = await wallet(DEV_KEYS.deployer).deployContract({ abi: A.MockStockTokenAbi as Abi, bytecode: A.MockStockTokenBytecode, args: [] as never });
   const token = (await pub.waitForTransactionReceipt({ hash: tokenHash })).contractAddress!;
-  await send(DEV_KEYS.deployer, token, A.MockStockTokenAbi, "setSchedule", [10n ** 18n, 2n * 10n ** 18n, BigInt(Date.parse("2026-10-15T00:00:00Z") / 1000)]);
+  await send(DEV_KEYS.deployer, token, A.MockStockTokenAbi, "setSchedule", [10n ** 18n, 2n * 10n ** 18n, BigInt(ACME_EFFECTIVE)]);
   await send(DEV_KEYS.deployer, C.stockTokenCrosscheck, A.StockTokenCrosscheckAbi, "setToken", [toBytes32String("ACME"), token]);
   const pnlHash = await wallet(DEV_KEYS.deployer).deployContract({ abi: A.MockStockTokenAbi as Abi, bytecode: A.MockStockTokenBytecode, args: [] as never });
   const pnlToken = (await pub.waitForTransactionReceipt({ hash: pnlHash })).contractAddress!;
-  await send(DEV_KEYS.deployer, pnlToken, A.MockStockTokenAbi, "setSchedule", [10n ** 18n, 2n * 10n ** 18n, BigInt(Date.parse("2026-11-20T00:00:00Z") / 1000)]);
+  await send(DEV_KEYS.deployer, pnlToken, A.MockStockTokenAbi, "setSchedule", [10n ** 18n, 2n * 10n ** 18n, BigInt(PNL_EFFECTIVE)]);
   await send(DEV_KEYS.deployer, C.stockTokenCrosscheck, A.StockTokenCrosscheckAbi, "setToken", [toBytes32String("PNL"), pnlToken]);
   const feedsConfig = join(RUN, "feeds.json");
   const corpTokens = [
@@ -346,22 +359,24 @@ async function main() {
 
   async function submit(opts: { schemaId: number; text: string; params?: Record<string, unknown>; isPublic: boolean }) {
     const salt: Hex = opts.isPublic ? ZERO32 : toHex(crypto.getRandomValues(new Uint8Array(32)));
-    const plain = { v: 1, schemaId: opts.schemaId, salt, params: opts.params ?? {}, contentType: "text/plain", docB64: Buffer.from(opts.text).toString("base64") };
+    const resultPriv = x25519.utils.randomSecretKey();
+    const resultPub = toHex(x25519.getPublicKey(resultPriv));
+    // Sealed with the document: the intake signs this into the provenance, so only the payer can open this query.
+    const open: OpenBinding = { opener: payer.toLowerCase(), payerCommit: opts.isPublic ? ZERO32 : payerCommit(resultPub), isPublic: opts.isPublic, allowPanelDisclosure: false, nonce: BigInt(toHex(crypto.getRandomValues(new Uint8Array(8)))).toString() };
+    const plain = { v: 1, schemaId: opts.schemaId, salt, params: opts.params ?? {}, contentType: "text/plain", docB64: Buffer.from(opts.text).toString("base64"), open };
     const envelope = seal(intakeAtt.encryptionPubKey, new TextEncoder().encode(JSON.stringify(plain)), aad.intake());
-    const intakeRes = await (await fetch(`${gw}/v1/intake/upload?n=3`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ envelope }) })).json() as { docCommit: Hex; quote: unknown; intake: Address; intakeSig: Hex; provenance: { docCommit: Hex; kind: number; originId: Hex; fetchedAt: string; tokensK: number; transcriptHash: Hex } };
-    const provenance = { ...intakeRes.provenance, fetchedAt: BigInt(intakeRes.provenance.fetchedAt) };
+    const intakeRes = await (await fetch(`${gw}/v1/intake/upload?n=3`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ envelope }) })).json() as { docCommit: Hex; quote: unknown; intake: Address; intakeSig: Hex; provenance: ProvenanceJson };
+    const provenance = provenanceFromJson(intakeRes.provenance);
     const signer = await recoverProvenance(dep.chainId, C.queryEscrow, provenance, intakeRes.intakeSig);
     ok(signer.toLowerCase() === intakeRes.intake.toLowerCase(), "intake response signature recovers its declared enclave identity");
+    ok(provenanceMatchesBinding(intakeRes.provenance, open), "intake signed exactly the sealed open binding (opener, payerCommit, consent, nonce)");
     await until("intake response signer active", async () => await read<boolean>(C.jurorRegistry, R, "isActive", [signer, Role.INTAKE]) || undefined, 20_000);
     ok(true, "intake response signer is active in the on-chain registry");
     ok(intakeRes.docCommit === computeDocCommit(salt, docHash(new TextEncoder().encode(opts.text))), `intake docCommit = keccak(salt ‖ sha256(doc))${opts.isPublic ? "" : " (salted)"}`);
-    const resultPriv = x25519.utils.randomSecretKey();
-    const resultPub = toHex(x25519.getPublicKey(resultPriv));
     const prep = await (await fetch(`${gw}/v1/query`, {
       method: "POST", headers: { "content-type": "application/json" },
       body: JSON.stringify({
-        intake: intakeRes, n: 3, isPublic: opts.isPublic, refundTo: payer.toLowerCase(), nonce: String(Date.now()),
-        sender: payer.toLowerCase(), pay: { path: "usdg" }, ...(opts.isPublic ? {} : { payerResultPubKey: resultPub }),
+        intake: intakeRes, n: 3, refundTo: payer.toLowerCase(), pay: { path: "usdg" }, ...(opts.isPublic ? {} : { payerResultPubKey: resultPub }),
       }),
     })).json() as { queryId: Hex; to: Address; data: Hex };
     const w = wallet(PAYER_KEY);
@@ -438,6 +453,8 @@ async function main() {
   const env = JSON.parse(Buffer.from(vB.ciphertext!.slice(2), "hex").toString("utf8"));
   const plain = PrivateResultPlainSchema.parse(JSON.parse(new TextDecoder().decode(open(B.resultPriv, env, aad.result(vidB)))));
   ok(plain.answerJson.includes('"answer":{"t":"bool","v":true}'), "payer decrypted the private result: answer = true");
+  const onchainB = await read<{ answerHash: Hex; payloadHash: Hex }>(C.verdicts, A.MochiVerdictsAbi, "getVerdict", [vidB]);
+  ok(privateResultMismatch(plain, onchainB) === undefined && onchainB.payloadHash !== keccak256(plain.payload as Hex), "decrypted result matches the on-chain answerHash and the salted private payloadHash (not keccak256(payload))");
   const qB = await read<{ payerCommit: Hex; docCommit: Hex }>(C.queryEscrow, A.QueryEscrowAbi, "getQuery", [B.queryId]);
   ok(qB.payerCommit !== ZERO32 && qB.docCommit !== computeDocCommit(ZERO32, docHash(new TextEncoder().encode("x"))), "on-chain docCommit is salted and payerCommit binds the result key");
 
@@ -468,7 +485,7 @@ async function main() {
     params: { question: "Were reserves fully backed?", answer_type: "BOOL" }, n: 3, isPublic: false,
     sender: payer.toLowerCase() as Address,
     pay: { path: "shielded-pool", note: poolNote, depositInfo: { deposit: poolDeposit, pool: privacy.pool, fromBlock: BigInt(dep.startBlock) } },
-  }, wallet(PAYER_KEY)) as { queryId: Hex; txHash: Hex; secrets: { resultPrivateKey?: Hex }; quote: { jurorFees: string; protocolFee: string }; changeNote: Note };
+  }, wallet(PAYER_KEY)) as { queryId: Hex; txHash: Hex; secrets: { salt: Hex; resultPrivateKey?: Hex }; quote: { jurorFees: string; protocolFee: string }; changeNote: Note };
   const relayTx = await pub.getTransaction({ hash: sdkPrivate.txHash });
   const relayerAddress = (await (await fetch(`${gw}/v1/relayer`)).json() as { address: Address }).address;
   ok(relayTx.from.toLowerCase() === relayerAddress.toLowerCase() && relayTx.from.toLowerCase() !== payer.toLowerCase(), "openShielded transaction is sent by the gateway relayer, not the payer");
@@ -486,7 +503,7 @@ async function main() {
     const verdict = await response.json() as { ciphertext?: Hex };
     return verdict.ciphertext && verdict.ciphertext !== "0x" ? true : undefined;
   });
-  const privatePlain = await privateSdk.decryptPrivateResult(privateVerdictId, sdkPrivate.secrets.resultPrivateKey!);
+  const privatePlain = await privateSdk.decryptPrivateResult(privateVerdictId, { queryId: sdkPrivate.queryId, ...sdkPrivate.secrets });
   ok(privatePlain.verdictId.toLowerCase() === privateVerdictId.toLowerCase() && privatePlain.answerJson.includes('"answer"'), "payer decrypted the sealed result for the shielded query");
   const replay = await fetch(`${gw}/v1/relay/open-shielded`, { method: "POST", headers: { "content-type": "application/json" }, body: lastPrivateRelayBody });
   ok(replay.status >= 400, "replaying the shielded proof is rejected");
@@ -522,13 +539,18 @@ async function main() {
   const trig = await fetch(`http://127.0.0.1:${PORTS.feeds}/v1/feed-runners/run/corp-actions`, { method: "POST", headers: { authorization: `Bearer ${ADMIN_TOKEN}` } });
   ok(trig.ok, "feed-runner triggered (corp-actions)");
   const splitFeed = keccak256(toHex("corp-actions.split@RHC"));
+  type FeedEntry = { verdictId: Hex; asOf: bigint; updatedAt: bigint; verdictTs: bigint; payload: Hex };
   const entry = await until("feed update", async () => {
-    const e = await read<{ verdictId: Hex; asOf: bigint }>(C.feeds, A.FeedsAbi, "latest", [splitFeed, toBytes32String("ACME")]);
+    const e = await read<FeedEntry>(C.feeds, A.FeedsAbi, "latest", [splitFeed, toBytes32String("ACME")]);
     return /^0x0+$/.test(e.verdictId) ? undefined : e;
   }, 180_000);
-  const vC = await read<{ round: number; agreementBps: number; status: number }>(C.verdicts, A.MochiVerdictsAbi, "getVerdict", [entry.verdictId]);
+  const vC = await read<{ round: number; agreementBps: number; status: number; ts: bigint }>(C.verdicts, A.MochiVerdictsAbi, "getVerdict", [entry.verdictId]);
   ok(Number(vC.round) === 1 && Number(vC.agreementBps) === 8000, "feed verdict came from round 1 (expanded to N=5) at 4/5 = 8000 bps");
-  ok(entry.asOf === BigInt(Date.parse("2026-10-15T00:00:00Z") / 1000), "corp-actions.split@RHC[ACME] updated with asOf = 2026-10-15 (crosscheck passed)");
+  ok(entry.asOf === BigInt(ACME_EFFECTIVE), `corp-actions.split@RHC[ACME] updated with asOf = ${isoDate(ACME_EFFECTIVE)} (crosscheck passed)`);
+  ok(entry.verdictTs === BigInt(vC.ts), "Feeds.latest() carries the verdict's on-chain time (verdictTs)");
+  // Feeds.update is permissionless; the harness key only simulates (the revert means nothing is sent).
+  const repost = await send(DEV_KEYS.deployer, C.feeds, A.FeedsAbi, "update", [splitFeed, toBytes32String("ACME"), entry.verdictId, entry.payload]).then(() => "applied", (e) => String(e));
+  ok(repost.includes("VerdictAlreadyApplied"), "re-posting the feed's current verdict reverts VerdictAlreadyApplied");
 
 
   console.log("6b. (F) Anonyma send-to-jury: HMAC-authenticated partner call, voucher drawn from Anonyma's USDG float");
@@ -536,12 +558,20 @@ async function main() {
   await send(DEV_KEYS.deployer, C.usdg, A.MockUSDGAbi, "approve", [C.queryEscrow, 2n ** 255n]);
   await send(DEV_KEYS.deployer, C.queryEscrow, A.QueryEscrowAbi, "fundAnonymaFloat", [50n * 10n ** 6n]);
   const anonDoc = "Anon Co (NASDAQ: ANON) today announced a 2-for-1 stock split, effective December 1, 2026.";
-  const anonPlain = { v: 1, schemaId: SchemaId.SPLIT, salt: ZERO32, params: {}, contentType: "text/plain", docB64: Buffer.from(anonDoc).toString("base64") };
-  const anonEnvelope = seal(intakeAtt.encryptionPubKey, new TextEncoder().encode(JSON.stringify(anonPlain)), aad.intake());
+  const voucherId = keccak256(toHex(`voucher-${Date.now()}`));
+  const anonDocCommit = computeDocCommit(ZERO32, docHash(new TextEncoder().encode(anonDoc)));
+  // Anonyma seals the open binding too: the gateway's relayer opens, with the voucher's low 64 bits as queryId nonce.
+  // The voucher names that exact query, so no other grant (opener, nonce) can spend it.
+  const anonRelayer = ((await (await fetch(`${gw}/v1/relayer`)).json()) as { address: Address }).address;
+  const anonNonce = BigInt(voucherId) & ((1n << 64n) - 1n);
+  const anonQueryId = await read<Hex>(C.queryEscrow, A.QueryEscrowAbi, "computeQueryId", [anonRelayer, anonDocCommit, anonNonce]);
   const voucher = {
-    voucherId: keccak256(toHex(`voucher-${Date.now()}`)), docCommit: computeDocCommit(ZERO32, docHash(new TextEncoder().encode(anonDoc))),
+    voucherId, queryId: anonQueryId,
     schemaId: SchemaId.SPLIT, n: 3, maxAmount: 10n * 10n ** 6n, tier: 2, expiry: BigInt(Math.floor(Date.now() / 1000) + 3600),
   };
+  const anonOpen: OpenBinding = { opener: anonRelayer.toLowerCase(), payerCommit: ZERO32, isPublic: true, allowPanelDisclosure: false, nonce: anonNonce.toString() };
+  const anonPlain = { v: 1, schemaId: SchemaId.SPLIT, salt: ZERO32, params: {}, contentType: "text/plain", docB64: Buffer.from(anonDoc).toString("base64"), open: anonOpen };
+  const anonEnvelope = seal(intakeAtt.encryptionPubKey, new TextEncoder().encode(JSON.stringify(anonPlain)), aad.intake());
   const voucherSig = await signAnonymaVoucher(privateKeyToAccount(DEV_KEYS.anonymaSigner), dep.chainId, C.queryEscrow, voucher);
   const anonBody = JSON.stringify({
     envelope: anonEnvelope, schemaId: SchemaId.SPLIT, n: 3, isPublic: true, refundTo: payer.toLowerCase(), voucherSig,
@@ -555,6 +585,7 @@ async function main() {
   const anonJson = (await anonRes.json()) as { queryId: Hex; error?: unknown };
   ok(anonRes.ok, `Anonyma partner call accepted (HMAC) and relayed openWithVoucher${anonRes.ok ? "" : ` — ${anonRes.status} ${JSON.stringify(anonJson)}`}`);
   const anonQuery = anonJson.queryId;
+  ok(anonQuery.toLowerCase() === anonQueryId.toLowerCase(), "voucher-paid query is the one the voucher names");
   const vidF = await waitVerdict(anonQuery, "Anonyma voucher");
   const qF = await read<{ payPath: number; status: number }>(C.queryEscrow, A.QueryEscrowAbi, "getQuery", [anonQuery]);
   ok(Number(qF.payPath) === 2 && Number(qF.status) === 3, `voucher-paid query decided (verdict ${vidF.slice(0, 12)}…)`);
@@ -630,7 +661,7 @@ async function main() {
   const evaluators = EVALUATOR_KEYS.map((k) => ({ key: k, account: privateKeyToAccount(k) }));
   ok(panelMembers.length === 3 && evaluators.every((e) => panelMembers.includes(e.account.address.toLowerCase())), "the 3 staked evaluators were drawn");
   const pd = `http://127.0.0.1:${PORTS.panel}`;
-  const reveals: { key: Hex; answerHash: Hex; payloadHash: Hex; salt: Hex }[] = [];
+  const reveals: { key: Hex; account: ReturnType<typeof privateKeyToAccount>; answerHash: Hex; payloadHash: Hex; salt: Hex; payload: Hex; answerJson: string }[] = [];
   let panelPayload: Hex = "0x";
   for (const e of evaluators) {
     const ek = generateEvaluatorKey();
@@ -639,33 +670,38 @@ async function main() {
       method: "POST", headers: { "content-type": "application/json" },
       body: JSON.stringify({ evaluator: e.account.address.toLowerCase(), encryptionPubKey: ek.pubKey, keySig }),
     });
-    const materials = await mres.json() as { queryId: Hex; evaluator: Hex; docEnvelope: { v: 1; epk: Hex; nonce: Hex; ct: Hex }; jurorSummary: unknown };
+    const materials = await mres.json() as { queryId: Hex; evaluator: Hex; openedAt: string; docEnvelope: { v: 1; epk: Hex; nonce: Hex; ct: Hex }; jurorSummary: unknown };
     const doc = openMaterials(materials, ek.privKey);
     ok(Buffer.from(doc.docB64, "base64").toString().includes("PNL"), `evaluator ${e.account.address.slice(0, 8)}… opened the document sealed to it (juror split shown: ${materials.jurorSummary ? "yes" : "no"})`);
+    // openedAt is the query's on-chain open time from the materials, so every evaluator builds the same payload.
     const answer = buildAnswer(doc.schemaId, doc.schemaVersion, doc.salt as Hex, doc.params,
-      { ticker: "PNL", ratio_num: "2", ratio_den: "1", effective_date: "November 20, 2026" }, 0n);
+      { ticker: "PNL", ratio_num: "2", ratio_den: "1", effective_date: longDate(PNL_EFFECTIVE) }, BigInt(materials.openedAt));
     const salt = keccak256(toHex(`salt-${e.account.address}`));
     await send(e.key, C.panel, P, "commit", [pnlQuery, commitment(pnlQuery, 0, e.account.address, answer.answerHash, answer.payloadHash, salt)]);
-    reveals.push({ key: e.key, answerHash: answer.answerHash, payloadHash: answer.payloadHash, salt });
+    reveals.push({ key: e.key, account: e.account, answerHash: answer.answerHash, payloadHash: answer.payloadHash, salt, payload: answer.payload, answerJson: answer.answerJson });
     panelPayload = answer.payload;
-    await fetch(`${pd}/v1/panel/${pnlQuery}/payload`, {
-      method: "POST", headers: { "content-type": "application/json" },
-      body: JSON.stringify({ evaluator: e.account.address.toLowerCase(), panelIndex: 0, payload: answer.payload, answerJson: answer.answerJson, sig: await payloadSig(e.account, pnlQuery, 0, answer.payload) }),
-    });
   }
-  for (const r of reveals) await send(r.key, C.panel, P, "reveal", [pnlQuery, r.answerHash, r.payloadHash, r.salt]);
+  // The desk keeps a public payload only after the evaluator's on-chain reveal, and only the revealed one.
+  for (const r of reveals) {
+    await send(r.key, C.panel, P, "reveal", [pnlQuery, r.answerHash, r.payloadHash, r.salt]);
+    const submitted = await fetch(`${pd}/v1/panel/${pnlQuery}/payload`, {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ evaluator: r.account.address.toLowerCase(), panelIndex: 0, payload: r.payload, answerJson: r.answerJson, sig: await payloadSig(r.account, pnlQuery, 0, r.payload) }),
+    });
+    ok(submitted.status === 201, `evaluator ${r.account.address.slice(0, 8)}… payload accepted after its reveal`);
+  }
   await until("panel resolved by keeper", async () => Number((await read<{ status: number }>(C.panel, P, "getCase", [pnlQuery])).status) === 4 || undefined, 60_000);
   ok(true, "keeper resolved the case (3/3 majority)");
   await pub.request({ method: "evm_increaseTime" as never, params: [86_401] as never });
   await pub.request({ method: "evm_mine" as never, params: [] as never });
   const panelVid = verdictIdOf(pnlQuery, 255);
   const pnlEntry = await until("panel feed update", async () => {
-    const e = await read<{ verdictId: Hex; asOf: bigint }>(C.feeds, A.FeedsAbi, "latest", [splitFeed, pnlKey]);
+    const e = await read<FeedEntry>(C.feeds, A.FeedsAbi, "latest", [splitFeed, pnlKey]);
     return e.verdictId.toLowerCase() === panelVid.toLowerCase() ? e : undefined;
   }, 90_000);
-  const vPanel = await read<{ escalated: boolean; round: number }>(C.verdicts, A.MochiVerdictsAbi, "getVerdict", [panelVid]);
+  const vPanel = await read<{ escalated: boolean; round: number; ts: bigint }>(C.verdicts, A.MochiVerdictsAbi, "getVerdict", [panelVid]);
   ok(vPanel.escalated && Number(vPanel.round) === 255, "panel verdict on-chain (escalated, PANEL_ROUND)");
-  ok(pnlEntry.asOf === BigInt(Date.parse("2026-11-20T00:00:00Z") / 1000) && keccak256(panelPayload) !== ZERO32, "keeper pushed the panel verdict into corp-actions.split@RHC[PNL] (crosscheck passed)");
+  ok(pnlEntry.asOf === BigInt(PNL_EFFECTIVE) && pnlEntry.verdictTs === BigInt(vPanel.ts) && keccak256(panelPayload) !== ZERO32, "keeper pushed the panel verdict into corp-actions.split@RHC[PNL] (crosscheck passed; verdictTs = panel verdict time)");
 
   console.log(`\nE2E PASSED: all services, every flow (${((Date.now() - STARTED_AT) / 1000).toFixed(1)}s).`);
 }
@@ -726,12 +762,13 @@ async function runLoad(ctx: any) {
 async function submitN7(ctx: any, text: string): Promise<Hex> {
   const { gw, payer } = ctx;
   const att = await (await fetch(`${gw}/v1/intake/attestation`)).json() as { encryptionPubKey: Hex };
-  const plain = { v: 1, schemaId: SchemaId.EARNINGS, salt: ZERO32, params: {}, contentType: "text/plain", docB64: Buffer.from(text).toString("base64") };
+  const open: OpenBinding = { opener: payer.toLowerCase(), payerCommit: ZERO32, isPublic: true, allowPanelDisclosure: false, nonce: BigInt(toHex(crypto.getRandomValues(new Uint8Array(8)))).toString() };
+  const plain = { v: 1, schemaId: SchemaId.EARNINGS, salt: ZERO32, params: {}, contentType: "text/plain", docB64: Buffer.from(text).toString("base64"), open };
   const envelope = seal(att.encryptionPubKey, new TextEncoder().encode(JSON.stringify(plain)), aad.intake());
   const intake = await (await fetch(`${gw}/v1/intake/upload`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ envelope }) })).json();
   const prep = await (await fetch(`${gw}/v1/query`, {
     method: "POST", headers: { "content-type": "application/json" },
-    body: JSON.stringify({ intake, n: 7, isPublic: true, refundTo: payer.toLowerCase(), nonce: String(Date.now() * 1000 + Math.floor(Math.random() * 1000)), sender: payer.toLowerCase(), pay: { path: "usdg" } }),
+    body: JSON.stringify({ intake, n: 7, refundTo: payer.toLowerCase(), pay: { path: "usdg" } }),
   })).json() as { queryId: Hex; to: Address; data: Hex };
   // One payer account: send transactions strictly one after another (nonces).
   const run = payerQueue.then(async () => {

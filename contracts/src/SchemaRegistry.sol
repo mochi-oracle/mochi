@@ -74,6 +74,7 @@ contract SchemaRegistry is ISchemaRegistry, AccessControl {
     function activationDelay() external view override returns (uint64) { return _activationDelay; }
 
     /// @notice Updates the delay applied to future proposals.
+    // aderyn-ignore-next-line(state-change-without-event) governor-only; the timelock's CallScheduled logs it
     function setActivationDelay(uint64 activationDelay_) external onlyRole(MochiRoles.GOVERNOR_ROLE) {
         _activationDelay = activationDelay_;
     }

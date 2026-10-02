@@ -22,8 +22,10 @@ contract EarningsBeatMarket {
     constructor(IFeeds feeds_, uint64 maxAge_) { feeds = feeds_; maxAge = maxAge_; }
 
     /// @notice Resolves YES for beatEps=1; NO for -1 or 0. Feed subscription is checked by Feeds.latest.
+    // aderyn-ignore-next-line(state-change-without-event) example; outcome is returned and public
     function resolve(bytes32 ticker, bytes32 period) external returns (bool outcome) {
         if (resolved[ticker][period]) revert AlreadyResolved(ticker, period);
+        // slither-disable-next-line unused-return -- readEarnings enforces maxAge; id and time are not needed
         (MochiTypes.EarningsBody memory body,,) = MochiFeedReader.readEarnings(feeds, EARNINGS_FEED, ticker, maxAge);
         if (body.period != period) revert WrongPeriod(period, body.period);
         if (body.beatEps == 2) revert NotResolvable(body.beatEps);

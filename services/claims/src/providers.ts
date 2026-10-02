@@ -1,4 +1,5 @@
 import type { EvidenceBundle, Juror } from './types.ts';
+import { estimateCallTokens, ProviderBudgetExceeded, reportedTotalTokens, type ProviderBudget } from './budget.ts';
 
 const MAX_INPUT_BYTES = 120_000;
 const MAX_RESPONSE_BYTES = 32_000;
@@ -50,6 +51,8 @@ export interface ChatJurorOptions {
   timeoutMs?: number;
   allowLoopbackHttp?: boolean;
   onTelemetry?: (event: ChatJurorTelemetry) => void;
+  /** Local daily call/token budget reserved before the request is sent. */
+  budget?: ProviderBudget;
 }
 
 export interface ChatJurorTelemetry {
@@ -162,7 +165,9 @@ export function createChatJuror(options: ChatJurorOptions): Juror {
         if (parentSignal?.aborted) abortFromParent();
         else parentSignal?.addEventListener('abort', abortFromParent, { once: true });
         const timer = setTimeout(() => controller.abort(), options.timeoutMs ?? DEFAULT_TIMEOUT_MS);
+        const hold = options.budget?.reserve(estimateCallTokens(requestBody, options.maxOutputTokens ?? 1200));
         try {
+          if (options.budget && !hold) throw new ProviderBudgetExceeded();
           const response = await (options.fetcher ?? fetch)(url, {
             method: 'POST', signal: controller.signal, redirect: 'error',
             headers: { 'content-type': 'application/json', ...(options.apiKey ? { authorization: `Bearer ${options.apiKey}` } : {}) },
@@ -173,12 +178,13 @@ export function createChatJuror(options: ChatJurorOptions): Juror {
           let envelope: unknown;
           try { envelope = JSON.parse(text); } catch { throw new Error('Provider response unavailable'); }
           usage = envelope && typeof envelope === 'object' ? reportedClaimUsage(envelope) : undefined;
+          hold?.settle(reportedTotalTokens(usage));
           const result = parseClaimChatResponse(envelope);
           report('success');
           return result;
         } catch {
           throw new Error('Provider request unavailable');
-        } finally { clearTimeout(timer); parentSignal?.removeEventListener('abort', abortFromParent); }
+        } finally { hold?.settle(); clearTimeout(timer); parentSignal?.removeEventListener('abort', abortFromParent); }
       } catch {
         report('failure');
         throw new Error('Provider request unavailable');

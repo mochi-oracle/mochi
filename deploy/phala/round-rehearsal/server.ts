@@ -38,6 +38,8 @@ const runner = (modelIndex: number): ModelRunner & { lastReceipt?: PhalaAciRunne
   const aciRunner = new PhalaAciRunner({
   client: new AciClient({
     baseUrl: realConfig!.baseUrl, apiKey: realConfig!.apiKey,
+    // Rehearsal only: accepts any DCAP-verified, UpToDate TDX gateway without an os:/compose: pin.
+    allowUnpinned: true,
     dcap: async (raw) => {
       const parsed = parseTdxQuote(raw), chain = pemChain(parsed.pckPem), leaf = chain[0], intermediate = chain[1];
       if (!leaf?.sgx || !intermediate) return { ok: false, status: 'Invalid', reportData: new Uint8Array() };

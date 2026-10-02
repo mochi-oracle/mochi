@@ -1,11 +1,9 @@
 import { decodeAbiParameters, encodeAbiParameters, keccak256, recoverMessageAddress, type Address, type Hex } from "viem";
 import type { Quote } from "./provider.ts";
-import { bytesToHex, hexToBytes } from "viem";
+import { hexToBytes } from "viem";
 import { dstackConfigMeasurement, parseTdxReportData, tdxMeasurement } from "./tdx-common.ts";
-import { verifyTdxQuote, type TdxVerification } from "./dcap/verify.ts";
-import type { CollateralSource } from "./dcap/collateral.ts";
-import { parseTdxQuote } from "./dcap/quote.ts";
-import { pemChain } from "./dcap/x509.ts";
+import { verifyTdxQuote, verifyTdxQuoteEvidence, type TdxQuoteEvidence, type TdxVerification } from "./dcap/verify.ts";
+import { staleCollateralGraceSec, type CollateralSource } from "./dcap/collateral.ts";
 export type TcbStatus = string;
 
 export interface QuoteVerifier {
@@ -87,50 +85,32 @@ export class DcapQuoteVerifier implements QuoteVerifier {
 
     const now = this.now();
     let raw: Uint8Array;
-    let fmspc: string;
-    let ca: "platform" | "processor";
+    let evidence: TdxQuoteEvidence;
     try {
       raw = hexToBytes(quote.raw);
-      const parsed = parseTdxQuote(raw);
-      const chain = pemChain(parsed.pckPem);
-      if (chain.length !== 3) return { ok: false as const, reason: "dcap: certificate chain" };
-      const leaf = chain[0]!;
-      const intermediate = chain[1]!;
-      if (!leaf.sgx) return { ok: false as const, reason: "dcap: PCK extension" };
-      fmspc = bytesToHex(leaf.sgx.fmspc).slice(2).toUpperCase();
-      if (intermediate.subjectCN === "Intel SGX PCK Platform CA") ca = "platform";
-      else if (intermediate.subjectCN === "Intel SGX PCK Processor CA") ca = "processor";
-      else return { ok: false as const, reason: "dcap: PCK CA" };
+      // The PCK chain, QE report and quote signatures need no collateral. Checking them first means a forged chain or a
+      // bogus FMSPC is reported as forged evidence, and collateral is only ever fetched for an Intel-signed FMSPC.
+      evidence = verifyTdxQuoteEvidence(raw, now);
     } catch (error) {
-      return {
-        ok: false as const,
-        reason: `dcap: ${error instanceof Error ? error.message : "invalid quote"}`,
-      };
+      return { ok: false as const, reason: `dcap: ${dcapCode(error)}` };
     }
 
     let collateral;
     try {
-      collateral = await this.options.collateral.get(fmspc, ca, expected.signal);
+      collateral = await this.options.collateral.get(evidence.fmspc, evidence.ca, expected.signal);
     } catch {
       return { ok: false as const, reason: "dcap: collateral unavailable" };
     }
 
     let result: TdxVerification;
     try {
-      result = this.verifyDcap(raw, collateral, now);
+      result = this.verifyDcap(raw, collateral, now, { collateralGraceSec: staleCollateralGraceSec(collateral) });
     } catch (error) {
-      const code = error && typeof error === "object" && "code" in error
-        ? String((error as { code: unknown }).code)
-        : error instanceof Error ? error.message : "invalid quote";
-      return { ok: false as const, reason: `dcap: ${code}` };
+      return { ok: false as const, reason: `dcap: ${dcapCode(error)}` };
     }
 
-    if (!this.policy.allowedStatuses.includes(result.status)) {
-      return { ok: false as const, reason: `tcb status ${result.status}` };
-    }
-    if (result.advisoryIds.some((id) => this.policy.rejectAdvisories.includes(id))) {
-      return { ok: false as const, reason: "rejected advisory" };
-    }
+    // Evidence about this enclave (debug mode, measurement and key binding) is checked before the platform TCB policy,
+    // so a genuine quote that misrepresents the enclave is reported as such even on an out-of-date platform.
     if (!this.policy.allowDebug && (result.td.tdAttributes[0]! & 1) !== 0) {
       return { ok: false as const, reason: "debug TD" };
     }
@@ -171,6 +151,13 @@ export class DcapQuoteVerifier implements QuoteVerifier {
       return { ok: false as const, reason: "quote expired or issued in the future" };
     }
 
+    if (!this.policy.allowedStatuses.includes(result.status)) {
+      return { ok: false as const, reason: `tcb status ${result.status}` };
+    }
+    if (result.advisoryIds.some((id) => this.policy.rejectAdvisories.includes(id))) {
+      return { ok: false as const, reason: "rejected advisory" };
+    }
+
     return {
       ok: true as const,
       measurement,
@@ -179,4 +166,10 @@ export class DcapQuoteVerifier implements QuoteVerifier {
       advisoryIds: result.advisoryIds,
     };
   }
+}
+
+function dcapCode(error: unknown): string {
+  return error && typeof error === "object" && "code" in error
+    ? String((error as { code: unknown }).code)
+    : error instanceof Error ? error.message : "invalid quote";
 }

@@ -1,5 +1,6 @@
 // Mochi conventions shared by the enclave side (TdxTeeProvider) and the verifier (DcapQuoteVerifier) for Intel TDX.
 import { bytesToHex, concat, hexToBytes, keccak256, toBytes, type Hex } from "viem";
+import { dstackMrConfigVersion } from "./dstack-mr-config.ts";
 
 export const TDX_REPORT_DATA_BYTES = 64;
 const REGISTER_BYTES = 48;
@@ -43,8 +44,10 @@ export type MeasurementScheme = "dstack-config-v1";
 export const DSTACK_CONFIG_MEASUREMENT_DOMAIN = "MOCHI_DSTACK_CONFIG_V1";
 
 /**
- * Stable dstack app identity measurement. MRCONFIGID is version || compose commitment || 15 zero bytes.
- * Runtime extensions in RTMR3 are deliberately excluded; full DCAP verification remains mandatory.
+ * Stable dstack app identity measurement. MRCONFIGID is version || 32-byte commitment || 15 zero bytes, with version 1
+ * (compose hash), 2 (compose, app id and key provider) or 3 (JCS launch document); see dstack-mr-config.ts. The whole
+ * register is hashed, so accepting a version adds no trust beyond the reviewed pin. Runtime extensions in RTMR3 are
+ * deliberately excluded; full DCAP verification remains mandatory.
  */
 export function dstackConfigMeasurement(regs: {
   mrtd: Uint8Array;
@@ -55,10 +58,7 @@ export function dstackConfigMeasurement(regs: {
     throw new RangeError("TDX registers are 48 bytes");
   }
   const config = regs.mrConfigId;
-  if (config.length !== REGISTER_BYTES) throw new RangeError("MRCONFIGID is 48 bytes");
-  if (config[0] !== 1 && config[0] !== 2) throw new Error("unsupported dstack MRCONFIGID version");
-  if (config.subarray(1, 33).every((byte) => byte === 0)) throw new Error("dstack MRCONFIGID commitment must be nonzero");
-  if (config.subarray(33).some((byte) => byte !== 0)) throw new Error("dstack MRCONFIGID padding must be zero");
+  dstackMrConfigVersion(config);
   return keccak256(concat([
     toBytes(DSTACK_CONFIG_MEASUREMENT_DOMAIN), regs.mrtd, regs.rtmr[0], regs.rtmr[1], regs.rtmr[2], config,
   ]));

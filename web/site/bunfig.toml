@@ -1,0 +1,13 @@
+# Bun install policy for the website (same as the repository root's bunfig.toml; Bun reads bunfig.toml from the
+# directory it runs in, and web/site is installed on its own with its own lockfile).
+#
+# Lifecycle scripts: package.json sets "trustedDependencies": [], which replaces Bun's built-in allowlist, so no
+# dependency install script ever runs (today that blocks esbuild's postinstall and msgpackr-extract's native build;
+# both have prebuilt or pure-JS fallbacks). Bun has no bunfig switch for the project's own scripts; CI and the
+# Dockerfiles also pass --ignore-scripts.
+[install]
+# New dependencies are added at exact versions, like every existing entry.
+exact = true
+# Supply-chain cooldown: when Bun resolves versions (bun add, bun update, a lockfile change) it only picks releases
+# that are at least 7 days old. Installs from the frozen lockfile use the locked versions as they are.
+minimumReleaseAge = 604800

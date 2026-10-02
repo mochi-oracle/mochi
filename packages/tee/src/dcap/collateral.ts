@@ -14,6 +14,22 @@ export interface CollateralSource {
   get(fmspc: string, ca: "platform" | "processor", signal?: AbortSignal): Promise<TdxCollateral>;
 }
 
+const staleGrace = new WeakMap<TdxCollateral, number>();
+
+/**
+ * Mark a collateral object as served past its nextUpdate because Intel PCS was unreachable. Verifiers then accept its
+ * TCB info, QE identity and CRLs for up to `graceSec` past their nextUpdate. Unmarked collateral gets no grace.
+ */
+export function markStaleCollateral(collateral: TdxCollateral, graceSec: number): TdxCollateral {
+  staleGrace.set(collateral, Math.max(0, graceSec));
+  return collateral;
+}
+
+/** The expiry grace a collateral source granted this object (0 unless it was served stale through a PCS outage). */
+export function staleCollateralGraceSec(collateral: TdxCollateral): number {
+  return staleGrace.get(collateral) ?? 0;
+}
+
 export class StaticCollateralSource implements CollateralSource {
   constructor(private readonly collateral: TdxCollateral) {}
 

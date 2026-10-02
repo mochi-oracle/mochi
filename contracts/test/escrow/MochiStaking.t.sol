@@ -164,17 +164,56 @@ contract MochiStakingTest is Test {
         assertLt(longStream.earned(bob), 7_000_000 / 1000);
     }
 
+    /// The leftover (500 over the 5 s left) and the new 1,000 (over a full 10 s) are streamed together until their
+    /// reward-weighted finish: floor((500 * 5 + 1000 * 10) / 1500) = 8 s from now, i.e. 1,500 at 187.5 per second.
+    /// (Absolute times: under via-ir a local derived from block.timestamp may be re-read after vm.warp.)
     function testLeftoverRollsIntoReplacementStream() public {
+        vm.warp(1_000);
         vm.prank(alice);
         staking.stake(100);
         staking.notifyReward(1_000);
-        uint256 time = block.timestamp + 5;
-        vm.warp(time);
+        vm.warp(1_005);
         staking.notifyReward(1_000);
-        assertEq(staking.rewardRate(), 150e18); // scaled by 1e18
-        time += 10;
-        vm.warp(time);
+        assertEq(staking.rewardRate(), 187.5e18); // scaled by 1e18
+        assertEq(staking.periodFinish(), 1_013);
+        assertEq(staking.undistributed(), 0);
+        vm.warp(1_013);
         assertEq(staking.earned(alice), 2_000);
+        vm.warp(1_020);
+        assertEq(staking.earned(alice), 2_000);
+    }
+
+    /// Without an active stream a notify always streams over the full rewardDuration.
+    function testNotifyAfterTheStreamEndedUsesTheFullDuration() public {
+        vm.warp(1_000);
+        vm.prank(alice);
+        staking.stake(100);
+        staking.notifyReward(1_000);
+        vm.warp(1_010);
+        staking.notifyReward(2_000);
+        assertEq(staking.periodFinish(), 1_020);
+        assertEq(staking.rewardRate(), 200e18);
+    }
+
+    /// Any second notify during a stream: the finish never moves earlier nor past now + rewardDuration, and the sole
+    /// staker still receives both amounts in full (up to flooring) once the stream ends.
+    function testNotifyNeverMovesTheFinishEarlierOrPastAFullDuration(uint256 first, uint256 second, uint8 elapsed) public {
+        first = bound(first, 1, 5_000_000);
+        second = bound(second, 1, 5_000_000);
+        uint256 dt = bound(elapsed, 0, 9);
+        vm.prank(alice);
+        staking.stake(100);
+        staking.notifyReward(first);
+        uint256 finish = staking.periodFinish();
+        vm.warp(block.timestamp + dt);
+        staking.notifyReward(second);
+        assertGe(staking.periodFinish(), finish);
+        assertLe(staking.periodFinish(), block.timestamp + staking.rewardDuration());
+        vm.warp(block.timestamp + staking.rewardDuration());
+        vm.prank(alice);
+        uint256 got = staking.claim();
+        assertLe(got + staking.undistributed() + staking.dust(), first + second);
+        assertGe(got + staking.undistributed() + staking.dust() + 1, first + second);
     }
 
     function testVoteLockBlocksUnstakeUntilLockHasPassed() public {

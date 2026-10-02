@@ -23,6 +23,8 @@ export interface ChainPort {
   getEnrolled(fromBlock: bigint, toBlock: bigint): Promise<EnrolledKey[]>;
   getJuror(key: Address): Promise<JurorRecord>;
   isActive(key: Address, role: number): Promise<boolean>;
+  /** JurorRegistry.allowedMeasurement(measurement, role): the governance allowlist for that role. */
+  measurementAllowed(measurement: Hex, role: number): Promise<boolean>;
   refreshAttestation(keys: Address[], until: bigint): Promise<Hex>;
   reportAttestationFailure(key: Address): Promise<Hex>;
 }
@@ -75,4 +77,6 @@ export interface AttestorDeps {
   maxQuoteAgeSec: number;
   adminToken: string;
   dissenterExcludedLineages: string[];
+  /** How long a store endpoint lookup is reused before it is read again (default 300 s). A failed read reuses it. */
+  endpointCacheSec?: number;
 }

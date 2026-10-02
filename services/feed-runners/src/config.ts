@@ -20,7 +20,8 @@ export const ServiceEnvSchema = z.object({
   INTAKE_TIMEOUT_MS: z.coerce.number().int().positive().default(15_000), HTTP_TIMEOUT_MS: z.coerce.number().int().positive().default(10_000),
   MULTIPLIER_POLL_MS: z.coerce.number().int().min(10_000).default(60_000), EDGAR_POLL_MS: z.coerce.number().int().min(10_000).default(60_000),
   TX_CONFIRMATIONS: z.coerce.number().int().positive().default(1),
-  MOCK_QUOTE_ROOT: address.optional(), QUOTE_VERIFIER: z.enum(["mock", "dcap"]).default("mock"),
+  // Required, like @mochi/tee quoteVerifierFromEnv: quote verification never defaults to mock.
+  MOCK_QUOTE_ROOT: address.optional(), QUOTE_VERIFIER: z.enum(["mock", "dcap"], { error: "QUOTE_VERIFIER must be set explicitly: dcap (or mock for local development only)" }),
 });
 export type ServiceConfig = z.infer<typeof ServiceEnvSchema> & { feeds: FeedsConfig; refundTo: Address; stateFile: string };
 

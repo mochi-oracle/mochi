@@ -4,6 +4,7 @@ pragma solidity ^0.8.28;
 import {Test} from "forge-std/Test.sol";
 import {IAccessControl} from "@openzeppelin/contracts/access/IAccessControl.sol";
 import {QueryEscrow} from "@mochi/QueryEscrow.sol";
+import {IQueryEscrow} from "@mochi/interfaces/IQueryEscrow.sol";
 import {MochiTypes} from "@mochi/libraries/MochiTypes.sol";
 import {MochiRoles} from "@mochi/libraries/MochiRoles.sol";
 import {IJurorRegistry} from "@mochi/interfaces/IJurorRegistry.sol";
@@ -17,9 +18,8 @@ import {MockSchemas} from "./mocks/MockSchemas.sol";
 import {MockRandomness} from "./mocks/MockRandomness.sol";
 import {MockStaking} from "./mocks/MockStaking.sol";
 
-contract QueryEscrowTest is Test {
-    event ReviewProtocolRecipientSet(address indexed previousRecipient, address indexed newRecipient);
-    event ReviewProtocolRevenueSettled(bytes32 indexed queryId, address indexed recipient, uint256 amount);
+/// @dev Shared deployment and helpers for QueryEscrow unit tests (also used by ProvenanceBinding.t.sol).
+abstract contract QueryEscrowFixture is Test {
     uint256 constant INTAKE_PK = 0xA11CE;
     uint256 constant ANONYMA_PK = 0xB0B;
     address intake;
@@ -77,8 +77,22 @@ contract QueryEscrowTest is Test {
         token.approve(address(shielded), type(uint256).max);
     }
 
-    function _prov(bytes32 doc, uint32 tokensK, uint8 kind) internal pure returns (MochiTypes.Provenance memory p) {
-        p = MochiTypes.Provenance(doc, kind, bytes32(uint256(9)), 0, tokensK, bytes32(0));
+    /// @dev A private grant for address(this) on schema 1 v1, expiring in 15 minutes.
+    function _prov(bytes32 doc, uint32 tokensK, uint8 kind, uint64 nonce)
+        internal
+        view
+        returns (MochiTypes.Provenance memory p)
+    {
+        p.docCommit = doc;
+        p.kind = kind;
+        p.originId = bytes32(uint256(9));
+        p.tokensK = tokensK;
+        p.opener = address(this);
+        p.schemaId = 1;
+        p.schemaVersion = 1;
+        p.payerCommit = keccak256("payer result key");
+        p.nonce = nonce;
+        p.expiry = uint64(block.timestamp + 15 minutes);
     }
 
     function _sig(MochiTypes.Provenance memory p) internal view returns (bytes memory sig) {
@@ -88,39 +102,44 @@ contract QueryEscrowTest is Test {
         sig = abi.encodePacked(r, s, v);
     }
 
-    function _voucher(bytes32 id, bytes32 docCommit, uint32 schemaId, uint8 n, uint256 maxAmount, uint64 expiry)
+    function _voucher(bytes32 id, bytes32 queryId, uint32 schemaId, uint8 n, uint256 maxAmount, uint64 expiry)
         internal
         view
         returns (MochiTypes.AnonymaVoucher memory v, bytes memory signature)
     {
-        v = MochiTypes.AnonymaVoucher(id, docCommit, schemaId, n, maxAmount, 1, expiry);
+        v = MochiTypes.AnonymaVoucher(id, queryId, schemaId, n, maxAmount, 1, expiry);
         bytes32 digest =
             keccak256(abi.encodePacked("\x19\x01", escrow.domainSeparator(), MochiTypes.hashAnonymaVoucher(v)));
         (uint8 v_, bytes32 r, bytes32 s) = vm.sign(ANONYMA_PK, digest);
         signature = abi.encodePacked(r, s, v_);
     }
 
-    function _params(uint8 n, uint64 nonce, address refundTo) internal pure returns (MochiTypes.OpenParams memory p) {
-        p = MochiTypes.OpenParams(1, n, false, false, bytes32(0), bytes32(0), refundTo, nonce);
+    /// @dev The queryId an open by this contract with grant `p` creates (what a voucher must name).
+    function _qid(MochiTypes.Provenance memory p) internal view returns (bytes32) {
+        return escrow.computeQueryId(p.opener, p.docCommit, p.nonce);
+    }
+
+    function _params(uint8 n, address refundTo) internal pure returns (MochiTypes.OpenParams memory p) {
+        p = MochiTypes.OpenParams(n, refundTo);
     }
 
     function _open(uint8 n, uint64 nonce, MochiTypes.PayPath path) internal returns (bytes32 id) {
         if (path == MochiTypes.PayPath.SHIELDED) return _openShielded(n, nonce);
-        MochiTypes.Provenance memory p = _prov(bytes32(uint256(100 + nonce)), 2, 0);
+        MochiTypes.Provenance memory p = _prov(bytes32(uint256(100 + nonce)), 2, 0, nonce);
         bytes memory sig = _sig(p);
-        MochiTypes.OpenParams memory args = _params(n, nonce, address(this));
+        MochiTypes.OpenParams memory args = _params(n, address(this));
         if (path == MochiTypes.PayPath.USDG) id = escrow.openWithUSDG(args, p, sig);
     }
 
     function _openShielded(uint8 n, uint64 nonce) internal returns (bytes32 id) {
-        MochiTypes.Provenance memory p = _prov(bytes32(uint256(100 + nonce)), 2, 0);
+        MochiTypes.Provenance memory p = _prov(bytes32(uint256(100 + nonce)), 2, 0, nonce);
         bytes memory sig = _sig(p);
         uint256 cost = _quoteTotal(n, 2);
         shielded.fund(cost);
         bytes32 nullifier = bytes32(uint256(1000 + nonce));
         bytes32 context = escrow.computeQueryId(address(this), p.docCommit, nonce);
         bytes memory proof = abi.encode(nullifier, cost, address(escrow), context);
-        id = escrow.openShielded(_params(n, nonce, address(this)), p, sig, nullifier, proof);
+        id = escrow.openShielded(_params(n, address(this)), p, sig, nullifier, proof);
     }
 
     function _quoteTotal(uint8 n, uint32 tokensK) internal view returns (uint256) {
@@ -133,6 +152,11 @@ contract QueryEscrowTest is Test {
         vm.roll(uint256(q.sealBlock) + 1);
         escrow.seal(id);
     }
+}
+
+contract QueryEscrowTest is QueryEscrowFixture {
+    event ReviewProtocolRecipientSet(address indexed previousRecipient, address indexed newRecipient);
+    event ReviewProtocolRevenueSettled(bytes32 indexed queryId, address indexed recipient, uint256 amount);
 
     function testQuoteUsesClassMixScalingAndMinimumFee() public {
         escrow.setClassPrice(MochiTypes.JurorClass.LARGE_A, 10, 1);
@@ -331,10 +355,10 @@ contract QueryEscrowTest is Test {
         uint256 cost = _quoteTotal(3, 2);
         token.approve(address(escrow), type(uint256).max);
         escrow.fundAnonymaFloat(cost);
-        MochiTypes.Provenance memory p = _prov(bytes32(uint256(77)), 2, 0);
-        MochiTypes.OpenParams memory args = _params(3, 4, address(this));
+        MochiTypes.Provenance memory p = _prov(bytes32(uint256(77)), 2, 0, 4);
+        MochiTypes.OpenParams memory args = _params(3, address(this));
         MochiTypes.AnonymaVoucher memory v = MochiTypes.AnonymaVoucher(
-            bytes32(uint256(5)), p.docCommit, 1, 3, cost, 2, uint64(block.timestamp + 1 days)
+            bytes32(uint256(5)), _qid(p), 1, 3, cost, 2, uint64(block.timestamp + 1 days)
         );
         bytes32 digest =
             keccak256(abi.encodePacked("\x19\x01", escrow.domainSeparator(), MochiTypes.hashAnonymaVoucher(v)));
@@ -344,9 +368,10 @@ contract QueryEscrowTest is Test {
         escrow.settle(id, 0, MochiTypes.VerdictStatus.HUNG, 7);
         assertEq(escrow.anonymaFloat(), cost);
 
-        MochiTypes.Provenance memory fetched = _prov(bytes32(uint256(88)), 2, 1);
-        MochiTypes.OpenParams memory feedParams = _params(3, 5, address(this));
-        feedParams.isPublic = true;
+        MochiTypes.Provenance memory fetched = _prov(bytes32(uint256(88)), 2, 1, 5);
+        fetched.isPublic = true;
+        fetched.payerCommit = bytes32(0);
+        MochiTypes.OpenParams memory feedParams = _params(3, address(this));
         escrow.grantRole(MochiRoles.FEED_RUNNER_ROLE, address(this));
         escrow.fundFeedBudget(cost);
         bytes32 feedId = escrow.openFeed(feedParams, fetched, _sig(fetched));
@@ -360,10 +385,10 @@ contract QueryEscrowTest is Test {
 
     function testPauseBlocksOnlyOpen() public {
         escrow.pause();
-        MochiTypes.Provenance memory p = _prov(bytes32(uint256(99)), 2, 0);
+        MochiTypes.Provenance memory p = _prov(bytes32(uint256(99)), 2, 0, 6);
         bytes memory signature = _sig(p);
         vm.expectRevert();
-        escrow.openWithUSDG(_params(3, 6, address(this)), p, signature);
+        escrow.openWithUSDG(_params(3, address(this)), p, signature);
         escrow.unpause();
         assertTrue(escrow.computeQueryId(address(this), p.docCommit, 6) != bytes32(0));
     }
@@ -393,48 +418,48 @@ contract QueryEscrowTest is Test {
     }
 
     function testOpenRejectsInvalidInputsAndDuplicateNonce() public {
-        MochiTypes.Provenance memory p = _prov(bytes32(uint256(71)), 2, 0);
-        MochiTypes.OpenParams memory args = _params(3, 71, address(this));
+        MochiTypes.Provenance memory p = _prov(bytes32(uint256(71)), 2, 0, 71);
+        MochiTypes.OpenParams memory args = _params(3, address(this));
         bytes memory signature = _sig(p);
         args.n = 4;
         vm.expectRevert();
         escrow.openWithUSDG(args, p, signature);
-        args = _params(3, 71, address(0));
+        args = _params(3, address(0));
         vm.expectRevert();
         escrow.openWithUSDG(args, p, signature);
         p.tokensK = 0;
         signature = _sig(p);
         vm.expectRevert();
-        escrow.openWithUSDG(_params(3, 71, address(this)), p, signature);
+        escrow.openWithUSDG(_params(3, address(this)), p, signature);
         p.tokensK = 2;
         schemas.setLatest(1, 0);
         signature = _sig(p);
         vm.expectRevert();
-        escrow.openWithUSDG(_params(3, 71, address(this)), p, signature);
+        escrow.openWithUSDG(_params(3, address(this)), p, signature);
         schemas.setLatest(1, 1);
         registry.setActive(intake, MochiTypes.Role.INTAKE, false);
         vm.expectRevert();
-        escrow.openWithUSDG(_params(3, 71, address(this)), p, signature);
+        escrow.openWithUSDG(_params(3, address(this)), p, signature);
         registry.setActive(intake, MochiTypes.Role.INTAKE, true);
         bytes memory badSignature = hex"1234";
         vm.expectRevert();
-        escrow.openWithUSDG(_params(3, 71, address(this)), p, badSignature);
-        escrow.openWithUSDG(_params(3, 71, address(this)), p, signature);
-        vm.expectRevert();
-        escrow.openWithUSDG(_params(3, 71, address(this)), p, signature);
+        escrow.openWithUSDG(_params(3, address(this)), p, badSignature);
+        bytes32 opened = escrow.openWithUSDG(_params(3, address(this)), p, signature);
+        vm.expectRevert(abi.encodeWithSelector(IQueryEscrow.QueryExists.selector, opened));
+        escrow.openWithUSDG(_params(3, address(this)), p, signature);
     }
 
     function testVoucherValidationReplayAndFloatFailures() public {
         uint256 cost = _quoteTotal(3, 2);
-        MochiTypes.Provenance memory p = _prov(bytes32(uint256(72)), 2, 0);
-        MochiTypes.OpenParams memory args = _params(3, 72, address(this));
+        MochiTypes.Provenance memory p = _prov(bytes32(uint256(72)), 2, 0, 72);
+        MochiTypes.OpenParams memory args = _params(3, address(this));
         bytes memory intakeSignature = _sig(p);
         (MochiTypes.AnonymaVoucher memory voucher, bytes memory signed) =
-            _voucher(bytes32(uint256(72)), p.docCommit, 1, 3, cost, uint64(block.timestamp + 100));
+            _voucher(bytes32(uint256(72)), _qid(p), 1, 3, cost, uint64(block.timestamp + 100));
         vm.expectRevert();
         escrow.openWithVoucher(args, p, intakeSignature, voucher, hex"1234");
         (MochiTypes.AnonymaVoucher memory expired, bytes memory expiredSig) =
-            _voucher(bytes32(uint256(73)), p.docCommit, 1, 3, cost, uint64(block.timestamp - 1));
+            _voucher(bytes32(uint256(73)), _qid(p), 1, 3, cost, uint64(block.timestamp - 1));
         vm.expectRevert();
         escrow.openWithVoucher(args, p, intakeSignature, expired, expiredSig);
         (MochiTypes.AnonymaVoucher memory wrong, bytes memory wrongSig) =
@@ -446,24 +471,26 @@ contract QueryEscrowTest is Test {
         escrow.fundAnonymaFloat(cost);
         bytes32 id = escrow.openWithVoucher(args, p, intakeSignature, voucher, signed);
         assertTrue(escrow.voucherUsed(voucher.voucherId));
-        args.nonce++;
-        vm.expectRevert();
+        p.nonce++;
+        intakeSignature = _sig(p);
+        vm.expectRevert(abi.encodeWithSelector(IQueryEscrow.VoucherUsed.selector, voucher.voucherId));
         escrow.openWithVoucher(args, p, intakeSignature, voucher, signed);
         assertTrue(id != bytes32(0));
     }
 
     function testFeedRoleVisibilityProvenanceAndBudgetValidation() public {
-        MochiTypes.Provenance memory p = _prov(bytes32(uint256(73)), 2, 1);
-        MochiTypes.OpenParams memory args = _params(3, 73, address(this));
-        args.isPublic = true;
+        MochiTypes.Provenance memory p = _prov(bytes32(uint256(73)), 2, 1, 73);
+        p.isPublic = true;
+        MochiTypes.OpenParams memory args = _params(3, address(this));
         bytes memory signature = _sig(p);
         vm.expectRevert();
         escrow.openFeed(args, p, signature);
         escrow.grantRole(MochiRoles.FEED_RUNNER_ROLE, address(this));
-        args.isPublic = false;
-        vm.expectRevert();
+        p.isPublic = false;
+        signature = _sig(p);
+        vm.expectRevert(IQueryEscrow.FeedQueryMustBePublicFetched.selector);
         escrow.openFeed(args, p, signature);
-        args.isPublic = true;
+        p.isPublic = true;
         p.kind = 0;
         signature = _sig(p);
         vm.expectRevert();
@@ -479,8 +506,8 @@ contract QueryEscrowTest is Test {
     }
 
     function testShieldedBadProofAndSpentNullifier() public {
-        MochiTypes.Provenance memory p = _prov(bytes32(uint256(74)), 2, 0);
-        MochiTypes.OpenParams memory args = _params(3, 74, address(this));
+        MochiTypes.Provenance memory p = _prov(bytes32(uint256(74)), 2, 0, 74);
+        MochiTypes.OpenParams memory args = _params(3, address(this));
         bytes memory signature = _sig(p);
         uint256 cost = _quoteTotal(3, 2);
         shielded.fund(cost * 2);
@@ -490,8 +517,9 @@ contract QueryEscrowTest is Test {
         vm.expectRevert();
         escrow.openShielded(args, p, signature, nullifier, hex"01");
         escrow.openShielded(args, p, signature, nullifier, proof);
-        args.nonce++;
-        id = escrow.computeQueryId(address(this), p.docCommit, args.nonce);
+        p.nonce++;
+        signature = _sig(p);
+        id = escrow.computeQueryId(address(this), p.docCommit, p.nonce);
         proof = abi.encode(nullifier, cost, address(escrow), id);
         vm.expectRevert();
         escrow.openShielded(args, p, signature, nullifier, proof);
@@ -539,10 +567,10 @@ contract QueryEscrowTest is Test {
         escrow.setReviewProtocolRecipient(address(0x300));
         uint256 initialCost = _quoteTotal(3, 2);
         escrow.fundAnonymaFloat(initialCost);
-        MochiTypes.Provenance memory p = _prov(bytes32(uint256(77)), 2, 0);
-        MochiTypes.OpenParams memory args = _params(3, 77, address(this));
+        MochiTypes.Provenance memory p = _prov(bytes32(uint256(77)), 2, 0, 77);
+        MochiTypes.OpenParams memory args = _params(3, address(this));
         (MochiTypes.AnonymaVoucher memory initial, bytes memory initialSig) =
-            _voucher(bytes32(uint256(770)), p.docCommit, 1, 3, initialCost, uint64(block.timestamp + 1 days));
+            _voucher(bytes32(uint256(770)), _qid(p), 1, 3, initialCost, uint64(block.timestamp + 1 days));
         bytes32 id = escrow.openWithVoucher(args, p, _sig(p), initial, initialSig);
         _seal(id);
         escrow.settle(id, 0, MochiTypes.VerdictStatus.HUNG, 0);
@@ -550,16 +578,16 @@ contract QueryEscrowTest is Test {
         uint256 expansionCost = fees + protocol;
         escrow.fundAnonymaFloat(expansionCost);
         (MochiTypes.AnonymaVoucher memory expansion, bytes memory expansionSig) =
-            _voucher(bytes32(uint256(771)), p.docCommit, 1, 5, expansionCost, uint64(block.timestamp + 1 days));
+            _voucher(bytes32(uint256(771)), id, 1, 5, expansionCost, uint64(block.timestamp + 1 days));
         escrow.expandWithVoucher(id, 5, expansion, expansionSig);
         assertEq(escrow.prevNOf(id), 3);
 
-        MochiTypes.Provenance memory p2 = _prov(bytes32(uint256(78)), 2, 0);
+        MochiTypes.Provenance memory p2 = _prov(bytes32(uint256(78)), 2, 0, 78);
         uint256 cost2 = _quoteTotal(3, 2);
         escrow.fundAnonymaFloat(cost2);
         (MochiTypes.AnonymaVoucher memory expireVoucher, bytes memory expireSig) =
-            _voucher(bytes32(uint256(772)), p2.docCommit, 1, 3, cost2, uint64(block.timestamp + 1 days));
-        bytes32 expireId = escrow.openWithVoucher(_params(3, 78, address(this)), p2, _sig(p2), expireVoucher, expireSig);
+            _voucher(bytes32(uint256(772)), _qid(p2), 1, 3, cost2, uint64(block.timestamp + 1 days));
+        bytes32 expireId = escrow.openWithVoucher(_params(3, address(this)), p2, _sig(p2), expireVoucher, expireSig);
         uint256 floatBefore = escrow.anonymaFloat();
         vm.warp(escrow.getQuery(expireId).deadline + 1);
         escrow.expire(expireId);
@@ -578,10 +606,9 @@ contract QueryEscrowTest is Test {
         for (uint8 c; c < 5; ++c) {
             escrow.setClassPrice(MochiTypes.JurorClass(c), base + c, c + 1);
         }
-        MochiTypes.Provenance memory p = _prov(bytes32(uint256(700 + n)), tokensK, 0);
-        uint64 nonce = uint64(700 + n);
+        MochiTypes.Provenance memory p = _prov(bytes32(uint256(700 + n)), tokensK, 0, uint64(700 + n));
         uint256 payerBefore = token.balanceOf(address(this));
-        bytes32 id = escrow.openWithUSDG(_params(n, nonce, address(this)), p, _sig(p));
+        bytes32 id = escrow.openWithUSDG(_params(n, address(this)), p, _sig(p));
         uint256 paid = escrow.getQuery(id).paid;
         _seal(id);
         uint32 mask = maskSeed & ((uint32(1) << n) - 1);

@@ -5,26 +5,34 @@
 The production audit should cover the complete `contracts/src` tree, with focused economic and state-machine review of
 the eight contracts below. `src/interfaces`, `src/libraries`, `src/governance`, `src/consumer`, `src/examples`, and
 `src/mocks` are supporting scope: verify interface assumptions, roles, and integration behavior. Deployment is not
-ready for mainnet until the audit findings below are resolved and reviewed.
+ready for mainnet until the audit findings are resolved and reviewed. Findings are tracked privately pending launch;
+they are not published in this repository.
 
-Compiler configuration from `foundry.toml`: Solidity 0.8.28, EVM `prague`, optimizer enabled with 200 runs, and
-`via_ir = true`. Runtime sizes use `forge build --sizes`; nSLOC is the count of nonblank, non-comment-only Solidity
-source lines (imports and declarations included). These sizes are for this build configuration.
+Compiler configuration from `foundry.toml`: Solidity 0.8.28, EVM `prague`, optimizer enabled with 200 runs,
+`via_ir = true`, and `bytecode_hash = "none"` with `cbor_metadata = true` (no metadata hash in the runtime code, so
+comments, whitespace and source paths do not change bytecode; the CBOR tail records only the solc version). Runtime
+sizes use `forge build --sizes` (Foundry v1.7.1); nSLOC is the count of nonblank, non-comment-only Solidity source
+lines (imports and declarations included). These sizes are for this build configuration and were refreshed on
+2026-10-02; contract changes after that date move them.
 
 | Contract | nSLOC | Runtime bytes | EIP-170 margin |
 |---|---:|---:|---:|
-| QueryEscrow | 507 | 24,085 | 491 |
-| MochiVerdicts | 247 | 12,773 | 11,803 |
-| JurorRegistry | 206 | 10,195 | 14,381 |
-| PanelEscalation | 449 | 17,738 | 6,838 |
-| Feeds | 125 | 6,741 | 17,835 |
-| MochiStaking | 121 | 4,937 | 19,639 |
-| ClerkVoting | 160 | 5,665 | 18,911 |
-| DrandRandomness | 91 | 3,314 | 21,262 |
+| QueryEscrow | 520 | 24,316 | 260 |
+| MochiVerdicts | 247 | 12,732 | 11,844 |
+| JurorRegistry | 298 | 12,283 | 12,293 |
+| PanelEscalation | 712 | 23,914 | 662 |
+| Feeds | 147 | 7,466 | 17,110 |
+| MochiStaking | 173 | 7,474 | 17,102 |
+| ClerkVoting | 180 | 6,278 | 18,298 |
+| DrandRandomness | 91 | 3,273 | 21,303 |
 
 The production dependency for token safety, access control, cryptography, and timelocks is OpenZeppelin Contracts
 5.4. Local tests use the checked-in OpenZeppelin source and `forge-std`; no external dependencies are downloaded by
-these checks. `Slither` and `Aderyn` are not installed in this workspace.
+these checks. CI runs pinned Slither and Aderyn on `contracts/src` (`.github/workflows/security.yml`, configured by
+`slither.config.json` and `aderyn.toml`). Every Slither High/Medium and Aderyn High finding has been triaged; none was
+a bug. Accepted ones carry an inline reason (`slither-disable-next-line` / `aderyn-fp-next-line`); `slither.db.json`
+and `aderyn-baseline.json` hold findings that cannot carry one (none for PanelEscalation). CI fails on any new Slither
+Medium or High and any new Aderyn High; Low findings are reported only.
 
 `forge coverage --ir-minimum` was attempted. The coverage build failed in solc 0.8.28 with a Yul stack-depth
 exception (`Variable expr_1 is 1 too deep in the stack`), after `--ir-minimum` changed optimizer settings. No coverage
@@ -54,7 +62,7 @@ role handover and multisig ownership in the production deployment ceremony.
 | ATTESTOR_ROLE | Attestation service | Refreshes key attestations and can apply 5% attestation-failure slashes. Must only report cryptographic failures, as noted in review log. |
 | SLASHER_ROLE | MochiVerdicts | Records service/timeout data and slashes for verified equivocation. |
 | LOCKER_ROLE | ClerkVoting | Locks voting stake through the proposal's end time. It cannot transfer stake. |
-| Anonyma signer | Voucher signing service | Signs vouchers that spend Anonyma's prefunded USDG float, bound to doc commitment, schema, N, expiry and max amount. |
+| Anonyma signer | Voucher signing service | Signs vouchers that spend Anonyma's prefunded USDG float, bound to one queryId (`computeQueryId(opener, docCommit, nonce)`), schema, N, expiry and max amount. |
 | Intake / consensus keys | Attested service keys in JurorRegistry | Intake provenance signatures gate opens; consensus signatures authorize verdict posts. Registry governor controls allowed measurements and service-key registration. |
 | Juror operators / juror keys | Bonding operators and enrolled enclave signing keys | Operators receive earned USDG; juror keys sign answers; bonds can be slashed and withdrawn after exit delay. |
 | Evaluators / panel | Stake-bearing evaluator addresses | Selected evaluators commit/reveal outcomes; panel fees and slash pool are distributed by PanelEscalation. |
@@ -87,24 +95,45 @@ role handover and multisig ownership in the production deployment ceremony.
 Implemented in `test/invariant/StakeInvariant.t.sol`: stateful stake/request-unstake/withdraw, reward notification and
 claim, and vote-lock sequences. It asserts `totalStaked == Σ stakeOf`, paid plus accrued/streaming/unallocated rewards
 do not exceed notifications, and locked stake cannot be unstaked before expiry for the handler's four actors.
-`test/invariant/EscrowInvariant.t.sol` drives USDG opens,
-seal, VERDICT/HUNG posts, settlement, and operator claims; it asserts exact escrow balance equality against float,
-feed-budget, and claimable liabilities, and checks unique/stored verdict IDs. These lifecycle checks were run with
-256 runs × depth 50. The repository default is 512 runs × depth 500, which exceeds the requested floor but makes
-full-stack lifecycle invariant runs materially longer.
+`test/invariant/EscrowInvariant.t.sol` drives the whole QueryEscrow lifecycle on all four pay paths: USDG, Anonyma
+voucher (bound to the queryId), shielded (mock pool) and feed-budget opens; seal and reseal; VERDICT and HUNG posts
+with random timeout masks through MochiVerdicts; USDG, shielded, voucher and feed expansions; expiry; operator claims;
+float and budget funding; and time and block warps. Each action checks its own money movement exactly (an open or
+expansion moves exactly the quote; a post pays exactly the answering seats' fees and releases exactly the round's
+escrow; an expiry refunds exactly the round's escrow to the path's refund target; a claim pays exactly what was owed).
+The invariants assert that the escrow balance equals Anonyma's float plus the feed budget plus all claimable fees plus
+the current-round escrow of every OPEN or SEALED query, that each query's status and `paid` match the handler's ghost
+state (no transition behind its back), that seat counts match the round, and that every posted verdict ID is unique
+and stored. `test/invariant/JurorRegistryInvariant.t.sol` drives a bonded registry: enrollment, attestation, the
+attestation-failure, equivocation and timeout slashes, service records, exits and withdrawals (including withdrawals
+attempted before the hold ends), pruning, measurement changes, time, and snapshot selection. It asserts that the
+registry's MOCHI equals the sum of bonds, which equals deposits minus withdrawals minus slashes, and that the sink holds
+exactly the slashes. It also asserts that no bond exceeds its deposit, that delisted keys hold no bond, that every pool
+has only its class's JUROR keys with no duplicates, that every key that has not exited or been delisted is still in its
+pool, and that exited or delisted keys are never active. Its selection action checks that each seat is an active,
+distinct, class-correct, non-excluded key inside the snapshot, and that later enrollment and pruning do not move a
+seat. Both suites treat any handler revert as a failure, and each has a scripted test that reaches every action.
 
-`test/invariant/ClerkVotingSnapshotPoC.t.sol` contains a deliberately skipped, minimized PoC for the known
-ClerkVoting live-stake versus proposal-snapshot defect. It is documented in `AUDIT-FINDINGS.md`.
+Invariant runs and depth come from `contracts/foundry.toml`: the default profile is 128 runs × depth 64, and the `deep`
+profile (`FOUNDRY_PROFILE=deep forge test --match-test '^invariant_'`) is 1,600 runs × depth 64. Suites under
+`test/invariant` no longer cap runs inline. On 2026-10-02 every invariant passed at the deep profile (16 properties:
+102,400 calls each with zero reverts; 92.6 s wall-clock, 232 s CPU). `test/panel/PanelEscalationInvariant.t.sol` no
+longer caps runs inline either; its six properties (now including fixed eligibility of pending draws and seed-fixed
+seated panels, with dead positions and held draws in the handler) passed at the deep profile on 2026-10-02 (102,400
+calls each, zero reverts).
+
+`test/invariant/ClerkVotingSnapshotPoC.t.sol` is now a regression suite for the ClerkVoting live-stake versus
+proposal-snapshot issue (late or same-timestamp stake has no weight; stake moved after the snapshot gives the
+recipient no weight), and `test/invariant/ClerkVotingSnapshotInvariant.t.sol` asserts that proposal votes never exceed
+the snapshot. The finding itself is tracked privately pending launch.
 
 The following requested stateful invariants are **not yet implemented as invariant-handler properties** and remain
 external-audit/test gaps. Existing unit and integration coverage exercises portions of these flows, but is not a
 substitute for stateful invariants:
 
-- QueryEscrow shielded/voucher/feed pay-path solvency, expansion, expiry, settlement-once and cumulative per-query
-  refunds/payout bounds.
-- JurorRegistry bond conservation, slash routing, expiry, and selection exclusion.
-- Verdict ID uniqueness; Feeds monotonic `asOf` and eligibility across generated sequences.
-- PanelEscalation evaluator stake/fee/slash conservation and at-most-once case resolution.
+- Feeds monotonic `asOf` and eligibility across generated sequences.
+- PanelEscalation at-most-once case resolution (`test/panel/PanelEscalationInvariant.t.sol` covers stake, fee and
+  reserve accounting).
 - ClerkVoting vote sum and at-most-once execution across generated proposals.
 - Drand beacon acceptance, ticket derivation, and precompile failure behavior.
 
@@ -112,16 +141,16 @@ substitute for stateful invariants:
 
 The test tree contains unit suites for escrow/staking, registry/token/randomness/schema, governance/class mix and clerk
 voting, verdicts/feeds/crosschecks/feed reader, panel escalation, and integration/full-stack flows. The repository
-review log records 104 contract tests green before this audit-prep work. The final `forge test -vv` run passed 124
-tests across 20 suites, with the one documented ClerkVoting PoC skipped and no failures. The new invariant suites
-contributed five passing invariants (three staking and two escrow/verdict properties).
+review log records 104 contract tests green before this audit-prep work. On 2026-10-02 `forge test` passed 245 tests
+across 41 suites with none skipped, including sixteen invariants (three staking, three staking reward-accounting, two
+ClerkVoting snapshot, two escrow lifecycle, two JurorRegistry and four PanelEscalation properties).
 
 ## Known limitations and exclusions
 
-- This is pre-audit preparation, not an independent audit or deployment approval. In particular, the FINDINGS item
-  marked High is unresolved in production code.
+- This is pre-audit preparation, not an independent audit or deployment approval. Review findings are tracked
+  privately pending launch; this document does not claim that any of them is resolved.
 - `forge coverage --ir-minimum` did not produce usable coverage because of the compiler failure above.
-- Slither and Aderyn were unavailable. No network-based scanner or dependency update was attempted.
+- Slither Low/Informational and Aderyn Low findings are reported in CI but not gated.
 - Off-chain TypeScript services, database schemas, frontend/SDK behavior, legal/compliance questions, production key
   custody, TEE vendor infrastructure, and live-chain operational procedures are outside this Solidity test scope.
 - Production deployment/handover, real USDG behavior, actual RHC sequencer semantics, and drand precompiles on the
@@ -129,8 +158,8 @@ contributed five passing invariants (three staking and two escrow/verdict proper
 
 ## Ten areas for the auditor to prioritize
 
-1. QueryEscrow's near-limit 24,085-byte runtime, settlement waterfall, expansion snapshots, and per-path liability
-   accounting (only 491 bytes remain under EIP-170).
+1. QueryEscrow's near-limit 24,316-byte runtime, settlement waterfall, expansion snapshots, and per-path liability
+   accounting (only 260 bytes remain under EIP-170).
 2. ClerkVoting proposal snapshot semantics, stake locks across overlapping proposals, quorum math, and execution
    against mutable governance targets.
 3. Role handover: DEFAULT_ADMIN/GOVERNOR/guardian separation, timelock ownership, ClerkVoting grants, and the actual
@@ -138,7 +167,8 @@ contributed five passing invariants (three staking and two escrow/verdict proper
 4. MochiVerdicts signature domains, answer/vote ordering, timeout masks, status threshold boundary math, and
    equivocation evidence verification.
 5. JurorRegistry enrollment proof-of-possession, attestation refresh/slashing authority, timeout counters, bond
-   withdrawals, and class-mix selection under stale/duplicate keys.
+   withdrawals and the post-service hold, open-time selection snapshots, rehash selection and its exact fallback,
+   and pool pruning.
 6. PanelEscalation commit/reveal deadlines, reseal, appeals, slash attribution, fee and reserve conservation, and
    handling of zero-reveal/no-majority panels.
 7. MochiStaking reward accumulator precision/remainder behavior, just-in-time staking around notifications, and vote

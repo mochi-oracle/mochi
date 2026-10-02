@@ -7,7 +7,13 @@ import { sha256, sha384 } from "@noble/hashes/sha2.js";
 import { bytesToHex, hexToBytes } from "@noble/hashes/utils.js";
 
 export type AciReport = Record<string, any>;
-export type EstablishedAciReport = { workloadId: string; keysetDigest: string; receiptKeys: any[]; staleAfter: number; tcbStatus: string };
+export type EstablishedAciReport = {
+  workloadId: string; keysetDigest: string; receiptKeys: any[]; staleAfter: number; tcbStatus: string;
+  /** sha256 of the dstack app compose, when the report carried event-log evidence that replays to RTMR3. */
+  composeHash?: string;
+  /** aciOsMeasurement() of the quoted TD (firmware, VM configuration, kernel, initrd and command line). */
+  osMeasurement?: string;
+};
 export class AciVerificationError extends Error {
   readonly httpStatus?: number;
   readonly retryAfterMs?: number;
@@ -97,22 +103,73 @@ export interface DcapResult {
   status: string;
   reportType?: string;
   reportData: Uint8Array | string;
-  tdReport?: { reportData: Uint8Array; rtmr: readonly Uint8Array[] };
+  tdReport?: { reportData: Uint8Array; rtmr: readonly Uint8Array[]; mrTd?: Uint8Array };
   measurement?: string;
 }
 export interface VerifyAciReportOptions {
   signal?: AbortSignal;
   nonce: string; dcap: (quote: Uint8Array, signal?: AbortSignal) => Promise<DcapResult> | DcapResult;
-  now?: number; maxAgeSec?: number; allowedWorkloads?: string[]; allowedComposeHashes?: string[];
+  now?: number; maxAgeSec?: number;
+  /** Policy entries; see parseAciPolicy. Plain entries are workload IDs. */
+  allowedWorkloads?: string[];
+  allowedComposeHashes?: string[];
+  allowedOsMeasurements?: string[];
+  /**
+   * Accept a report without any `os:`/`compose:` pin, i.e. from any genuine TDX VM. Off by default (fails with
+   * `workload_unpinned`); intended only for discovering a workload's pin, or for an explicitly unpinned client.
+   */
+  allowUnpinned?: boolean;
 }
+
+/**
+ * Workload pinning policy. `workload_id` is not covered by the quote's report data, so a workload-ID allow-list alone
+ * proves nothing: any TDX VM can claim any ID. The attested pins are the dstack compose hash (RTMR3 event-log replay)
+ * and the OS measurement (firmware, VM configuration, kernel, initrd and command line). Entries:
+ * `compose:<64 hex>`, `os:<64 hex>`, `model:<id>`, and plain workload IDs (optionally `workload:<id>`).
+ */
+export type AciPolicy = { workloads: string[]; composeHashes: string[]; osMeasurements: string[]; models: string[] };
+export function parseAciPolicy(entries: readonly string[] = []): AciPolicy {
+  const policy: AciPolicy = { workloads: [], composeHashes: [], osMeasurements: [], models: [] };
+  for (const raw of entries) {
+    const entry = String(raw).trim();
+    if (!entry) continue;
+    const typed = /^(compose|os|model|workload):(.*)$/i.exec(entry);
+    if (!typed) { policy.workloads.push(entry); continue; }
+    const kind = typed[1]!.toLowerCase(), value = typed[2]!.trim();
+    if (kind === "compose" || kind === "os") {
+      const digest = value.toLowerCase().replace(/^0x/, "");
+      if (!/^[0-9a-f]{64}$/.test(digest)) throw new AciVerificationError("invalid_policy");
+      (kind === "compose" ? policy.composeHashes : policy.osMeasurements).push(digest);
+    } else if (!value || value.length > 256) throw new AciVerificationError("invalid_policy");
+    else (kind === "model" ? policy.models : policy.workloads).push(value);
+  }
+  return policy;
+}
+
+/** sha256(MRTD ‖ RTMR0 ‖ RTMR1 ‖ RTMR2): the TD's firmware, VM configuration and boot chain, stable across instances. */
+export function aciOsMeasurement(td: { mrTd?: Uint8Array; rtmr: readonly Uint8Array[] }): string | undefined {
+  const registers = [td.mrTd, td.rtmr?.[0], td.rtmr?.[1], td.rtmr?.[2]];
+  if (registers.some((register) => !(register instanceof Uint8Array) || register.length !== 48)) return undefined;
+  const joined = new Uint8Array(48 * 4);
+  registers.forEach((register, i) => joined.set(register!, 48 * i));
+  return hex(hash(joined));
+}
+
 export async function verifyAciReport(report: AciReport, options: VerifyAciReportOptions): Promise<EstablishedAciReport> {
+  const policy = parseAciPolicy(options.allowedWorkloads);
+  policy.composeHashes.push(...parseAciPolicy((options.allowedComposeHashes ?? []).map((value) => `compose:${value}`)).composeHashes);
+  policy.osMeasurements.push(...parseAciPolicy((options.allowedOsMeasurements ?? []).map((value) => `os:${value}`)).osMeasurements);
+  const pinned = policy.composeHashes.length > 0 || policy.osMeasurements.length > 0;
+  // Fail closed: without an attested pin any TDX VM is accepted, so that must be requested explicitly, and a
+  // workload-ID list (not covered by the quote) never substitutes for a pin.
+  if (!pinned && (policy.workloads.length || !options.allowUnpinned)) throw new AciVerificationError("workload_unpinned");
   const att = report?.attestation;
   const keyset = att?.workload_keyset;
   if (report?.api_version !== "aci/1" || att?.tee_type !== "tdx" || !keyset || typeof keyset !== "object" || Array.isArray(keyset)) throw new AciVerificationError("invalid_report");
   const digest = workloadKeysetDigest(keyset);
   if (report.workload_keyset_digest !== digest || att.report_data !== reportData(digest, options.nonce)) throw new AciVerificationError("report_binding");
   const identity = typeof report.workload_id === "string" ? report.workload_id : digest;
-  if (options.allowedWorkloads && !options.allowedWorkloads.includes(identity)) throw new AciVerificationError("workload_not_allowed");
+  if (policy.workloads.length && !policy.workloads.includes(identity)) throw new AciVerificationError("workload_not_allowed");
   const staleAfter = keyset.not_after;
   const now = options.now ?? Math.floor(Date.now() / 1000);
   if (typeof staleAfter !== "number" || !(now < staleAfter)) throw new AciVerificationError("report_stale");
@@ -131,10 +188,14 @@ export async function verifyAciReport(report: AciReport, options: VerifyAciRepor
   const evidence = att.evidence;
   if (typeof evidence?.event_log === "string" || typeof evidence?.app_compose === "string") {
     const result = await verifyComposeMeasurement(evidence, dcap.tdReport);
-    if (!result.ok || (options.allowedComposeHashes && (!result.composeHash || !options.allowedComposeHashes.includes(result.composeHash)))) throw new AciVerificationError("compose_measurement");
-  } else if (options.allowedComposeHashes) {
+    if (!result.ok || (policy.composeHashes.length && (!result.composeHash || !policy.composeHashes.includes(result.composeHash)))) throw new AciVerificationError("compose_measurement");
+    established.composeHash = result.composeHash;
+  } else if (policy.composeHashes.length) {
     throw new AciVerificationError("compose_measurement");
   }
+  const osMeasurement = dcap.tdReport ? aciOsMeasurement(dcap.tdReport) : undefined;
+  if (policy.osMeasurements.length && (!osMeasurement || !policy.osMeasurements.includes(osMeasurement))) throw new AciVerificationError("os_measurement");
+  if (osMeasurement) established.osMeasurement = osMeasurement;
   return established;
 }
 
@@ -197,8 +258,23 @@ export class AciClient {
   private cacheUntil = 0;
   private readonly fetcher: typeof fetch;
   private readonly now: () => number;
-  constructor(private readonly options: { baseUrl: string; apiKey: string; fetch?: typeof fetch; dcap: VerifyAciReportOptions["dcap"]; now?: () => number; allowedWorkloads?: string[] }) {
+  private readonly models: string[];
+  constructor(private readonly options: {
+    baseUrl: string; apiKey: string; fetch?: typeof fetch; dcap: VerifyAciReportOptions["dcap"]; now?: () => number;
+    /** Pinning policy (parseAciPolicy); invalid entries fail construction. */
+    allowedWorkloads?: string[];
+    /** Model IDs this client may request; the signed receipt must name the same model. Merged with `model:` entries. */
+    allowedModels?: string[];
+    /**
+     * Accept any DCAP-verified TDX gateway when allowedWorkloads has no `os:`/`compose:` pin. Without a pin and
+     * without this explicit opt-in, construction fails (`workload_unpinned`).
+     */
+    allowUnpinned?: boolean;
+  }) {
     this.fetcher = options.fetch ?? fetch; this.now = options.now ?? (() => Math.floor(Date.now() / 1000));
+    const policy = parseAciPolicy(options.allowedWorkloads);
+    if (policy.osMeasurements.length + policy.composeHashes.length === 0 && (policy.workloads.length || options.allowUnpinned !== true)) throw new AciVerificationError("workload_unpinned");
+    this.models = [...policy.models, ...(options.allowedModels ?? []).filter((model) => typeof model === "string" && model.length > 0)];
   }
   async attest(signal?: AbortSignal): Promise<EstablishedAciReport> {
     aborted(signal);
@@ -210,19 +286,25 @@ export class AciClient {
     if (!response.ok || response.redirected) throw httpFailure(response.redirected ? "attestation_redirect" : "attestation_http", response);
     const report = JSON.parse(new TextDecoder().decode(await readBounded(response, MAX_ATTESTATION_BYTES, signal))) as AciReport;
     aborted(signal);
-    const verified = await verifyAciReport(report, { nonce, signal, dcap: this.options.dcap, now: this.now(), allowedWorkloads: this.options.allowedWorkloads });
+    const verified = await verifyAciReport(report, { nonce, signal, dcap: this.options.dcap, now: this.now(), allowedWorkloads: this.options.allowedWorkloads, allowUnpinned: this.options.allowUnpinned === true });
     aborted(signal);
     this.established = verified;
     this.cacheUntil = Math.min(verified.staleAfter, this.now() + 3600);
     return verified;
   }
-  async chat(body: unknown, options: { signal?: AbortSignal; maxResponseBytes?: number; requireUpToDate?: boolean } = {}): Promise<{ json: any; receipt: Awaited<ReturnType<typeof verifyAciReceipt>>; established: EstablishedAciReport }> {
+  /**
+   * Sends one confidential chat request and returns it only after the report, receipt and body hashes verify. A gateway
+   * whose TDX TCB status is not UpToDate is refused before any request is sent, unless `requireUpToDate: false`. An
+   * explicit `allowedTcbStatuses` list (the operator's TDX_ALLOWED_TCB_STATUSES policy) replaces that UpToDate rule.
+   */
+  async chat(body: unknown, options: { signal?: AbortSignal; maxResponseBytes?: number; requireUpToDate?: boolean; allowedTcbStatuses?: readonly string[] } = {}): Promise<{ json: any; receipt: Awaited<ReturnType<typeof verifyAciReceipt>>; established: EstablishedAciReport }> {
     const signal = options.signal;
     const maxResponseBytes = options.maxResponseBytes ?? DEFAULT_MAX_RESPONSE_BYTES;
     if (!Number.isSafeInteger(maxResponseBytes) || maxResponseBytes < 1) throw new TypeError("maxResponseBytes must be a positive safe integer");
     if (!body || typeof body !== "object" || Array.isArray(body)) throw new AciVerificationError("request_shape");
     const request = body as Record<string, unknown>;
     if (typeof request.model !== "string" || !request.model) throw new AciVerificationError("request_model");
+    if (this.models.length && !this.models.includes(request.model)) throw new AciVerificationError("model_not_allowed");
     const provider = request.provider;
     if (provider !== undefined && (!provider || typeof provider !== "object" || Array.isArray(provider))) throw new AciVerificationError("request_provider");
     const routing = (provider ?? {}) as Record<string, unknown>;
@@ -232,7 +314,9 @@ export class AciClient {
     const bytes = encoder.encode(JSON.stringify({ ...request, provider: { ...routing, aci_verified: true } }));
     aborted(signal);
     const established = await this.attest(signal);
-    if (options.requireUpToDate && established.tcbStatus !== "UpToDate") throw new AciVerificationError("tcb_status");
+    if (options.allowedTcbStatuses !== undefined
+      ? established.tcbStatus === "Revoked" || !options.allowedTcbStatuses.includes(established.tcbStatus)
+      : options.requireUpToDate !== false && established.tcbStatus !== "UpToDate") throw new AciVerificationError("tcb_status");
     const response = await this.fetcher(`${this.options.baseUrl.replace(/\/$/, "")}/chat/completions`, { method: "POST", headers: { "content-type": "application/json", authorization: `Bearer ${this.options.apiKey}` }, body: bytes, signal, redirect: "error" });
     if (!response.ok || response.redirected) throw httpFailure(response.redirected ? "inference_redirect" : "inference_http", response);
     const responseBytes = await readBounded(response, maxResponseBytes, signal);
@@ -249,7 +333,7 @@ export class AciClient {
       if (attempt < 3) await abortableDelay(100 * (attempt + 1), signal);
     }
     if (!receipt) throw new AciVerificationError("receipt_unavailable");
-    if (receipt.requestedModelId !== request.model) throw new AciVerificationError("receipt_model");
+    if (receipt.requestedModelId !== request.model || (this.models.length && !this.models.includes(receipt.requestedModelId))) throw new AciVerificationError("receipt_model");
     aborted(signal);
     try { return { json: JSON.parse(new TextDecoder().decode(responseBytes)), receipt, established }; } catch { throw new AciVerificationError("response_json"); }
   }

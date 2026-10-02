@@ -1,6 +1,7 @@
 /**
  * Bounded local-only rehearsal of the mainnet-style deploy, configuration timelock,
- * and activation timelock. Uses a fresh Anvil loopback port and mnemonic-derived
+ * and activation timelock. Uses a fresh Anvil on a free loopback high port (its listener
+ * PID and chain id are checked before anything is sent) and mnemonic-derived
  * development keys only. No caller environment configuration is inherited by deploy-local.
  *
  * Run: bun scripts/production-activation-rehearsal.ts
@@ -9,13 +10,13 @@ import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { spawn, type ChildProcess } from "node:child_process";
-import { createServer } from "node:net";
-import { setTimeout as sleep } from "node:timers/promises";
 import { mnemonicToAccount } from "viem/accounts";
 import { createPublicClient, createWalletClient, http, parseAbi, keccak256, toHex, type Address, type Hex } from "viem";
 import * as A from "@mochi/chain";
 import { buildPhalaBatch, type Input } from "./phala-batch.ts";
+import { buildPanelSwitchOnBatch, panelWiringProblems, readPanelWiring } from "./panel-escalation.ts";
 import { ROLE_IDS } from "@mochi/chain";
+import { startAnvil } from "./launch-ops/anvil-harness.ts";
 
 const ROOT = resolve(import.meta.dir, "..");
 const MNEMONIC = "test test test test test test test test test test test junk";
@@ -29,14 +30,6 @@ const accessAbi = parseAbi([
   "function paused() view returns (bool)",
 ]);
 const assert: (condition: unknown, message: string) => asserts condition = (condition, message) => { if (!condition) throw new Error(message); };
-
-async function freePort(): Promise<number> {
-  const server = createServer();
-  await new Promise<void>((ok, fail) => server.once("error", fail).listen(0, "127.0.0.1", ok));
-  const port = (server.address() as { port: number }).port;
-  await new Promise<void>((ok, fail) => server.close((err) => err ? fail(err) : ok()));
-  return port;
-}
 
 function start(command: string, args: string[], options: { cwd: string; env?: NodeJS.ProcessEnv }): ChildProcess {
   return spawn(command, args, { cwd: options.cwd, env: options.env, stdio: ["ignore", "pipe", "pipe"] });
@@ -54,25 +47,12 @@ async function collect(proc: ChildProcess, timeoutMs = 180_000): Promise<{ code:
   return { code, output };
 }
 
-async function waitForRpc(url: string, proc: ChildProcess) {
-  for (let i = 0; i < 80; i++) {
-    if (proc.exitCode !== null) throw new Error(`Anvil exited before becoming ready (exit ${proc.exitCode})`);
-    try {
-      const response = await fetch(url, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "eth_chainId", params: [] }) });
-      if (response.ok && Number.parseInt((await response.json() as { result: string }).result, 16) === 46630) return;
-    } catch { /* wait for startup */ }
-    await sleep(125);
-  }
-  throw new Error("Anvil did not become ready on its loopback port");
-}
-
 async function main() {
-  const port = await freePort();
-  const rpc = `http://127.0.0.1:${port}`;
+  // Our own anvil: free high port, listener PID and chain id 46630 verified before anything is sent.
+  const anvil = await startAnvil(46630, ["--mnemonic", MNEMONIC, "--accounts", "20"]);
+  const { rpc, port } = anvil;
   const temp = await mkdtemp(join(tmpdir(), "mochi-activation-rehearsal-"));
-  const anvil = start("anvil", ["--host", "127.0.0.1", "--port", String(port), "--chain-id", "46630", "--mnemonic", MNEMONIC, "--accounts", "20"], { cwd: ROOT, env: { PATH: process.env.PATH } });
   try {
-    await waitForRpc(rpc, anvil);
     const owner = accountAt(1);
     const guardian = owner; // User-selected shared administrative and emergency control.
     const deployer = accountAt(0);
@@ -90,19 +70,22 @@ async function main() {
     const env = { PATH: process.env.PATH };
     const deploy = start("bun", ["scripts/deploy-local.ts", "--mainnet", "--rehearsal", "--rpc", rpc, "--key-file", keyPath, "--out", deploymentPath,
       "--owner", owner.address, "--guardian", guardian.address, "--usdg", usdgReceipt.contractAddress!,
-      "--shielded", "privacy-pools", "--randomness", "drand", "--yes"], { cwd: ROOT, env });
+      "--shielded", "privacy-pools", "--randomness", "drand", "--panel-escalation", "off", "--yes"], { cwd: ROOT, env });
     const deployed = await collect(deploy);
     assert(deployed.code === 0, `deploy-local rehearsal failed (exit ${deployed.code}):\n${deployed.output}`);
-    const deployment = JSON.parse(await Bun.file(deploymentPath).text()) as { chainId: number; paused: boolean; minJurorBond: string; timelockDelay: string; contracts: Record<string, Address>; privacy?: { entrypoint: Address } };
+    const deployment = JSON.parse(await Bun.file(deploymentPath).text()) as { chainId: number; paused: boolean; minJurorBond: string; timelockDelay: string; panelEscalation?: string; contracts: Record<string, Address>; privacy?: { entrypoint: Address } };
     assert(deployment.chainId === 46630 && deployment.paused === true, "deployment metadata must describe paused chainId 46630 rehearsal");
     const { contracts } = deployment;
     assert(deployment.timelockDelay === "60", "new deployments must record the default 60-second delay");
     assert(await publicClient.readContract({ address: contracts.timelock!, abi: parseAbi(["function getMinDelay() view returns (uint256)"]), functionName: "getMinDelay" }) === delay, "deployed timelock must honour the default delay");
     assert(await publicClient.readContract({ address: contracts.queryEscrow!, abi: accessAbi, functionName: "paused" }), "QueryEscrow must start paused");
+    // Launch keeps PanelEscalation deployed but unwired: no panel and no reserve share.
+    const panelWiring = await readPanelWiring(publicClient, contracts.queryEscrow!);
+    assert(deployment.panelEscalation === "off" && panelWiringProblems("off", contracts.panel, panelWiring).length === 0, "rehearsal must deploy with panel escalation off (QueryEscrow.panel 0x0, panelReserveBps 0)");
 
     // A rehearsal may stand in an external token, but deploy-local must refuse one with no contract code; no request leaves loopback.
     const productionGuard = start("bun", ["scripts/deploy-local.ts", "--mainnet", "--rehearsal", "--rpc", rpc, "--key-file", keyPath, "--out", join(temp, "refused.json"), "--owner", owner.address,
-      "--guardian", guardian.address, "--usdg", contracts.usdg!, "--mochi-token", guardian.address, "--shielded", "privacy-pools", "--randomness", "drand", "--yes"], { cwd: ROOT, env });
+      "--guardian", guardian.address, "--usdg", contracts.usdg!, "--mochi-token", guardian.address, "--shielded", "privacy-pools", "--randomness", "drand", "--panel-escalation", "off", "--yes"], { cwd: ROOT, env });
     const guardResult = await collect(productionGuard);
     assert(guardResult.code !== 0 && guardResult.output.includes("--mochi-token has no contract code"), "rehearsal mode must refuse an external MOCHI address without contract code");
 
@@ -185,20 +168,29 @@ async function main() {
     assert(guardianPauseReceipt.status === "success", "guardian pause transaction failed after activation");
     assert(await publicClient.readContract({ address: contracts.queryEscrow!, abi: accessAbi, functionName: "paused" }), "guardian must retain pause authority after activation");
 
+    // The generated switch-on batch, run through the deployed timelock, wires the panel back on after its own delay.
+    const panelSalt = `0x${"5e".repeat(32)}` as Hex;
+    const panelOnSchedule = buildPanelSwitchOnBatch(deploymentForBatch as never, panelSalt, "schedule");
+    const panelOnExecute = buildPanelSwitchOnBatch(deploymentForBatch as never, panelSalt, "execute");
+    await schedule(panelOnSchedule as never);
+    await expectTimelockNotReady(panelOnExecute as never);
+    assert(panelWiringProblems("off", contracts.panel, await readPanelWiring(publicClient, contracts.queryEscrow!)).length === 0, "panel must stay off until the switch-on delay passes");
+    await (publicClient.request as (args: { method: string; params: unknown[] }) => Promise<unknown>)({ method: "evm_increaseTime", params: [Number(delay)] });
+    await (publicClient.request as (args: { method: string; params: unknown[] }) => Promise<unknown>)({ method: "evm_mine", params: [] });
+    await execute(panelOnExecute as never);
+    assert(panelWiringProblems("on", contracts.panel, await readPanelWiring(publicClient, contracts.queryEscrow!)).length === 0, "switch-on batch must wire PanelEscalation with the 2500 bps reserve");
+
     console.log(JSON.stringify({
       result: "passed", rpc, chainId: 46630, deploymentMode: "mainnet rehearsal", deployer: deployer.address,
       owner: owner.address, guardian: guardian.address, mochiSource: "test-deployment (local fixture only)",
       usdg: "MockUSDG", initialPaused: true, configure: { callCount: configureSchedule.callCount, earlyExecutionReverted: true, earlyRevert: "TimelockUnexpectedOperationState", executedAfterSeconds: "60", pausedAfterConfigure: true, attestorRoleAssigned: true, feedRunnerRoleAssigned: true },
       activation: { callCount: activation.callCount, earlyExecutionReverted: true, earlyRevert: "TimelockUnexpectedOperationState", executedAfterSeconds: "60", unpausedAfterExecution: true, guardianPauseAfterActivation: true },
+      panelEscalation: { deployedOff: true, switchOnCallCount: panelOnSchedule.callCount, earlyExecutionReverted: true, onAfterDelay: true },
       jurorFixture: "nine locally approved and attested zero-bond jurors; activation CLI refused before enrollment and passed afterward; no payment or real service health claimed",
       limitation: "this local run deploys the test token; the external-token path is exercised by a testnet dress rehearsal (chain 46630, --mochi-token stand-in) and on mainnet",
     }, null, 2));
   } finally {
-    anvil.kill("SIGTERM");
-    if (anvil.exitCode === null) {
-      await Promise.race([new Promise<void>((resolveExit) => anvil.once("exit", () => resolveExit())), sleep(3_000)]);
-      if (anvil.exitCode === null) anvil.kill("SIGKILL");
-    }
+    await anvil.stop();
     await rm(temp, { recursive: true, force: true });
   }
 }

@@ -38,14 +38,20 @@ function pcsFetch(collateral: TdxCollateral): typeof fetch {
 }
 
 function bytesFromSnapshot(snapshot: string, name: string): Uint8Array {
+  // nosemgrep: detect-non-literal-regexp -- name is a fixed snapshot field name from this test
   const found = snapshot.match(new RegExp(`${name}: \\[([\\d,\\s]+)\\]`));
   if (!found) throw new Error(`snapshot is missing ${name}`);
   return Uint8Array.from(found[1]!.split(",").map((value) => value.trim()).filter(Boolean).map(Number));
 }
 
 describe("TEE/verifier factories", () => {
-  test("defaults to mock provider and verifier", async () => {
-    expect(quoteVerifierFromEnv({}, { rootAddress: root.address }).constructor.name).toBe("MockQuoteVerifier");
+  test("quote verification fails closed: QUOTE_VERIFIER is required and mock only when explicitly selected", async () => {
+    for (const env of [{}, { QUOTE_VERIFIER: "" }, { QUOTE_VERIFIER: "  " }, { QUOTE_VERIFIER: undefined }]) {
+      expect(() => quoteVerifierFromEnv(env, { rootAddress: root.address })).toThrow(/QUOTE_VERIFIER must be set explicitly/);
+    }
+    expect(quoteVerifierFromEnv({ QUOTE_VERIFIER: "mock" }, { rootAddress: root.address }).constructor.name).toBe("MockQuoteVerifier");
+    expect(quoteVerifierFromEnv({ QUOTE_VERIFIER: "dcap" }).constructor.name).toBe("DcapQuoteVerifier");
+    expect(() => quoteVerifierFromEnv({ QUOTE_VERIFIER: "MOCK" }, { rootAddress: root.address })).toThrow(/unsupported/);
     expect((await teeProviderFromEnv({}, mock)).kind).toBe("mock");
   });
 
@@ -78,7 +84,7 @@ describe("TEE/verifier factories", () => {
       { QUOTE_VERIFIER: "dcap", TDX_ALLOWED_TCB_STATUSES: "Revoked" },
       { QUOTE_VERIFIER: "dcap", TDX_ALLOW_DEBUG: "true" },
     ]) expect(() => quoteVerifierFromEnv(env, { rootAddress: root.address })).toThrow();
-    expect(() => quoteVerifierFromEnv({})).toThrow(/root address/);
+    expect(() => quoteVerifierFromEnv({ QUOTE_VERIFIER: "mock" })).toThrow(/root address/);
     await expect(teeProviderFromEnv({ TEE_MEASUREMENT: "dstack-config-v1" }, mock)).rejects.toThrow(/TEE_MODE=dstack/);
     await expect(teeProviderFromEnv({ TEE_MODE: "dstack", TEE_MEASUREMENT: "unknown" }, mock)).rejects.toThrow(/TEE_MODE=dstack/);
     await expect(teeProviderFromEnv({ TEE_MODE: "sev-snp" }, mock)).rejects.toThrow(/unsupported TEE_MODE/);
@@ -107,5 +113,21 @@ describe("TEE/verifier factories", () => {
     const provider = await teeProviderFromEnv({ TEE_MODE: "tdx", TSM_ROOT: "/fake/tsm" }, mock, { tsm });
     expect(provider.kind).toBe("tdx");
     expect(provider.measurement()).toBe(tdxQuoteMeasurement(raw));
+  });
+});
+
+describe("shared collateral cache and explicit TDX policy", () => {
+  test("services sharing a state directory share one persisted PCS cache; the strict TCB policy is the default", async () => {
+    const { collateralCacheDirFromEnv, collateralSourceFromEnv, tdxPolicyFromEnv } = await import("../src/factory.ts");
+    expect(collateralCacheDirFromEnv({})).toBeUndefined();
+    expect(collateralCacheDirFromEnv({ SEALED_STORE_DIR: "/data/mochi/sealed/juror-3" })).toBe("/data/mochi/sealed/dcap-collateral");
+    expect(collateralCacheDirFromEnv({ SEALED_STORE_DIR: "/data/mochi/sealed/attestor/" })).toBe("/data/mochi/sealed/dcap-collateral");
+    const env = { PCS_BASE_URL: "https://pcs-factory.test", SEALED_STORE_DIR: "/tmp/mochi-factory-test/intake" };
+    const first = collateralSourceFromEnv(env);
+    expect(collateralSourceFromEnv({ ...env, SEALED_STORE_DIR: "/tmp/mochi-factory-test/juror-0" })).toBe(first);
+    expect(first.persistenceDir).toBe("/tmp/mochi-factory-test/dcap-collateral");
+    expect(tdxPolicyFromEnv({})).toEqual({ allowedStatuses: ["UpToDate"], rejectAdvisories: [], allowDebug: false });
+    expect(tdxPolicyFromEnv({ TDX_ALLOWED_TCB_STATUSES: "UpToDate,SWHardeningNeeded" }).allowedStatuses).toEqual(["UpToDate", "SWHardeningNeeded"]);
+    expect(() => tdxPolicyFromEnv({ TDX_ALLOWED_TCB_STATUSES: "UpToDate,Revoked" })).toThrow(/Revoked/);
   });
 });

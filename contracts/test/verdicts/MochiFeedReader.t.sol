@@ -16,6 +16,14 @@ contract ReaderCaller {
     function earnings(IFeeds feeds, bytes32 feed, bytes32 ticker, uint64 age)
         external view returns (MochiTypes.EarningsBody memory, bytes32, uint64)
     { return MochiFeedReader.readEarnings(feeds, feed, ticker, age); }
+
+    function split(IFeeds feeds, bytes32 feed, bytes32 ticker, uint64 age)
+        external view returns (MochiTypes.SplitBody memory, bytes32, uint64)
+    { return MochiFeedReader.readSplit(feeds, feed, ticker, age); }
+
+    function nav(IFeeds feeds, bytes32 feed, bytes32 fund, uint64 age)
+        external view returns (MochiTypes.NavBody memory, bytes32, uint64)
+    { return MochiFeedReader.readNav(feeds, feed, fund, age); }
 }
 
 contract MochiFeedReaderTest is Test {
@@ -58,6 +66,7 @@ contract MochiFeedReaderTest is Test {
         v.schemaId = 3;
         v.queryId = keccak256(abi.encode("feed-query", verdictId));
         v.payloadHash = keccak256(payload);
+        v.ts = uint64(block.timestamp);
         verdicts.setVerdict(verdictId, v);
         feeds.update(FEED, TICKER, verdictId, payload);
     }
@@ -89,8 +98,56 @@ contract MochiFeedReaderTest is Test {
         vm.warp(uint256(timestamp) + 1 days + 1);
         vm.expectRevert(abi.encodeWithSelector(MochiFeedReader.StaleEntry.selector, timestamp));
         caller.earnings(feeds, FEED, TICKER, 1 days);
-        _update(bytes32("OTHER"), PERIOD, 0, uint64(block.timestamp));
+        _update(bytes32("OTHER"), PERIOD, 0, timestamp + 1 days + 1);
         vm.expectRevert(abi.encodeWithSelector(MochiFeedReader.WrongSubject.selector, TICKER, bytes32("OTHER")));
         caller.earnings(feeds, FEED, TICKER, 1 days);
+    }
+
+    function _push(bytes32 feed, uint32 schemaId, bytes32 id, bytes memory payload) private {
+        MochiTypes.Verdict memory v;
+        v.status = uint8(MochiTypes.VerdictStatus.VERDICT);
+        v.isPublic = true;
+        v.provenanceKind = uint8(MochiTypes.ProvenanceKind.FETCHED);
+        v.originId = ORIGIN;
+        v.schemaId = schemaId;
+        v.queryId = keccak256(abi.encode("feed-query", id));
+        v.payloadHash = keccak256(payload);
+        v.ts = uint64(block.timestamp);
+        verdicts.setVerdict(id, v);
+        assertTrue(feeds.update(feed, TICKER, id, payload));
+    }
+
+    /// A future-dated fact (split effective next month) ages from its verdict; a past-dated observation (NAV as of
+    /// two days ago, verified now) ages from its asOf.
+    function testAgeIsMeasuredFromTheOlderOfAsOfAndVerdictTime() public {
+        uint64 t0 = 1_800_000_000;
+        vm.warp(t0);
+        bytes32[] memory origins = new bytes32[](1);
+        origins[0] = ORIGIN;
+        bytes32 splitFeed = keccak256("corp-actions.split@RHC");
+        bytes32 navFeed = keccak256("nav@RHC");
+        feeds.register(splitFeed, 2, origins, address(0), 10);
+        feeds.register(navFeed, 5, origins, address(0), 10);
+        usdg.mint(address(this), 20);
+        usdg.approve(address(feeds), 20);
+        feeds.subscribe(splitFeed, address(caller), 1);
+        feeds.subscribe(navFeed, address(caller), 1);
+
+        uint64 effective = t0 + 30 days;
+        MochiTypes.SplitBody memory sb = MochiTypes.SplitBody(TICKER, effective, 2, 1);
+        _push(splitFeed, 2, keccak256("split"), abi.encode(TICKER, effective, abi.encode(sb)));
+        (, , uint64 observedAt) = caller.split(feeds, splitFeed, TICKER, 1 days);
+        assertEq(observedAt, t0);
+        vm.warp(t0 + 1 days + 1);
+        vm.expectRevert(abi.encodeWithSelector(MochiFeedReader.StaleEntry.selector, t0));
+        caller.split(feeds, splitFeed, TICKER, 1 days);
+
+        uint64 asOf = t0 - 1 days; // as of the start of an earlier day
+        MochiTypes.NavBody memory nb = MochiTypes.NavBody(TICKER, asOf, 100e8, 0, 0, 0);
+        _push(navFeed, 5, keccak256("nav"), abi.encode(TICKER, asOf, abi.encode(nb)));
+        vm.expectRevert(abi.encodeWithSelector(MochiFeedReader.StaleEntry.selector, asOf));
+        caller.nav(feeds, navFeed, TICKER, 2 days);
+        (, , observedAt) = caller.nav(feeds, navFeed, TICKER, 3 days);
+        assertEq(observedAt, asOf);
     }
 }

@@ -6,6 +6,7 @@ import { privateKeyToAccount } from "viem/accounts";
 import { createPublicClient, http, parseAbi, keccak256, toHex } from "viem";
 import { createChain, ROLE_IDS } from "@mochi/chain";
 import { DstackKeySource } from "@mochi/tee";
+import { parseAciPolicy } from "@mochi/aci";
 import { createDb, upsertEndpoint } from "@mochi/db";
 import { PRODUCTION_IDENTITY_SPECS, PRODUCTION_RECEIPT_SIGNING_SPEC, PRODUCTION_SERVICE_SPECS } from "../phala/production-identities/identities.ts";
 import { deploymentMinJurorBond, productionChainId, productionTimelockDelay } from "./chain-policy.ts";
@@ -33,7 +34,16 @@ export type ProductionLaunchConfig = {
   attestorAdminTokenEnv: string;
   relayKeyEnv?: string;
   anonHmacSecretEnv?: string;
+  /**
+   * Intel TDX TCB statuses every DCAP check accepts (attestor, intake, consensus, jurors and the jurors' Phala ACI
+   * gateway check); passed to each service as TDX_ALLOWED_TCB_STATUSES. Default ["UpToDate"]. See
+   * tdxPolicyFromEnv in packages/tee for the trade-off: a wider list keeps the service up through an Intel TCB recovery
+   * at the cost of accepting platforms with a published, unpatched vulnerability. "Revoked" is refused.
+   */
+  tdxAllowedTcbStatuses?: string[];
 };
+export const DEFAULT_TDX_ALLOWED_TCB_STATUSES = ["UpToDate"] as const;
+const TDX_TCB_STATUSES = ["UpToDate", "SWHardeningNeeded", "ConfigurationNeeded", "ConfigurationAndSWHardeningNeeded", "OutOfDate", "OutOfDateConfigurationNeeded"];
 export type RuntimeDeps = {
   keySource?: Pick<DstackKeySource, "derive">;
   spawn?: typeof spawn;
@@ -142,6 +152,11 @@ export function validateLaunchConfig(raw: unknown): ProductionLaunchConfig {
   }
   if (c.anonHmacSecretEnv !== undefined && !/^[A-Z][A-Z0-9_]{1,63}$/.test(c.anonHmacSecretEnv)) throw new Error("anonHmacSecretEnv must name an environment variable");
   for (const envName of [c.databaseUrlEnv, c.aciApiKeyEnv, c.attestorAdminTokenEnv]) if (!/^[A-Z][A-Z0-9_]{1,63}$/.test(envName)) throw new Error("secret env references must be environment variable names");
+  if (c.tdxAllowedTcbStatuses !== undefined && (!Array.isArray(c.tdxAllowedTcbStatuses) || c.tdxAllowedTcbStatuses.length === 0
+    || !c.tdxAllowedTcbStatuses.includes("UpToDate") || new Set(c.tdxAllowedTcbStatuses).size !== c.tdxAllowedTcbStatuses.length
+    || c.tdxAllowedTcbStatuses.some((status) => !TDX_TCB_STATUSES.includes(status)))) {
+    throw new Error("tdxAllowedTcbStatuses must list distinct Intel TCB statuses including UpToDate (Revoked is never allowed)");
+  }
   return c;
 }
 function validatePassport(p: Passport, cls: number) {
@@ -149,6 +164,10 @@ function validatePassport(p: Passport, cls: number) {
   if (!p || !p.modelId || !p.lineage || p.provider !== "phala-aci" || !p.aciModel || p.modelId !== p.aciModel || p.modelId !== expectedModel || p.lineage !== expectedLineage || !p.workload || (p.maxTokens !== undefined && (!Number.isInteger(p.maxTokens) || p.maxTokens < 1 || p.maxTokens > 8192)) || p.weightsSha256 !== `0x${"00".repeat(32)}` || p.openWeights !== false || p.zdr !== false) {
     throw new Error(`juror class ${cls} passport must identify a reviewed Phala ACI model and make no weights/ZDR claims`);
   }
+  // PHALA_ACI_ALLOWED_WORKLOADS: the juror accepts only ACI gateways matching an attested os:/compose: pin.
+  let pinned = false;
+  try { const policy = parseAciPolicy(p.workload.split(",")); pinned = policy.osMeasurements.length + policy.composeHashes.length > 0; } catch { /* reported below */ }
+  if (!pinned) throw new Error(`juror class ${cls} passport workload must include an attested os: or compose: pin`);
 }
 
 export type EnrollmentReadinessReader = {
@@ -329,7 +348,9 @@ export async function startProductionRuntime(raw: unknown | undefined, deps: Run
       }
       for (const row of endpointRows(config)) await upsertEndpoint(db.db, row.address, row.role, row.url);
     } finally { await db.close(); }
-    const dstackBase = { TEE_MODE: "dstack", TEE_KEYS: "kms", TEE_MEASUREMENT: "dstack-config-v1", QUOTE_VERIFIER: "dcap", DSTACK_SOCKET: env.DSTACK_SOCKET ?? "/var/run/dstack.sock" };
+    // One explicit Intel TCB policy for every DCAP check (see ProductionLaunchConfig.tdxAllowedTcbStatuses).
+    const tdxPolicy = { TDX_ALLOWED_TCB_STATUSES: (config.tdxAllowedTcbStatuses ?? DEFAULT_TDX_ALLOWED_TCB_STATUSES).join(",") };
+    const dstackBase = { TEE_MODE: "dstack", TEE_KEYS: "kms", TEE_MEASUREMENT: "dstack-config-v1", QUOTE_VERIFIER: "dcap", DSTACK_SOCKET: env.DSTACK_SOCKET ?? "/var/run/dstack.sock", ...tdxPolicy };
     const childhealth: Record<string, "starting" | "healthy" | "failed"> = {};
     const healthPorts: Record<string, number> = {};
     const exited = new Set<string>();
@@ -370,7 +391,9 @@ export async function startProductionRuntime(raw: unknown | undefined, deps: Run
     children.push(pool);
     log(`juror pool started with ${seatEnvs.length} seats on loopback ports ${PRODUCTION_PORTS.jurors[0]}-${PRODUCTION_PORTS.jurors.at(-1)}`);
     launch("gateway", "gateway", 3200, { ...base(3200), MOCHI_DEPLOYMENT: deployPath, INTAKE_URL: url("intake"), ...(config.mode === "active" ? { RELAYER_KEY: serviceKeys.ORCHESTRATOR_KEY } : {}), ...(env[config.anonHmacSecretEnv ?? ""] ? { ANONYMA_HMAC_SECRET: env[config.anonHmacSecretEnv!] } : {}) });
-    if (config.mode === "enroll" || config.mode === "active") launch("attestor", "attestor", 3202, { ...base(3202), MOCHI_DEPLOYMENT: deployPath, ATTESTOR_KEY: serviceKeys.ATTESTOR_KEY, ADMIN_TOKEN: adminToken!, PORT: "3202", QUOTE_VERIFIER: "dcap" });
+    // The attestor keeps no sealed data. SEALED_STORE_DIR only places its persisted Intel PCS collateral cache in the
+    // shared /data/mochi/sealed/dcap-collateral beside the enclaves' sealed stores, so a restart survives a PCS outage.
+    if (config.mode === "enroll" || config.mode === "active") launch("attestor", "attestor", 3202, { ...base(3202), MOCHI_DEPLOYMENT: deployPath, ATTESTOR_KEY: serviceKeys.ATTESTOR_KEY, ADMIN_TOKEN: adminToken!, PORT: "3202", QUOTE_VERIFIER: "dcap", SEALED_STORE_DIR: "/data/mochi/sealed/attestor", ...tdxPolicy });
     if (config.mode === "active") {
       launch("indexer", "indexer", 3201, { ...base(3201), MOCHI_DEPLOYMENT: deployPath, ANCHORER_KEY: serviceKeys.ANCHORER_KEY, RECEIPT_SIGNING_KEY: receiptSigningKey, PORT: "3201" });
       launch("orchestrator", "orchestrator", 3203, { ...base(3203), MOCHI_DEPLOYMENT: deployPath, ORCHESTRATOR_KEY: serviceKeys.ORCHESTRATOR_KEY, FEED_RUNNER_KEY: serviceKeys.FEED_RUNNER_KEY, INTAKE_URL: url("intake"), CONSENSUS_URL: url("consensus"), ...timing, PORT: "3203" });

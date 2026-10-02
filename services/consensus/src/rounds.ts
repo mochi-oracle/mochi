@@ -93,6 +93,8 @@ export class ConsensusEnclave {
     catch { throw new ConsensusError(400, "INVALID_SEED", "consensus seed envelope is invalid"); }
     if (seed.queryId !== queryId || seed.docCommit !== q.docCommit || seed.schemaId !== q.schemaId || seed.paramsHash !== q.paramsHash) throw new ConsensusError(400, "SEED_MISMATCH", "consensus seed does not match query");
     if (q.isPublic && seed.salt !== ZERO32) throw new ConsensusError(400, "SALT_MISMATCH", "public query seed salt must be zero");
+    // A private query's salt hides its on-chain answerHash and payloadHash; without one both would be guessable.
+    if (!q.isPublic && seed.salt === ZERO32) throw new ConsensusError(400, "SALT_MISMATCH", "private query seed salt must be non-zero");
     let def;
     try { def = resolveSchema(seed.schemaId, seed.params); } catch { throw new ConsensusError(400, "INVALID_SCHEMA_PARAMS", "schema parameters are invalid"); }
     if (def.version !== q.schemaVersion) throw new ConsensusError(400, "SCHEMA_VERSION_MISMATCH", "query schema version is unsupported");
@@ -182,7 +184,9 @@ export class ConsensusEnclave {
     let payload: Hex = "0x";
     let payloadHash: Hex = ZERO32;
     if (result.status === VerdictStatus.VERDICT) {
-      const built = buildPayload(def, result.agreed, normalized.params, { openedAt: q.openedAt });
+      // Public: keccak256(payload), which Feeds re-checks. Private: salted with the query's secret seed salt so the
+      // outcome cannot be recovered by hashing the few candidate payloads (e.g. the four claim answers).
+      const built = buildPayload(def, result.agreed, normalized.params, { openedAt: q.openedAt, ...(q.isPublic ? {} : { privateSalt: state.seed.salt as Hex }) });
       payload = built.payload;
       payloadHash = built.payloadHash;
     }

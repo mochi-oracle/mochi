@@ -1,0 +1,44 @@
+# gitleaks configuration, used by the `gitleaks` job in .github/workflows/security.yml:
+#   gitleaks git --config .gitleaks.toml --redact .
+# It extends the default ruleset. Each allowlist below is scoped as narrowly as practical and says why it is safe.
+# Individual historical false positives (by commit fingerprint) are listed in .gitleaksignore.
+
+title = "mochi"
+
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = """forge-std's public Infura project ID. Upstream foundry-rs/forge-std hardcodes it in the default RPC
+URLs in StdChains.sol; it is a shared public key published by forge-std, not a Mochi credential, and Mochi never uses
+those default RPC aliases. Scoped to that one file and that one value."""
+condition = "AND"
+paths = ['''^contracts/lib/forge-std/src/StdChains\.sol$''']
+regexes = ['''b9794ad1ddf84dfb8c34d6bb5dca2001''']
+
+[[allowlists]]
+description = """Vendored OpenZeppelin test suite: fixed test vectors, signatures and fixture keys used by upstream
+JavaScript tests. Mochi neither runs nor deploys these files."""
+paths = ['''^contracts/lib/openzeppelin-contracts/test/''']
+
+[[allowlists]]
+description = """Generated ABI/bytecode module (scripts/gen-abis.ts). Long creation-bytecode hex strings next to names
+like *TokenBytecode trip generic-api-key on every regeneration; the file holds no credentials."""
+paths = ['''^packages/chain/src/abis\.ts$''']
+
+[[allowlists]]
+description = """Anvil/Hardhat default development keys (accounts 0-9 of the public mnemonic
+"test test test test test test test test test test test junk"). They are public and used only by local fixtures and
+rehearsals on loopback Anvil. A production key must never be one of these."""
+regexes = [
+  '''(?i)(?:0x)?ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80''',
+  '''(?i)(?:0x)?59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d''',
+  '''(?i)(?:0x)?5de4111afa1a4b94908f83103eb1f1706367c2e68ca870fc3fb9a804cdab365a''',
+  '''(?i)(?:0x)?7c852118294e51e653712a81e05800f419141751be58f605c371e15141b007a6''',
+  '''(?i)(?:0x)?47e179ec197488593b187f80a00eb0da91f1b9d0b13f8733639f19c30a34926a''',
+  '''(?i)(?:0x)?8b3a350cf5c34c9194ca85829a2df0ec3153be0318b5e2d3348e872092edffba''',
+  '''(?i)(?:0x)?92db14e403b83dfe3df233f83dfa3a0d7096f21ca9b0d6d6b8d88b2b4ec1564e''',
+  '''(?i)(?:0x)?4bbbf85ce3377467afe5d46f804f221813b2bb87f24d81f60f1fcdbf7cbf4356''',
+  '''(?i)(?:0x)?dbda1821b80551c9d65939329250298aa3472ba22feea921c0cf5d620ea67b97''',
+  '''(?i)(?:0x)?2a871d0798f97d79848a013d4936a73bf4cc922c825d33c1cf7073dff6d409c6''',
+]

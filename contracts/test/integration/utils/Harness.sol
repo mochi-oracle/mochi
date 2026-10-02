@@ -135,8 +135,12 @@ abstract contract Harness is Test {
         return IRandomness(address(new BlockhashRandomness(1)));
     }
 
+    /// @dev A public grant for address(this): schema 1, nonce = uint64(docCommit), expiring in one hour.
     function _provenance(bytes32 docCommit, uint8 kind, bytes32 origin, uint32 tokensK) internal view returns (MochiTypes.Provenance memory p) {
-        p = MochiTypes.Provenance(docCommit, kind, origin, kind == 1 ? uint64(block.timestamp) : 0, tokensK, kind == 1 ? keccak256("tls") : bytes32(0));
+        p.docCommit = docCommit; p.kind = kind; p.originId = origin; p.tokensK = tokensK;
+        if (kind == 1) { p.fetchedAt = uint64(block.timestamp); p.transcriptHash = keccak256("tls"); }
+        p.opener = address(this); p.schemaId = 1; p.schemaVersion = 1; p.isPublic = true; p.allowPanelDisclosure = true;
+        p.nonce = uint64(uint256(docCommit)); p.expiry = uint64(block.timestamp + 1 hours);
     }
     function _signProvenance(MochiTypes.Provenance memory p) internal view returns (bytes memory) {
         bytes32 structHash = MochiTypes.hashProvenance(p);
@@ -146,14 +150,16 @@ abstract contract Harness is Test {
     }
     function _open(uint32 schema, uint8 n, bytes32 doc, bool fetched) internal returns (bytes32 qid) {
         MochiTypes.Provenance memory p = _provenance(doc, fetched ? 1 : 0, fetched ? ORIGIN : bytes32(0), 1);
-        MochiTypes.OpenParams memory op = MochiTypes.OpenParams(schema, n, true, true, bytes32(0), bytes32(0), address(this), uint64(uint256(doc)));
+        p.schemaId = schema;
+        MochiTypes.OpenParams memory op = MochiTypes.OpenParams(n, address(this));
         (uint256 jf, uint256 pf) = escrow.quote(schema, n, 1);
         usdg.mint(address(this), jf + pf);
         qid = escrow.openWithUSDG(op, p, _signProvenance(p));
     }
     function _openFeed(bytes32 doc, uint8 n) internal returns (bytes32 qid) {
         MochiTypes.Provenance memory p = _provenance(doc, 1, ORIGIN, 1);
-        MochiTypes.OpenParams memory op = MochiTypes.OpenParams(uint32(MochiTypes.SchemaId.EX_DIVIDEND), n, true, true, bytes32(0), bytes32(0), vm.addr(feedRunnerPk), uint64(uint256(doc)));
+        p.schemaId = uint32(MochiTypes.SchemaId.EX_DIVIDEND); p.opener = vm.addr(feedRunnerPk);
+        MochiTypes.OpenParams memory op = MochiTypes.OpenParams(n, vm.addr(feedRunnerPk));
         bytes memory sig = _signProvenance(p);
         vm.prank(vm.addr(feedRunnerPk)); qid = escrow.openFeed(op, p, sig);
     }

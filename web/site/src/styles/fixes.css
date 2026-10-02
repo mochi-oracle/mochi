@@ -1,0 +1,90 @@
+/* Visual fixes from the 2 Oct 2026 audit, layered over site.css and the designer's public/mochi.css.
+   mochi.css is linked after this bundle, so rules that must beat it carry one extra selector part. */
+
+/* Fixed frame (dashboard and reduced motion). mochi.css drew the left bars as rem-sized ::before/::after of :root,
+   which WebKit and Firefox size from the 16px initial font size instead of the 10px root, so the bars grew over the
+   logo and the first characters of the content. Draw the whole nested L (lavender outside, orange inside) in one
+   fixed body::before, where rem resolves against the root in every engine, and drop the :root pseudo-elements. */
+html.dashboard-document::before,
+html.dashboard-document::after,
+html.mochi-reduced-motion::before,
+html.dashboard-document body::after,
+html.mochi-reduced-motion body::after { content: none; }
+html.dashboard-document body::before,
+html.mochi-reduced-motion body::before {
+  --frame-bar: 1.2rem;
+  content: '';
+  position: fixed;
+  inset: 0;
+  z-index: 15;
+  width: auto;
+  height: auto;
+  pointer-events: none;
+  background:
+    linear-gradient(var(--mochi-orange), var(--mochi-orange)) var(--frame-bar) var(--frame-bar) / 100% var(--frame-bar) no-repeat,
+    linear-gradient(var(--mochi-orange), var(--mochi-orange)) var(--frame-bar) var(--frame-bar) / var(--frame-bar) 100% no-repeat,
+    linear-gradient(var(--mochi-lavender), var(--mochi-lavender)) 0 0 / 100% var(--frame-bar) no-repeat,
+    linear-gradient(var(--mochi-lavender), var(--mochi-lavender)) 0 0 / var(--frame-bar) 100% no-repeat;
+}
+@media (min-width: 768px) {
+  html.dashboard-document body::before,
+  html.mochi-reduced-motion body::before { --frame-bar: 2.5rem; }
+}
+
+/* The scroller starts below the header bar ([data-page-wrapper] padding), so a full-viewport height ran --header
+   past the bottom edge and the end of every page, including the footer wordmark, could never scroll into view. */
+[data-scroll-wrapper] { height: calc(100vh - var(--header)); height: calc(100svh - var(--header)); }
+
+/* Principles carousel: only the active slide is visible (Swiper's crossFade drives the opacity inline during a
+   transition; this keeps inactive slides hidden at rest). */
+[data-content-carousel] .swiper-slide:not(.swiper-slide-active) { opacity: 0; }
+
+/* Open menu: the page under the menu must not scroll when the pointer is over the frame strips. Lenis is stopped in
+   motion/index.js; this also covers native (reduced-motion) and touch scrolling. The stable gutter keeps the layout
+   from shifting where the platform shows classic scrollbars. */
+[data-scroll-wrapper] { scrollbar-gutter: stable; }
+html.menu--opened [data-scroll-wrapper] { overflow: hidden; }
+
+/* Open menu: show the SVG close mark only; the bars retract instead of rotating into a second X. */
+html.menu--opened .menu-indicator::before,
+html.menu--opened .menu-indicator::after { transform: scaleX(0); }
+.menu-indicator .svgi { margin: auto; }
+
+/* Keyboard focus on CTA buttons: site.css removes the outline (.btn:focus) and mochi.css's currentColor ring is white
+   on the dark and orange buttons, which vanishes against white sections. A black ring over a white halo reads on
+   every background the buttons sit on. */
+html .btn:focus-visible { outline: 3px solid #000; outline-offset: 3px; box-shadow: 0 0 0 3px #fff; }
+
+/* Small white text on the brand orange is ~3.75:1. Use near-black text on the header CTA and the orange sample card
+   (#111 on #e94f0b is ~5:1); the card's button keeps white text on its pink hover fill. */
+html .btn--contacts { color: #111; }
+html .workspace .review-card:nth-child(2) { color: #111; }
+html .workspace .review-card:nth-child(2) .work-button:hover { color: #fff; }
+
+/* The header logo is the Home link; its pointer-events-none utility made clicks fall through to the page. */
+.preloader-complete .fake-logo { pointer-events: auto; }
+
+/* Field agreement rows (dashboard): the label track was a fixed 10rem on phones, so a long field name ran under the
+   bar. Labels may wrap, and on phones they sit on their own line above the bar and its percentage. */
+html .field-agreement > :first-child { min-width: 0; overflow-wrap: anywhere; }
+@media (max-width: 767px) {
+  html .field-agreement { grid-template-columns: minmax(0, 1fr) auto; row-gap: .8rem; }
+  html .field-agreement > :first-child { grid-column: 1 / -1; }
+}
+
+/* Dashboard rail (desktop): it sticks 5rem below the top of the scroller, and the scroller already starts below the
+   header bar, so mochi.css's calc(100vh - 5rem) ran the rail --header past the bottom edge and hid its footer links.
+   Fit it to the space that is left; a short window scrolls the rail instead of clipping it. */
+@media (min-width: 768px) {
+  html .workspace-rail { height: calc(100vh - var(--header) - 5rem); height: calc(100svh - var(--header) - 5rem); overflow-y: auto; }
+}
+/* Laptop-height windows: tighten the rail's top spacing so its footer links still fit without scrolling. */
+@media (min-width: 768px) and (max-height: 820px) {
+  html .workspace-rail { padding-top: 3rem; }
+  html .workspace-rail .rail-brand { margin-bottom: 3rem; }
+  html .workspace-rail .rail-footer { padding-top: 2rem; }
+}
+
+/* Home, Build With MOCHI: the invitation research pilot is a labelled note under the paid check. The label keeps
+   the column's 1.25em ruled line height so the ruled background stays aligned. */
+.mochi-pilot-label { margin-bottom: 0; font-size: .75em; line-height: 1.6667; letter-spacing: .08em; text-transform: uppercase; }

@@ -1,4 +1,4 @@
-import { and, eq, sql } from "drizzle-orm";
+import { and, asc, count, eq, sql } from "drizzle-orm";
 import { z } from "zod";
 import type { Database } from "./client.ts";
 import { disagreementModel, disclosures, feedSubscriptions, jurors, panelPayloads, queries } from "./schema.ts";
@@ -63,21 +63,42 @@ export async function modelDisagreementSeries(db: Database, schemaId: number, fi
     .orderBy(disagreementModel.bucket);
 }
 
-/** Stores a disclosure envelope (sealed to the recipient; unreadable by the server). Idempotent per recipient. */
-export async function insertDisclosure(db: Database, verdictId: string, recipientKeyHash: string, envelope: Uint8Array) {
+/** Most envelope hashes listDisclosures returns for one verdict and recipient (each is still fetchable by its hash). */
+export const DISCLOSURE_LIST_LIMIT = 256;
+
+/**
+ * Stores a disclosure envelope (sealed to the recipient; unreadable by the server) under its hash, the keccak256 of
+ * `envelope` (its canonical JSON bytes; the caller computes it). Idempotent per envelope. A different envelope for the
+ * same verdict and recipient is stored beside it, never rejected: there is no first-come slot to squat, and the
+ * recipient tells envelopes apart by opening them and checking the result against the verdict on-chain.
+ */
+export async function insertDisclosure(db: Database, verdictId: string, recipientKeyHash: string, envelopeHash: string, envelope: Uint8Array) {
   await db
     .insert(disclosures)
-    .values({ verdictId: hex32.parse(verdictId), recipientKeyHash: hex32.parse(recipientKeyHash), envelope })
+    .values({ verdictId: hex32.parse(verdictId), recipientKeyHash: hex32.parse(recipientKeyHash), envelopeHash: hex32.parse(envelopeHash), envelope })
     .onConflictDoNothing();
 }
 
-export async function getDisclosure(db: Database, verdictId: string, recipientKeyHash: string) {
-  const rows = await db
-    .select()
-    .from(disclosures)
-    .where(and(eq(disclosures.verdictId, hex32.parse(verdictId)), eq(disclosures.recipientKeyHash, hex32.parse(recipientKeyHash))))
-    .limit(1);
+const recipientRows = (verdictId: string, recipientKeyHash: string) =>
+  and(eq(disclosures.verdictId, hex32.parse(verdictId)), eq(disclosures.recipientKeyHash, hex32.parse(recipientKeyHash)));
+
+/** The envelope with `envelopeHash`, or (without one) the oldest envelope for the verdict and recipient. */
+export async function getDisclosure(db: Database, verdictId: string, recipientKeyHash: string, envelopeHash?: string) {
+  const where = envelopeHash === undefined
+    ? recipientRows(verdictId, recipientKeyHash)
+    : and(recipientRows(verdictId, recipientKeyHash), eq(disclosures.envelopeHash, hex32.parse(envelopeHash)));
+  const rows = await db.select().from(disclosures).where(where).orderBy(asc(disclosures.createdAt), asc(disclosures.envelopeHash)).limit(1);
   return rows[0] ?? null;
+}
+
+/** Envelope hashes for a verdict and recipient, oldest first, at most `limit`; `total` counts them all. */
+export async function listDisclosures(db: Database, verdictId: string, recipientKeyHash: string, limit = DISCLOSURE_LIST_LIMIT) {
+  const [rows, counted] = await Promise.all([
+    db.select({ envelopeHash: disclosures.envelopeHash, createdAt: disclosures.createdAt }).from(disclosures)
+      .where(recipientRows(verdictId, recipientKeyHash)).orderBy(asc(disclosures.createdAt), asc(disclosures.envelopeHash)).limit(limit),
+    db.select({ value: count() }).from(disclosures).where(recipientRows(verdictId, recipientKeyHash)),
+  ]);
+  return { envelopes: rows, total: Number(counted[0]?.value ?? 0) };
 }
 
 export async function upsertFeedSubscription(db: Database, feedId: string, consumer: string, until: Date, paid: bigint) {

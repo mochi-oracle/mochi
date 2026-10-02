@@ -159,4 +159,57 @@ contract ClerkVotingTest is Test {
         voting.execute(id);
         assertTrue(voting.getProposal(id).executed);
     }
+
+    function testGraceWindowBoundsQueueAndExecute() public {
+        uint256 id = _propose(_input(ClerkVoting.Kind.SET_CLASS_MIX));
+        _voteYes(id);
+        uint64 grace = voting.GRACE_PERIOD();
+        uint256 endTime = voting.getProposal(id).endTime;
+        vm.warp(endTime + grace + 1);
+        vm.expectRevert(abi.encodeWithSelector(ClerkVoting.ProposalExpired.selector, id));
+        voting.queue(id);
+        vm.warp(endTime + grace); // last second of the queue window
+        voting.queue(id);
+        uint256 eta = voting.getProposal(id).eta;
+        vm.warp(eta + grace + 1);
+        vm.expectRevert(abi.encodeWithSelector(ClerkVoting.ProposalExpired.selector, id));
+        voting.execute(id);
+        vm.warp(eta + grace); // last second of the execution window
+        voting.execute(id);
+        assertEq(uint8(classMix.seatClass(0)), 4);
+    }
+
+    /// Ordering is per target: a newer class-mix proposal supersedes an older one, but a schema revocation is not
+    /// blocked by an unrelated, newer schema proposal.
+    function testSupersededProposalErrorsAndIndependentTargets() public {
+        uint256 propose1 = _propose(_schemaInput());
+        _voteYes(propose1);
+        _queue(propose1);
+        vm.warp(uint256(voting.getProposal(propose1).eta));
+        voting.execute(propose1); // schema 8 version 1
+
+        uint256 olderMix = _propose(_input(ClerkVoting.Kind.SET_CLASS_MIX));
+        uint256 revokeV1 = _propose(_input(ClerkVoting.Kind.REVOKE_SCHEMA));
+        uint256 propose2 = _propose(_schemaInput());
+        ClerkVoting.ProposalInput memory mix = _input(ClerkVoting.Kind.SET_CLASS_MIX);
+        mix.classMix = [uint8(1), 2, 4, 0, 3, 1, 2, 0, 4];
+        uint256 newerMix = _propose(mix);
+        uint256[4] memory ids = [olderMix, revokeV1, propose2, newerMix];
+        for (uint256 i; i < 4; ++i) _voteYes(ids[i]);
+        _end(newerMix);
+        for (uint256 i; i < 4; ++i) voting.queue(ids[i]);
+        vm.warp(uint256(voting.getProposal(newerMix).eta));
+
+        assertEq(voting.targetOf(olderMix), voting.targetOf(newerMix));
+        assertTrue(voting.targetOf(revokeV1) != voting.targetOf(propose2));
+        voting.execute(newerMix);
+        vm.expectRevert(abi.encodeWithSelector(ClerkVoting.SupersededProposal.selector, olderMix, newerMix));
+        voting.execute(olderMix);
+        voting.execute(propose2); // schema 8 version 2
+        voting.execute(revokeV1); // still revokes version 1
+        assertEq(voting.lastExecutedFor(voting.targetOf(propose2)), propose2);
+        assertTrue(schemas.getVersion(8, 1).revoked);
+        assertFalse(schemas.getVersion(8, 2).revoked);
+        assertEq(uint8(classMix.seatClass(0)), 1);
+    }
 }

@@ -1,6 +1,12 @@
 import { describe, expect, test } from "bun:test";
-import { keccak256, encodePacked } from "viem";
-import { AttestationDocSchema, IntakeUploadPlainSchema, aad, payerCommit } from "../src/index.ts";
+import { keccak256, encodePacked, toHex } from "viem";
+import { docCommit, privatePayloadHash, provenanceHash, ZERO32 } from "@mochi/core";
+import {
+  AttestationDocSchema, IntakeUploadPlainSchema, IntakeUrlPlainSchema, aad, maskDocHash, payerCommit, privateResultMismatch, provenanceFromJson,
+  provenanceMatchesBinding, type OpenBinding, type ProvenanceJson,
+} from "../src/index.ts";
+
+const binding: OpenBinding = { opener: `0x${"0b".repeat(20)}`, payerCommit: `0x${"0c".repeat(32)}`, isPublic: false, allowPanelDisclosure: false, nonce: "18446744073709551615" };
 
 describe("protocol", () => {
   test("payerCommit binds the result key", () => {
@@ -17,8 +23,53 @@ describe("protocol", () => {
     expect(bad.success).toBe(false);
   });
   test("intake plain defaults params", () => {
-    const p = IntakeUploadPlainSchema.parse({ v: 1, schemaId: 2, salt: `0x${"00".repeat(32)}`, contentType: "text/plain", docB64: "" });
+    const p = IntakeUploadPlainSchema.parse({ v: 1, schemaId: 2, salt: `0x${"00".repeat(32)}`, contentType: "text/plain", docB64: "", open: binding });
     expect(p.params).toEqual({});
+  });
+  test("intake requests must carry the sealed open binding (uint64 nonce, lowercase opener)", () => {
+    const url = { v: 1, schemaId: 2, salt: ZERO32, url: "https://docs.example/x" };
+    expect(IntakeUrlPlainSchema.safeParse(url).success).toBe(false);
+    expect(IntakeUrlPlainSchema.safeParse({ ...url, open: binding }).success).toBe(true);
+    expect(IntakeUrlPlainSchema.safeParse({ ...url, open: { ...binding, nonce: (1n << 64n).toString() } }).success).toBe(false);
+    expect(IntakeUrlPlainSchema.safeParse({ ...url, open: { ...binding, opener: `0x${"0B".repeat(20)}` } }).success).toBe(false);
+  });
+  test("provenance JSON converts to the EIP-712 message and matches only its own binding", () => {
+    const json: ProvenanceJson = {
+      docCommit: `0x${"01".repeat(32)}`, kind: 0, originId: ZERO32, fetchedAt: "0", tokensK: 1, transcriptHash: ZERO32,
+      schemaId: 7, schemaVersion: 1, paramsHash: ZERO32, expiry: "1700000900", ...binding,
+    };
+    const prov = provenanceFromJson(json);
+    expect(prov.nonce).toBe((1n << 64n) - 1n);
+    expect(prov.expiry).toBe(1700000900n);
+    expect(provenanceHash(prov)).not.toBe(provenanceHash({ ...prov, nonce: 1n }));
+    expect(provenanceMatchesBinding(json, binding)).toBe(true);
+    for (const change of [{ opener: `0x${"0d".repeat(20)}` }, { payerCommit: ZERO32 }, { isPublic: true }, { allowPanelDisclosure: true }, { nonce: "1" }]) {
+      expect(provenanceMatchesBinding({ ...json, ...change } as ProvenanceJson, binding)).toBe(false);
+    }
+  });
+  test("private result check: answerHash, salted payloadHash, and HUNG", () => {
+    const salt = `0x${"5a".repeat(32)}` as const;
+    const payload = `0x${"ab".repeat(96)}` as const;
+    const answerJson = '{"answer":1}';
+    const answerHash = keccak256(toHex(answerJson));
+    expect(privatePayloadHash(salt, payload)).toBe(keccak256(encodePacked(["string", "bytes32", "bytes32"], ["mochi/private-payload/v1", salt, keccak256(payload)])));
+    expect(() => privatePayloadHash(ZERO32, payload)).toThrow();
+    expect(privateResultMismatch({ salt, answerJson, payload }, { answerHash, payloadHash: privatePayloadHash(salt, payload) })).toBeUndefined();
+    expect(privateResultMismatch({ salt, answerJson, payload }, { answerHash, payloadHash: keccak256(payload) })).toBe("payloadHash");
+    expect(privateResultMismatch({ salt, answerJson: "{}", payload }, { answerHash, payloadHash: privatePayloadHash(salt, payload) })).toBe("answerHash");
+    expect(privateResultMismatch({ salt, answerJson, payload: "0x" }, { answerHash, payloadHash: ZERO32 })).toBeUndefined();
+    expect(privateResultMismatch({ salt, answerJson, payload }, { answerHash, payloadHash: ZERO32 })).toBe("payloadHash");
+  });
+  test("masked docHash: plain for public, salt-masked for private, and only the requester's salt recovers docCommit", () => {
+    const docHash = keccak256(toHex("document bytes"));
+    expect(maskDocHash(ZERO32, docHash)).toBe(docHash);
+    const salt = `0x${"5e".repeat(32)}` as const;
+    const masked = maskDocHash(salt, docHash);
+    expect(masked).toMatch(/^0x[0-9a-f]{64}$/);
+    expect(masked).not.toBe(docHash);
+    expect(maskDocHash(salt, masked)).toBe(docHash);
+    expect(docCommit(salt, maskDocHash(salt, masked))).toBe(docCommit(salt, docHash));
+    expect(docCommit(`0x${"5f".repeat(32)}`, maskDocHash(`0x${"5f".repeat(32)}`, masked))).not.toBe(docCommit(salt, docHash));
   });
   test("aad strings are distinct per purpose", () => {
     const q = `0x${"aa".repeat(32)}` as const;

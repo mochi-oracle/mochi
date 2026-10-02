@@ -1,7 +1,7 @@
 import { createPublicClient, createWalletClient, http, type Hex } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
-import { loadDeployment, chainFor, PanelEscalationAbi } from "@mochi/chain";
-import { bindKey, commitment, evaluatorSalt, generateEvaluatorKey, payloadSig } from "../src/evaluator.ts";
+import { loadDeployment, chainFor, PanelEscalationAbi, QueryEscrowAbi } from "@mochi/chain";
+import { assertPublicPayload, bindKey, commitment, evaluatorSalt, generateEvaluatorKey, payloadSig } from "../src/evaluator.ts";
 
 const args = process.argv.slice(2);
 const command = args[0];
@@ -60,17 +60,24 @@ if (command === "stake") {
   const value = commitment(caseId, panelIndex, account.address, answerHash, payloadHash, salt);
   console.log(JSON.stringify({ commitment: value, salt }));
   console.log(await writePanel("commit", [caseId, value]));
+} else if (command === "claim") {
+  // Only needed when a payout transfer to this evaluator failed and was kept as an owed balance.
+  console.log(await writePanel("claim", []));
 } else if (command === "reveal") {
   console.log(await writePanel("reveal", [required("case-id"), required("answer-hash"), required("payload-hash"), required("salt")]));
 } else if (command === "submit-payload") {
-  const { account } = loadClients();
+  const { account, dep, publicClient } = loadClients();
   const caseId = required("case-id") as Hex;
+  // A private query's payload carries private field values: it must never leave this machine. (caseId = queryId)
+  const query = await publicClient.readContract({ address: dep.contracts.queryEscrow, abi: QueryEscrowAbi, functionName: "getQuery", args: [caseId] }) as { isPublic: boolean };
+  assertPublicPayload(query.isPublic);
   const panelIndex = Number(required("panel-index")) as 0 | 1;
   const payload = required("payload") as Hex;
   const answerJson = await Bun.file(required("answer-json")).text();
   const response = await fetch(`${baseUrl}/v1/panel/${caseId}/payload`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ evaluator: account.address.toLowerCase(), panelIndex, payload, answerJson, sig: await payloadSig(account, caseId, panelIndex, payload) }), signal: AbortSignal.timeout(15_000) });
-  if (!response.ok) throw new Error("payload submission failed");
+  // The desk keeps a payload only after this evaluator's on-chain reveal, and only the revealed one.
+  if (!response.ok) throw new Error(`payload submission failed: ${((await response.json().catch(() => ({}))) as { error?: { code?: string } }).error?.code ?? response.status}`);
   console.log(await response.text());
 } else {
-  throw new Error("usage: evaluator <stake|materials|commit|reveal|submit-payload> [--flags]");
+  throw new Error("usage: evaluator <stake|materials|commit|reveal|submit-payload|claim> [--flags]");
 }

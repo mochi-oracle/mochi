@@ -1,8 +1,8 @@
 import { describe, expect, test } from "bun:test";
 import { privateKeyToAccount } from "viem/accounts";
-import { toHex, type Hex } from "viem";
+import { keccak256, toHex, type Hex } from "viem";
 import { x25519 } from "@noble/curves/ed25519.js";
-import { aad, PrivateResultPlainSchema, type IntakeUploadPlain } from "@mochi/protocol";
+import { aad, payerCommit, privateResultMismatch, provenanceFromJson, PrivateResultPlainSchema, type IntakeUploadPlain } from "@mochi/protocol";
 import { MemorySealedStore, MockQuoteVerifier, MockTeeProvider, open, recoverProvenance, recoverVerdictAttestation, seal } from "@mochi/tee";
 import { ROUND_REHEARSAL_FIXTURE, ROUND_REHEARSAL_MODEL_OUTPUT, createRoundRehearsal, type RoundRehearsalOptions } from "./round.ts";
 
@@ -23,11 +23,14 @@ function makeOptions(overrides: Partial<RoundRehearsalOptions> = {}, outputs: un
   return { ...defaults, ...overrides };
 }
 
-function uploadEnvelope(recipient: Hex, value: Partial<IntakeUploadPlain> = {}) {
+/** The fixed open binding for a payer result key (the caller seals it with the document). */
+const openFor = (payerResultPubKey: Uint8Array) => ({ ...ROUND_REHEARSAL_FIXTURE.open, payerCommit: payerCommit(toHex(payerResultPubKey)) });
+
+function uploadEnvelope(recipient: Hex, value: Partial<IntakeUploadPlain> = {}, payerKey: Uint8Array = payer.publicKey) {
   const plain: IntakeUploadPlain = {
     v: 1, schemaId: ROUND_REHEARSAL_FIXTURE.schemaId, salt: ROUND_REHEARSAL_FIXTURE.salt,
     params: { ...ROUND_REHEARSAL_FIXTURE.params }, contentType: "text/plain",
-    docB64: Buffer.from(ROUND_REHEARSAL_FIXTURE.evidence).toString("base64"), ...value,
+    docB64: Buffer.from(ROUND_REHEARSAL_FIXTURE.evidence).toString("base64"), open: openFor(payerKey), ...value,
   };
   return seal(recipient, new TextEncoder().encode(JSON.stringify(plain)), aad.intake());
 }
@@ -50,11 +53,12 @@ describe("Phala synthetic private round composition", () => {
     const privatePlain = PrivateResultPlainSchema.parse(JSON.parse(new TextDecoder().decode(open(payer.secretKey, result.decision.privateResult, aad.result(result.decision.verdictId)))));
     expect(privatePlain.verdictId).toBe(result.decision.verdictId);
     expect(privatePlain.answerJson).toContain('"v":"42"');
-    const provenanceSigner = await recoverProvenance(31337, `0x${"00".repeat(20)}` as Hex, {
-      docCommit: result.intake.docCommit, kind: 0, originId: result.intake.provenance.originId,
-      fetchedAt: BigInt(result.intake.provenance.fetchedAt), tokensK: result.intake.provenance.tokensK,
-      transcriptHash: result.intake.provenance.transcriptHash,
-    }, result.intake.intakeSig);
+    // The on-chain payloadHash of a private verdict is salted with the query's secret salt.
+    expect(privateResultMismatch(privatePlain, result.decision.verdictInput as { answerHash: string; payloadHash: string })).toBeUndefined();
+    expect((result.decision.verdictInput as { payloadHash: string }).payloadHash).not.toBe(keccak256(privatePlain.payload as Hex));
+    // The intake signed the full grant, bound to the sealed open (opener, payer key commitment, consent, nonce).
+    expect(result.intake.provenance).toMatchObject({ ...openFor(payer.publicKey), docCommit: result.intake.docCommit, paramsHash: result.intake.paramsHash, schemaId: ROUND_REHEARSAL_FIXTURE.schemaId, schemaVersion: 1 });
+    const provenanceSigner = await recoverProvenance(31337, `0x${"00".repeat(20)}` as Hex, provenanceFromJson(result.intake.provenance), result.intake.intakeSig);
     expect(provenanceSigner.toLowerCase()).toBe(result.intake.identity.toLowerCase());
     const consensusSigner = await recoverVerdictAttestation(31337, ROUND_REHEARSAL_FIXTURE.verdictsAddress, result.decision.verdictInput as never, (await import("@mochi/core")).votesHash(result.decision.votes as never), result.decision.consensusSig);
     expect(consensusSigner.toLowerCase()).toBe(result.attestations.consensus.address.toLowerCase());
@@ -79,6 +83,22 @@ describe("Phala synthetic private round composition", () => {
     await expect(createRoundRehearsal(good).run({ envelope: uploadEnvelope(other.encryptionPublicKey()), payerResultPubKey: toHex(payer.publicKey) as Hex })).rejects.toThrow("invalid intake envelope");
   });
 
+  test("rejects an open binding other than the fixed private one for this payer key, before intake", async () => {
+    const otherPayer = x25519.keygen();
+    for (const open of [
+      { ...openFor(payer.publicKey), opener: `0x${"00".repeat(19)}03` },
+      { ...openFor(payer.publicKey), nonce: "2" },
+      { ...openFor(payer.publicKey), allowPanelDisclosure: true },
+      { ...openFor(payer.publicKey), isPublic: true },
+      openFor(otherPayer.publicKey),
+    ]) {
+      const diagnostics: unknown[] = [];
+      const options = makeOptions({ onDiagnostic: (event) => diagnostics.push(event) });
+      await expect(createRoundRehearsal(options).run({ envelope: uploadEnvelope(options.tees.intake.encryptionPublicKey(), { open }), payerResultPubKey: toHex(payer.publicKey) as Hex })).rejects.toThrow("fixed synthetic fixture");
+      expect(diagnostics).toEqual([{ stage: "request", causeCode: "fixture_rejected" }]);
+    }
+  });
+
   test("reports only safe stage, provider cause code and HTTP status on juror failure", async () => {
     const diagnostics: unknown[] = [];
     const options = makeOptions({ onDiagnostic: (event) => diagnostics.push(event) });
@@ -98,6 +118,6 @@ describe("Phala synthetic private round composition", () => {
     const result = await flow.run({ envelope: uploadEnvelope(options.tees.intake.encryptionPublicKey()), payerResultPubKey: toHex(payer.publicKey) as Hex });
     const other = x25519.keygen();
     expect(() => open(other.secretKey, result.decision.privateResult, aad.result(result.decision.verdictId))).toThrow();
-    await expect(flow.run({ envelope: uploadEnvelope(options.tees.intake.encryptionPublicKey()), payerResultPubKey: toHex(other.publicKey) as Hex })).rejects.toThrow("already bound");
+    await expect(flow.run({ envelope: uploadEnvelope(options.tees.intake.encryptionPublicKey(), {}, other.publicKey), payerResultPubKey: toHex(other.publicKey) as Hex })).rejects.toThrow("already bound");
   });
 });

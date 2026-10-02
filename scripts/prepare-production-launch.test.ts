@@ -8,7 +8,9 @@ import { join } from "node:path";
 import { keyBinding, type QuoteVerifier } from "@mochi/tee";
 import { parseTdxQuote } from "@mochi/tee";
 import { bytesToHex } from "viem";
-import { reportData as aciReportData, workloadKeysetDigest } from "@mochi/aci";
+import { aciOsMeasurement, reportData as aciReportData, workloadKeysetDigest } from "@mochi/aci";
+
+const pinnedWorkload = (i: number) => `os:${(i + 1).toString(16).padStart(2, "0").repeat(32)}`;
 import { readFile as readBytes } from "node:fs/promises";
 import { PRODUCTION_IDENTITY_SPECS, PRODUCTION_SERVICE_SPECS } from "../deploy/phala/production-identities/identities.ts";
 import { validateLaunchConfig, PRODUCTION_PORTS } from "../deploy/production/runtime.ts";
@@ -44,6 +46,7 @@ function deployment() {
   return {
     chainId: 4663, rpcUrl: "https://rpc.example", startBlock: "1",
     tokenSource: { kind: "external", decimals: 18 }, owner: address(201), guardian: address(202), timelock: address(203), paused: true,
+    panelEscalation: "off" as const,
     contracts: {
       mochiToken: address(204), usdg: address(205), queryEscrow: address(206), jurorRegistry: address(207), verdicts: address(208),
       receiptAnchor: address(209), panel: address(210), timelock: address(203), schemaRegistry: address(211), randomness: address(212),
@@ -57,7 +60,7 @@ function deployment() {
 function build(extra: Partial<Parameters<typeof prepareProductionLaunch>[0]> = {}) {
   return verified().then((checked) => prepareProductionLaunch({
     verified: checked, deployment: deployment(), operator: address(230),
-    workloads: Object.fromEntries(PRODUCTION_IDENTITY_SPECS.filter((row) => row.role === "juror").map((row, i) => [row.name, `aci-workload-${i}`])),
+    workloads: Object.fromEntries(PRODUCTION_IDENTITY_SPECS.filter((row) => row.role === "juror").map((row, i) => [row.name, pinnedWorkload(i)])),
     deploymentPath: "/protected/deployments/mainnet.json", outputDirectory: "/protected/new-launch", now: () => now,
     randomSalt: () => `0x${"55".repeat(32)}` as Hex,
     ...extra,
@@ -72,17 +75,18 @@ test("prepares public CA-bound runtime, batch and disabled website inputs", asyn
   expect(prepared.runtime.databaseUrlEnv).toBe("MOCHI_PRODUCTION_DATABASE_URL");
   expect(prepared.runtime.aciApiKeyEnv).toBe("PHALA_API_KEY");
   expect(prepared.runtime.attestorAdminTokenEnv).toBe("MOCHI_PRODUCTION_ATTESTOR_ADMIN_TOKEN");
+  expect(prepared.runtime.tdxAllowedTcbStatuses).toEqual(["UpToDate"]);
   expect(prepared.runtime.endpoints.jurors).toEqual(PRODUCTION_PORTS.jurors.map((port) => `http://127.0.0.1:${port}`));
   expect(prepared.runtime.identities.jurors.map((row) => [row.passport?.modelId, row.passport?.lineage, row.passport?.workload])).toEqual([
-    ["qwen/qwen3.6-35b-a3b", "qwen", "aci-workload-0"],
-    ["qwen/qwen3.6-35b-a3b", "qwen", "aci-workload-1"],
-    ["deepseek/deepseek-v4-flash-0731", "deepseek", "aci-workload-2"],
-    ["deepseek/deepseek-v4-flash-0731", "deepseek", "aci-workload-3"],
-    ["google/gemma-4-31b-it", "gemma", "aci-workload-4"],
-    ["google/gemma-4-31b-it", "gemma", "aci-workload-5"],
-    ["moonshotai/kimi-k2.6", "kimi", "aci-workload-6"],
-    ["openai/gpt-oss-120b", "gpt-oss", "aci-workload-7"],
-    ["openai/gpt-oss-120b", "gpt-oss", "aci-workload-8"],
+    ["qwen/qwen3.6-35b-a3b", "qwen", pinnedWorkload(0)],
+    ["qwen/qwen3.6-35b-a3b", "qwen", pinnedWorkload(1)],
+    ["deepseek/deepseek-v4-flash-0731", "deepseek", pinnedWorkload(2)],
+    ["deepseek/deepseek-v4-flash-0731", "deepseek", pinnedWorkload(3)],
+    ["google/gemma-4-31b-it", "gemma", pinnedWorkload(4)],
+    ["google/gemma-4-31b-it", "gemma", pinnedWorkload(5)],
+    ["moonshotai/kimi-k2.6", "kimi", pinnedWorkload(6)],
+    ["openai/gpt-oss-120b", "gpt-oss", pinnedWorkload(7)],
+    ["openai/gpt-oss-120b", "gpt-oss", pinnedWorkload(8)],
   ]);
   expect(prepared.runtime.identities.jurors.every((row) => row.passport?.weightsSha256 === `0x${"00".repeat(32)}` && row.passport.openWeights === false && row.passport.zdr === false && row.passport.provider === "phala-aci")).toBe(true);
   expect(prepared.identities.jurors.map((row) => row.class)).toEqual([0, 0, 1, 1, 2, 2, 3, 4, 4]);
@@ -119,6 +123,16 @@ test("writes only into a new output directory and records actual artifact paths"
   await expect(writeProductionLaunch(out, prepared)).rejects.toThrow();
 });
 
+test("workload policies must carry an attested pin; a bare workload ID is refused", async () => {
+  const names = PRODUCTION_IDENTITY_SPECS.filter((row) => row.role === "juror").map((row) => row.name);
+  const unpinned = Object.fromEntries(names.map((name, i) => [name, `aci-workload-${i}`]));
+  await expect(build({ workloads: unpinned })).rejects.toThrow("needs an attested os: or compose: pin");
+  const malformed = Object.fromEntries(names.map((name) => [name, "os:not-a-digest"]));
+  await expect(build({ workloads: malformed })).rejects.toThrow("needs an attested os: or compose: pin");
+  const composeOnly = Object.fromEntries(names.map((name) => [name, `compose:${"cd".repeat(32)}`]));
+  expect((await build({ workloads: composeOnly })).runtime.identities.jurors[0]!.passport!.workload).toBe(`compose:${"cd".repeat(32)}`);
+});
+
 test("discovers a shared ACI workload only from a fresh nonce-bound TDX report without credentials", async () => {
   const fixture = await readBytes(new URL("../packages/tee/test/fixtures/intel-tdx/tdx_quote", import.meta.url));
   let seenRequest: URL | undefined;
@@ -142,9 +156,12 @@ test("discovers a shared ACI workload only from a fresh nonce-bound TDX report w
   }) as unknown as typeof fetch;
   const workload = await discoverPhalaAciWorkload({
     baseUrl: "https://inference.example/v1", fetchImpl, now: () => now,
-    dcap: (quote) => ({ ok: true, status: "UpToDate", reportType: "tdx", reportData: parseTdxQuote(quote).td.reportData }),
+    dcap: (quote) => ({ ok: true, status: "UpToDate", reportType: "tdx", reportData: parseTdxQuote(quote).td.reportData, tdReport: parseTdxQuote(quote).td }),
   });
-  expect(workload).toBe(expectedWorkloadId);
+  // The discovered policy pins the quoted TD's OS measurement, not the unsigned workload_id.
+  const td = parseTdxQuote(fixture).td;
+  expect(workload).toBe(`os:${aciOsMeasurement(td)}`);
+  expect(workload).not.toContain(expectedWorkloadId);
   expect(seenRequest?.pathname).toBe("/v1/aci/attestation");
   expect(seenRequest?.searchParams.get("nonce")).toMatch(/^[0-9a-f]{64}$/);
   expect(seenInit?.method).toBe("GET");
@@ -195,4 +212,17 @@ test("recorded mainnet delays reach release input, both schedule batches and own
   }
   for (const chainId of [4663, 46630, 31337]) expect(() => productionTimelockDelay({ chainId, timelockDelay: "3601" })).toThrow("0 to 3600");
   await expect(build({ deployment: { ...deployment(), timelockDelay: "3601" } })).rejects.toThrow("0 to 3600");
+});
+
+test("launch inputs require panel escalation off when recorded and offer the N3 jury only", async () => {
+  await expect(build({ deployment: { ...deployment(), panelEscalation: "on" } })).rejects.toThrow("--panel-escalation off");
+  await expect(build({ deployment: { ...deployment(), panelEscalation: "maybe" } })).rejects.toThrow("must be off or on");
+  const { panelEscalation: _unrecorded, ...legacy } = deployment();
+  await expect(build({ deployment: legacy })).rejects.toThrow("does not record panelEscalation");
+  const reprepared = await build({ deployment: { ...deployment(), panelEscalation: "on" }, allowPanelEscalationOn: true });
+  expect((reprepared.runtime.deployment as any).panelEscalation).toBe("on");
+  const prepared = await build({ deployment: { ...deployment(), panelEscalation: "off" } });
+  expect((prepared.runtime.deployment as any).panelEscalation).toBe("off");
+  expect(() => validateLaunchConfig(prepared.runtime)).not.toThrow();
+  expect((prepared.website as any).jurySizes).toEqual([3]);
 });

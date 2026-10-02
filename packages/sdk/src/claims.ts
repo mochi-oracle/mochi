@@ -1,6 +1,6 @@
 import { SchemaId, VerdictStatus } from '@mochi/core';
 import type { Address, Hex, WalletClient } from 'viem';
-import type { MochiClient, Pay, PreparedQuery } from './client.ts';
+import type { MochiClient, Pay, PreparedQuery, QuerySecrets } from './client.ts';
 
 export const CLAIM_REVIEW_ANSWERS = ['supported', 'contradicted', 'missing_context', 'insufficient_evidence'] as const;
 export type ClaimReviewAnswer = typeof CLAIM_REVIEW_ANSWERS[number];
@@ -30,7 +30,14 @@ export interface PreparedClaimReview {
   prepared: PreparedQuery;
 }
 
+/**
+ * `chain_derived` (waitForClaimReview): the verdict id, status, schema, agreementBps and masks were read from
+ * MochiVerdicts on chain, and a VERDICT's answer was decrypted and accepted only against the on-chain answerHash and
+ * salted payloadHash. `gateway_reported` (interpretClaimReviewVerdict): taken from a gateway record, not checked.
+ */
 export type ClaimReviewOutcome =
+  | { execution: 'chain_derived'; status: 'VERDICT'; answer: ClaimReviewAnswer; agreementBps: number; dissentMask: number; timeoutMask: number; verdictId: Hex }
+  | { execution: 'chain_derived'; status: 'HUNG'; agreementBps: number; dissentMask: number; timeoutMask: number; verdictId: Hex }
   | { execution: 'gateway_reported'; status: 'VERDICT'; answer: ClaimReviewAnswer; agreementBps?: number; dissentMask?: number; timeoutMask?: number; verdictId?: Hex }
   | { execution: 'gateway_reported'; status: 'HUNG'; agreementBps?: number; dissentMask?: number; timeoutMask?: number; verdictId?: Hex }
   | { execution: 'unresolved'; status: 'unknown_or_pending'; verdictId?: Hex };
@@ -140,7 +147,7 @@ export function askClaimReview(client: MochiClient, input: ClaimReviewInput, wal
   return client.ask(optionsFor(input), wallet);
 }
 
-/** Interprets the gateway's FREEFORM_FACT record; this does not independently verify the chain. */
+/** Interprets the gateway's FREEFORM_FACT record (labeled gateway_reported); this does not verify against the chain. */
 export function interpretClaimReviewVerdict(verdict: Record<string, unknown>): ClaimReviewOutcome {
   const chain = verdict.chain;
   const verdictId = typeof verdict.verdictId === 'string' && /^0x[0-9a-f]{64}$/i.test(verdict.verdictId) ? verdict.verdictId as Hex : undefined;
@@ -163,19 +170,23 @@ export function interpretClaimReviewVerdict(verdict: Record<string, unknown>): C
   return { execution: 'gateway_reported', status: 'VERDICT', answer: answer as ClaimReviewAnswer, ...metadata };
 }
 
-/** Waits for the gateway's protocol record; private VERDICT content is decrypted and answerHash-checked by MochiClient. */
-export async function waitForClaimReview(client: MochiClient, queryId: Hex, resultPrivateKey: Hex, options?: Parameters<MochiClient['waitForVerdict']>[1]): Promise<ClaimReviewOutcome> {
+/**
+ * Waits for the query's verdict and reads it from the chain: the verdict id (MochiVerdicts.latestVerdictOf), status,
+ * schema, agreementBps and masks (MochiVerdicts.getVerdict) are chain-derived, and a VERDICT's answer is decrypted by
+ * MochiClient.decryptPrivateResult, which accepts it only if its answerHash and salted payloadHash match that on-chain
+ * verdict. The gateway only relays the ciphertext. The client needs `chain`. `secrets` are the query's secrets from
+ * prepare/ask: { salt, resultPrivateKey }.
+ */
+export async function waitForClaimReview(client: MochiClient, queryId: Hex, secrets: QuerySecrets, options?: Parameters<MochiClient['waitForVerdict']>[1]): Promise<ClaimReviewOutcome> {
+  if (typeof secrets !== 'object' || secrets === null || !secrets.resultPrivateKey) throw new TypeError('waitForClaimReview needs the query secrets { salt, resultPrivateKey }');
   const verdictId = await client.waitForVerdict(queryId, options);
-  const verdict = await client.getVerdict(verdictId);
-  const chain = verdict.chain;
-  if (!chain || typeof chain !== 'object') return { execution: 'unresolved', status: 'unknown_or_pending', verdictId };
-  const chainRecord = chain as Record<string, unknown>;
-  const schemaId = chainRecord.schemaId ?? chainRecord.schema_id;
-  const status = chainRecord.status;
-  if (schemaId !== SchemaId.FREEFORM_FACT) return { execution: 'unresolved', status: 'unknown_or_pending', verdictId };
-  if (status === VerdictStatus.HUNG || status === 'HUNG') return interpretClaimReviewVerdict(verdict);
-  if (status !== VerdictStatus.VERDICT && status !== 'VERDICT') return { execution: 'unresolved', status: 'unknown_or_pending', verdictId };
-  const privateResult = await client.decryptPrivateResult(verdictId, resultPrivateKey);
+  const onChain = await client.chainVerdict(verdictId);
+  if (onChain.queryId.toLowerCase() !== queryId.toLowerCase()) throw new Error('Verdict belongs to another query');
+  if (onChain.schemaId !== SchemaId.FREEFORM_FACT) return { execution: 'unresolved', status: 'unknown_or_pending', verdictId };
+  const metadata = { agreementBps: onChain.agreementBps, dissentMask: onChain.dissentMask, timeoutMask: onChain.timeoutMask, verdictId };
+  if (onChain.status === VerdictStatus.HUNG) return { execution: 'chain_derived', status: 'HUNG', ...metadata };
+  if (onChain.status !== VerdictStatus.VERDICT) return { execution: 'unresolved', status: 'unknown_or_pending', verdictId };
+  const privateResult = await client.decryptPrivateResult(verdictId, { queryId, ...secrets });
   let parsed: unknown;
   try { parsed = JSON.parse(privateResult.answerJson); } catch { return { execution: 'unresolved', status: 'unknown_or_pending', verdictId }; }
   if (!parsed || typeof parsed !== 'object') return { execution: 'unresolved', status: 'unknown_or_pending', verdictId };
@@ -186,5 +197,5 @@ export async function waitForClaimReview(client: MochiClient, queryId: Hex, resu
   if ((parsed as Record<string, unknown>).schemaId !== SchemaId.FREEFORM_FACT || answerType !== 'str' || typeof answer !== 'string' || !CLAIM_REVIEW_ANSWERS.includes(answer as ClaimReviewAnswer)) {
     return { execution: 'unresolved', status: 'unknown_or_pending', verdictId };
   }
-  return interpretClaimReviewVerdict({ ...verdict, decodedPayload: { body: { answerType: 2, stringAnswer: answer } } });
+  return { execution: 'chain_derived', status: 'VERDICT', answer: answer as ClaimReviewAnswer, ...metadata };
 }

@@ -1,7 +1,7 @@
-import { Role, SchemaId, QueryStatus, VerdictStatus, ZERO32, docCommit, docHash } from "@mochi/core";
+import { Role, SchemaId, QueryStatus, VerdictStatus, ZERO32, docCommit, docHash, provenanceHash } from "@mochi/core";
 import type { Address, Hex } from "viem";
 import { normalizeParams, paramsHash, resolveSchema } from "@mochi/schemas";
-import { aad, IntakeUploadPlainSchema, payerCommit, type AttestationDoc, type JurorAttestationDoc, type DispatchReq, type Peer } from "@mochi/protocol";
+import { aad, IntakeUploadPlainSchema, payerCommit, provenanceFromJson, provenanceMatchesBinding, type AttestationDoc, type JurorAttestationDoc, type DispatchReq, type Peer, type ProvenanceJson } from "@mochi/protocol";
 import type { QuoteVerifier, SealedStore, TeeProvider, Envelope } from "@mochi/tee";
 import { IntakeEnclave } from "../../../services/intake/src/intake.ts";
 import type { IntakeChainPort } from "../../../services/intake/src/ports.ts";
@@ -16,6 +16,11 @@ const VERDICTS = `0x${"00".repeat(19)}01` as Address;
 const CHAIN_ID = 31337;
 const QUERY_ID = `0x${"91".repeat(32)}` as Hex;
 const SALT = `0x${"37".repeat(32)}` as Hex;
+/** Fixed open binding of the synthetic query: who would open it and with which queryId nonce. Nothing is opened (there
+ *  is no chain); the intake still signs it into the Provenance grant, as in production. payerCommit comes from the
+ *  payer result key of each run. */
+const OPENER = `0x${"00".repeat(19)}02` as Address;
+const OPEN_NONCE = "1";
 const QUESTION = "What numeric value does the submitted synthetic record report? Return the value as a string.";
 const EVIDENCE = "Synthetic submitted evidence: the recorded value is 42.";
 const PARAMS = Object.freeze({ question: QUESTION, answer_type: "STRING" });
@@ -40,6 +45,8 @@ export const ROUND_REHEARSAL_FIXTURE = Object.freeze({
   chainId: CHAIN_ID,
   verdictsAddress: VERDICTS,
   sourceProvenance: "SUBMITTED" as const,
+  /** The `open` binding sealed with the upload, without payerCommit (= payerCommit(payerResultPubKey)). */
+  open: Object.freeze({ opener: OPENER, isPublic: false, allowPanelDisclosure: false, nonce: OPEN_NONCE }),
 });
 export const ROUND_REHEARSAL_MODEL_OUTPUT = Object.freeze({
   fields: Object.freeze({ answer: "42" }),
@@ -60,7 +67,8 @@ export interface RoundRehearsalOptions {
 export interface RoundRehearsalInput { envelope: Envelope; payerResultPubKey: Hex }
 export interface RoundRehearsalResult {
   fixture: { schemaId: number; schemaVersion: number; queryId: Hex; chainId: number; verdictsAddress: Address; sourceProvenance: "SUBMITTED" };
-  intake: { docCommit: Hex; paramsHash: Hex; provenance: { kind: 0; originId: Hex; fetchedAt: string; tokensK: number; transcriptHash: Hex }; intakeSig: Hex; identity: Address };
+  /** provenance: the full signed EIP-712 grant (15 fields, uint64 members as decimal strings). */
+  intake: { docCommit: Hex; paramsHash: Hex; provenance: ProvenanceJson; intakeSig: Hex; identity: Address };
   attestations: { intake: AttestationDoc; consensus: AttestationDoc; jurors: JurorAttestationDoc[] };
   decision: { verdictId: Hex; verdictInput: unknown; votes: unknown[]; consensusSig: Hex; privateResult: Envelope };
 }
@@ -83,11 +91,14 @@ export function createRoundRehearsal(options: RoundRehearsalOptions) {
   const payerCommitment = (pub: Hex) => payerCommit(pub);
   let committedDoc: Hex | undefined;
   let committedPayer: Hex | undefined;
+  // Query.provenanceHash: the struct hash of the grant the (fixture) query was opened with. Intake releases only the
+  // record stored under it.
+  let committedProvenance: Hex | undefined;
   const getFixtureQuery = () => ({
     status: QueryStatus.SEALED, docCommit: committedDoc!, schemaId: SchemaId.FREEFORM_FACT,
     schemaVersion: 1, paramsHash: PARAMS_HASH, n: 3, round: 0, isPublic: false,
     allowPanelDisclosure: false, payPath: 0, provenanceKind: 0, originId: ZERO32,
-    tokensK: 1, provenanceHash: ZERO32, payerCommit: committedPayer ?? ZERO32,
+    tokensK: 1, provenanceHash: committedProvenance ?? ZERO32, payerCommit: committedPayer ?? ZERO32,
     payer: ZERO_ADDRESS, refundTo: ZERO_ADDRESS, openedAt: 1n, deadline: 0n,
     sealBlock: 0n, seed: ZERO32, paid: 0n, protocolFee: 0n,
   });
@@ -103,7 +114,7 @@ export function createRoundRehearsal(options: RoundRehearsalOptions) {
     async getJuror(key) { const i = jurorAddresses.findIndex(a => a.toLowerCase() === key.toLowerCase()); if (i < 0) throw new Error("unknown fixture juror"); return { jurorClass: [0, 2, 4][i] } as never; },
   };
   const intakeChain: IntakeChainPort = {
-    async getQuery(id) { assertQuery(id); return { status: QueryStatus.SEALED, docCommit: committedDoc!, paramsHash: PARAMS_HASH, schemaId: SchemaId.FREEFORM_FACT, schemaVersion: 1, isPublic: false }; },
+    async getQuery(id) { assertQuery(id); return { status: QueryStatus.SEALED, docCommit: committedDoc!, paramsHash: PARAMS_HASH, schemaId: SchemaId.FREEFORM_FACT, schemaVersion: 1, isPublic: false, allowPanelDisclosure: false, provenanceHash: committedProvenance ?? ZERO32 }; },
     async jurorsOf(id) { assertQuery(id); return jurorAddresses; },
     async isActive(key, role) { return jurorChain.isActive(key as Address, role); },
     async getJuror(key) { return jurorChain.getJuror(key as Address); },
@@ -139,13 +150,20 @@ export function createRoundRehearsal(options: RoundRehearsalOptions) {
     if (!/^0x[0-9a-f]{64}$/.test(input.payerResultPubKey)) { diagnostic("request", "fixture_rejected"); throw new TypeError("invalid payer result public key"); }
     const expectedCommit = docCommit(SALT, docHash(FIXTURE_BYTES));
     const expectedPayerCommit = payerCommitment(input.payerResultPubKey);
+    // The sealed open binding: a private query (salted, payer result key committed), no panel disclosure, fixed opener
+    // and nonce. The intake signs exactly this into the grant.
+    const open = plain.open;
+    if (open.opener !== OPENER || open.isPublic || open.allowPanelDisclosure || open.nonce !== OPEN_NONCE || open.payerCommit !== expectedPayerCommit) { diagnostic("request", "fixture_rejected"); throw new TypeError("open binding does not match the fixed synthetic fixture and payer key"); }
     if (committedDoc && (committedDoc !== expectedCommit || committedPayer !== expectedPayerCommit)) { diagnostic("request", "fixture_already_bound"); throw new TypeError("query fixture is already bound to another document or payer key"); }
     committedDoc = expectedCommit;
     committedPayer = expectedPayerCommit;
     let provenance;
     try { provenance = await intake.intakeUpload(input.envelope); }
     catch { diagnostic("intake", "intake_failed"); throw new Error("intake failed"); }
-    if (provenance.docCommit !== expectedCommit || provenance.paramsHash !== PARAMS_HASH || provenance.provenance.kind !== 0) { diagnostic("intake", "intake_binding_failed"); throw new Error("intake fixture binding failed"); }
+    const grant = provenance.provenance;
+    if (provenance.docCommit !== expectedCommit || provenance.paramsHash !== PARAMS_HASH || grant.kind !== 0 || grant.docCommit !== expectedCommit
+      || grant.paramsHash !== PARAMS_HASH || grant.schemaId !== SchemaId.FREEFORM_FACT || grant.schemaVersion !== 1 || !provenanceMatchesBinding(grant, open)) { diagnostic("intake", "intake_binding_failed"); throw new Error("intake fixture binding failed"); }
+    committedProvenance = provenanceHash(provenanceFromJson(grant));
     let peerDocs;
     let jurorPeers;
     try {
@@ -159,11 +177,14 @@ export function createRoundRehearsal(options: RoundRehearsalOptions) {
     let dispatched;
     try { dispatched = await intake.dispatch({ queryId: QUERY_ID, jurors: jurorPeers, consensus: consensusPeer } as DispatchReq); }
     catch { diagnostic("dispatch", "dispatch_failed"); throw new Error("dispatch failed"); }
-    try { await consensus.openRound({ queryId: QUERY_ID, round: 0, consensusSeed: dispatched.consensusSeed as never, payerResultPubKey: input.payerResultPubKey }); }
+    let opened;
+    try { opened = await consensus.openRound({ queryId: QUERY_ID, round: 0, consensusSeed: dispatched.consensusSeed as never, payerResultPubKey: input.payerResultPubKey }); }
     catch { diagnostic("consensus_open", "consensus_open_failed"); throw new Error("consensus open failed"); }
     await Promise.all(dispatched.jurors.map(async ({ seat, docEnvelope }) => {
       try {
-        const result = await jurors[seat]!.answer({ queryId: QUERY_ID, seat, docEnvelope, consensus: consensusPeer, consensusUrl } as never);
+        // Jurors bound their work by the round's absolute deadline (AnswerReq.round/deadlineMs), as the orchestrator
+        // passes them in production; without it the answer budget is already spent and nothing is delivered.
+        const result = await jurors[seat]!.answer({ queryId: QUERY_ID, seat, docEnvelope, consensus: consensusPeer, consensusUrl, round: opened.round, deadlineMs: opened.deadlineMs });
         if (!result.delivered) { diagnostic("juror_delivery", "answer_not_delivered", seat); throw new Error("juror answer was not delivered to in-process consensus"); }
       } catch (error) {
         if (!(error instanceof Error && error.message === "juror answer was not delivered to in-process consensus")) {
@@ -180,7 +201,7 @@ export function createRoundRehearsal(options: RoundRehearsalOptions) {
     if (decision.public || !decision.privateResult) { diagnostic("consensus_close", "private_result_missing"); throw new Error("private rehearsal result projection failed"); }
     return {
       fixture: { schemaId: SchemaId.FREEFORM_FACT, schemaVersion: 1, queryId: QUERY_ID, chainId: CHAIN_ID, verdictsAddress: VERDICTS, sourceProvenance: "SUBMITTED" },
-      intake: { docCommit: provenance.docCommit as Hex, paramsHash: provenance.paramsHash as Hex, provenance: { kind: 0, originId: provenance.provenance.originId as Hex, fetchedAt: provenance.provenance.fetchedAt, tokensK: provenance.tokensK, transcriptHash: provenance.provenance.transcriptHash as Hex }, intakeSig: provenance.intakeSig as Hex, identity: provenance.intake as Address },
+      intake: { docCommit: provenance.docCommit as Hex, paramsHash: provenance.paramsHash as Hex, provenance: grant, intakeSig: provenance.intakeSig as Hex, identity: provenance.intake as Address },
       attestations: peerDocs,
       decision: { verdictId: decision.verdictId as Hex, verdictInput: decision.verdictInput, votes: decision.votes, consensusSig: decision.consensusSig as Hex, privateResult: decision.privateResult as Envelope },
     };

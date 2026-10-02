@@ -3,8 +3,8 @@ import {LiveClient,validateConfig,formatValue} from '../site/src/live-client.js'
 import {MockTeeProvider,MockQuoteVerifier,signProvenance,seal,open} from '@mochi/tee';
 import {privateKeyToAccount} from 'viem/accounts';
 import {toHex,fromHex,keccak256,zeroHash} from 'viem';
-import {docHash,docCommit,canonicalJson} from '@mochi/core';
-import {aad} from '@mochi/protocol';
+import {docHash,docCommit,canonicalJson,privatePayloadHash} from '@mochi/core';
+import {aad,provenanceFromJson} from '@mochi/protocol';
 const h=(c:string)=>`0x${c.repeat(64)}` as `0x${string}`;
 const a=(c:string)=>`0x${c.repeat(40)}` as `0x${string}`;
 const root=privateKeyToAccount(h('1'));
@@ -24,9 +24,11 @@ async function setup(tamper='') {
      const envelope=JSON.parse(init.body).envelope;plain=JSON.parse(new TextDecoder().decode(tee.decryptEnvelope(envelope,aad.intake())));
      const bytes=Uint8Array.from(atob(plain.docB64),(c:string)=>c.charCodeAt(0));
      const commit=tamper==='document'?h('9'):docCommit(plain.salt,docHash(bytes));
-     const prov={docCommit:commit,kind:0,originId:zeroHash,fetchedAt:BigInt(Math.floor(Date.now()/1000)),tokensK:1,transcriptHash:zeroHash};
-     const sig=await signProvenance(tee.signer(),31337,config.contracts.queryEscrow as any,prov as any);
-     return Response.json({provenance:{...prov,fetchedAt:String(prov.fetchedAt)},docCommit:commit,paramsHash:zeroHash,intake:config.intakeAddress,intakeSig:tamper==='signature'?`0x${'00'.repeat(65)}`:sig,schemaId:plain.schemaId,tokensK:1});
+     // The intake signs the sealed open binding into the grant (tamper: a grant for someone else's wallet/key).
+     const open=tamper==='binding'?{...plain.open,opener:a('d')}:plain.open;
+     const json={docCommit:commit,kind:0,originId:zeroHash,fetchedAt:String(Math.floor(Date.now()/1000)),tokensK:1,transcriptHash:zeroHash,schemaId:plain.schemaId,schemaVersion:1,paramsHash:zeroHash,expiry:String(Math.floor(Date.now()/1000)+900),...open};
+     const sig=await signProvenance(tee.signer(),31337,config.contracts.queryEscrow as any,provenanceFromJson(json as any));
+     return Response.json({provenance:json,docCommit:commit,paramsHash:zeroHash,intake:config.intakeAddress,intakeSig:tamper==='signature'?`0x${'00'.repeat(65)}`:sig,schemaId:plain.schemaId,tokensK:1});
    }
    return Response.json({queryId:h('8'),to:a('9'),data:'0xdeadbeef',quote:{jurorFees:'1',protocolFee:'0'}});
  }});
@@ -38,10 +40,16 @@ test('encrypted browser request is bound to source; payment uses local calldata 
  const {client,sent,plain}=await setup();const result=await client.prepare(input);
  expect(result.displayAmount).toBe('0.021');expect(result.data).not.toBe('0xdeadbeef');expect(result.escrow).toBe(config.contracts.queryEscrow);
  expect(plain().salt).not.toBe(zeroHash);expect(result.secrets.resultPrivateKey).toMatch(/^0x[0-9a-f]{64}$/);
+ // The binding sealed with the document: this wallet opens, private, no panel consent, a fresh nonce.
+ expect(plain().open).toMatchObject({opener:a('6'),isPublic:false,allowPanelDisclosure:false});expect(plain().open.payerCommit).not.toBe(zeroHash);
+ const {decodeFunctionData}=await import('viem');const {QueryEscrowAbi}=await import('../../packages/chain/src/abis.ts');
+ const [params,prov]=decodeFunctionData({abi:QueryEscrowAbi,data:result.data}).args as any[];
+ expect(params).toEqual({n:3,refundTo:a('6')});expect(prov).toMatchObject({opener:a('6'),isPublic:false,nonce:BigInt(plain().open.nonce)});
+ const queryBody=JSON.parse(sent.find(x=>x.path==='/api/v1/query').body);expect(queryBody.isPublic).toBeUndefined();expect(queryBody.sender).toBeUndefined();
  expect(JSON.stringify(sent)).not.toContain('Private source document');expect(JSON.stringify(sent)).not.toContain(result.secrets.resultPrivateKey);
 });
-test('forged document or provenance signatures fail before query preparation',async()=>{
- for(const kind of ['document','signature']){const {client,sent}=await setup(kind);await expect(client.prepare(input)).rejects.toThrow();expect(sent.some(x=>x.path==='/api/v1/query')).toBe(false)}
+test('forged document, provenance signature or grant binding fail before query preparation',async()=>{
+ for(const kind of ['document','signature','binding']){const {client,sent}=await setup(kind);await expect(client.prepare(input)).rejects.toThrow();expect(sent.some(x=>x.path==='/api/v1/query')).toBe(false)}
 });
 test('failed attestation blocks all uploads',async()=>{
  const {client,sent}=await setup();client.verifier={verify:async()=>({ok:false})};await expect(client.prepare(input)).rejects.toThrow('attestation failed');expect(sent.length).toBe(1);
@@ -57,16 +65,19 @@ test('excess allowance is reset and bounded; reverted approval prevents query su
  await expect(client.submit(p)).rejects.toThrow('reverted');expect(txs.length).toBe(1);expect(txs[0].to).toBe(config.contracts.usdg);
  expect(txs[0].data.endsWith('0'.repeat(64))).toBe(true);
 });
-test('private answers decrypt only locally and must match the direct chain commitment',async()=>{
+test('private answers decrypt only locally and must match the direct chain commitments (answerHash, salted payloadHash)',async()=>{
  const {client}=await setup();const p=await client.prepare(input);
  const {x25519}=await import('@noble/curves/ed25519.js');
  const answer=canonicalJson({fields:{ratio:2},salt:p.secrets.salt});
- const v={v:1,verdictId:h('a'),salt:p.secrets.salt,answerJson:answer,payload:'0x',fields:[]};
+ const payload=`0x${'ab'.repeat(96)}` as `0x${string}`;
+ const v={v:1,verdictId:h('a'),salt:p.secrets.salt,answerJson:answer,payload,fields:[]};
  const env=seal(toHex(x25519.getPublicKey(fromHex(p.secrets.resultPrivateKey,'bytes'))),new TextEncoder().encode(JSON.stringify(v)),aad.result(h('a')));
  const item={queryId:h('8'),verdictId:h('a'),packet:{ciphertext:toHex(new TextEncoder().encode(JSON.stringify(env))),chain:{answerHash:h('f')}}};
- client.public.readContract=async()=>({queryId:h('8'),isPublic:false,answerHash:keccak256(toHex(answer))});
+ const salted=privatePayloadHash(p.secrets.salt,payload);
+ client.public.readContract=async()=>({queryId:h('8'),isPublic:false,answerHash:keccak256(toHex(answer)),payloadHash:salted});
  expect((await client.verifyResult(item,p.secrets)).verified).toBe(true);
- client.public.readContract=async()=>({queryId:h('8'),isPublic:false,answerHash:h('f')});await expect(client.verifyResult(item,p.secrets)).rejects.toThrow('on-chain commitment');
+ client.public.readContract=async()=>({queryId:h('8'),isPublic:false,answerHash:h('f'),payloadHash:salted});await expect(client.verifyResult(item,p.secrets)).rejects.toThrow('on-chain commitment');
+ client.public.readContract=async()=>({queryId:h('8'),isPublic:false,answerHash:keccak256(toHex(answer)),payloadHash:keccak256(payload)});await expect(client.verifyResult(item,p.secrets)).rejects.toThrow('Payload does not match');
 });
 test('deployment rejects missing identity and unavailable jury sizes',async()=>{
  expect(()=>validateConfig({...config,intakeMeasurement:zeroHash})).toThrow();const {client}=await setup();await expect(client.prepare({...input,n:9})).rejects.toThrow('not available');

@@ -67,6 +67,7 @@ describe("Anonyma settlement", () => {
     expect(result.statement.floatBalance).toBe("700");
     expect(result.statement.recommendedTopUp).toBe("300");
     const body = f.written.get("1970-01-01.json")!;
+    // nosemgrep: hardcoded-hmac-key -- fixed test secret
     expect(f.written.get("1970-01-01.sig")).toBe(createHmac("sha256", "test-secret").update(body).digest("hex"));
   });
 

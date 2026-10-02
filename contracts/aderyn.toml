@@ -1,0 +1,43 @@
+# Aderyn static analysis (CI: the `aderyn` job in .github/workflows/security.yml; run from contracts/ with `aderyn .`).
+# DO NOT CHANGE: only config version 1 is supported.
+version = 1
+
+# Foundry project root (this directory). Remappings come from foundry.toml.
+root = "."
+
+# First-party sources only. forge-std/OpenZeppelin (lib/), the vendored Privacy Pools code (vendor/) and the
+# npm-resolved dependencies are outside src/ and are not scanned; tests are not under src/.
+src = "src"
+
+# - src/mocks/: test doubles that are never deployed to production.
+# - src/privacy/Imports.sol: an import-only shim that pulls the vendored, unmodified 0xbow Privacy Pools contracts into
+#   the build for their artifacts. Their dependencies resolve from ../node_modules (outside this root), which makes
+#   Aderyn 0.6.8 panic ("content not found"). The shim has no first-party logic; Slither still covers that code path,
+#   and PrivacyPoolShieldedPayments.sol stays in scope here.
+exclude = ["src/mocks/", "src/privacy/Imports.sol"]
+
+# Triage (2026-10). High findings fail CI (scripts/aderyn-gate.ts): each one is fixed, annotated inline with
+# `// aderyn-fp-next-line(<detector>) <reason>` / `// aderyn-ignore-next-line(<detector>) <reason>`, or, only where the
+# code cannot be annotated yet, accepted in aderyn-baseline.json. Low findings are reported, not gated. The Low
+# detectors below are off because every instance was reviewed and they report style or a documented design choice:
+# - push-zero-opcode: the build targets prague and Robinhood Chain (Arbitrum Orbit) supports PUSH0.
+# - literal-instead-of-constant, large-numeric-literal, internal-function-used-once: style only.
+# - centralization-risk: privileged roles are the design; they sit behind the governance timelock (SECURITY.md).
+# - costly-loop, require-revert-in-loop: loops are bounded by the seat count (at most 9) or the 3-member panel, and
+#   reverting the whole call on one bad element is intended.
+# - uninitialized-local-variable, unchecked-return, state-no-address-check: Slither covers the same patterns
+#   (uninitialized-local and unused-return per instance at Medium, gated; missing-zero-check at Low). Aderyn also
+#   flags OpenZeppelin _grantRole's ignored bool, and zero is a meaningful "disabled" value for several setters.
+[detectors]
+exclude = [
+  "push-zero-opcode",
+  "literal-instead-of-constant",
+  "large-numeric-literal",
+  "internal-function-used-once",
+  "centralization-risk",
+  "costly-loop",
+  "require-revert-in-loop",
+  "uninitialized-local-variable",
+  "unchecked-return",
+  "state-no-address-check",
+]

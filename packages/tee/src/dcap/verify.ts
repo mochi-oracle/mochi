@@ -33,6 +33,10 @@ type ChainContext = {
   root: Cert;
   ca: "platform" | "processor";
 };
+/** Quote evidence authenticated without any Intel collateral; `fmspc` comes from the Intel-signed PCK certificate. */
+export interface TdxQuoteEvidence extends ChainContext {
+  fmspc: string;
+}
 type VerifiedChainContext = ChainContext & {
   rootCrl: ReturnType<typeof parseCrl>;
   pckCrl: ReturnType<typeof parseCrl>;
@@ -88,42 +92,63 @@ function verifySignature(signature: string, message: Uint8Array, key: Uint8Array
   }
 }
 
-function checkChain(chain: Cert[], rootDer: Uint8Array, now: number): Cert {
-  if (chain.length !== 3) fail("certificate chain");
-  const root = chain[2]!;
-  if (!equalBytes(root.der, rootDer)) fail("untrusted root");
-  if (!root.ca) fail("certificate CA");
-
-  for (let index = 0; index < chain.length; index++) {
-    const cert = chain[index]!;
-    if (now < cert.notBefore || now > cert.notAfter) fail("certificate validity");
-    if (index === 0 && cert.ca) fail("certificate CA");
-    if (index > 0 && !cert.ca) fail("certificate CA");
-    if (index < 2) {
-      const issuer = chain[index + 1]!;
-      if (!equalBytes(cert.issuerDer, issuer.subjectDer)) fail("certificate issuer");
-      if (!verifyCertSignature(cert, issuer.publicKey)) fail("certificate signature");
-    }
+/**
+ * Clock-independent checks of the quote's PCK chain (PCK leaf, Intel platform/processor CA, root) against the pinned
+ * Intel root: shape, CA flags, issuer linkage and every signature. Certificate validity windows are checked separately
+ * and last, so a chain that is forged and also out of date is still reported as forged.
+ */
+function checkPckChainSignatures(chain: Cert[], rootDer: Uint8Array): [Cert, Cert, Cert] {
+  if (chain.length !== 3) fail("PCK chain");
+  const [pck, intermediate, root] = chain as [Cert, Cert, Cert];
+  if (!equalBytes(root.der, rootDer)) fail("PCK untrusted root");
+  if (pck.ca || !intermediate.ca || !root.ca) fail("PCK certificate CA");
+  if (!equalBytes(pck.issuerDer, intermediate.subjectDer) || !equalBytes(intermediate.issuerDer, root.subjectDer)) {
+    fail("PCK certificate issuer");
   }
-  if (!verifyCertSignature(root, root.publicKey)) fail("root signature");
-  return chain[0]!;
+  if (!verifyCertSignature(pck, intermediate.publicKey) || !verifyCertSignature(intermediate, root.publicKey)) {
+    fail("PCK certificate signature");
+  }
+  if (!verifyCertSignature(root, root.publicKey)) fail("PCK root signature");
+  return [pck, intermediate, root];
 }
 
-function verifyQuoteChain(rawQuote: Uint8Array, now: number, rootDer: Uint8Array): ChainContext {
-  const quote = parseTdxQuote(rawQuote);
-  const chain = pemChain(quote.pckPem);
-  const pck = checkChain(chain, rootDer, now);
-  const intermediate = chain[1]!;
-  const root = chain[2]!;
-  const sgx = pck.sgx;
-  if (!sgx || pck.ca) fail("PCK extension");
+/**
+ * Authenticate everything in a TDX quote that needs no Intel collateral, in this order: the PCK chain to the pinned
+ * Intel root, the PCK SGX extension and CA name, the QE report signature by the PCK key, the QE report data binding of
+ * the attestation key, the quote signature by that key and, last, the PCK chain validity windows.
+ *
+ * Every failure except "PCK certificate validity" (clock-dependent) and quote parse errors is positive evidence that
+ * the quote is not what a genuine Intel QE produced: the chain, the CA and the signatures are fixed by Intel. Callers
+ * run this before fetching collateral, so the FMSPC used to fetch it is Intel-signed rather than attacker-chosen.
+ */
+export function verifyTdxQuoteEvidence(
+  rawQuote: Uint8Array,
+  now: number,
+  options: { trustedRootDer?: Uint8Array } = {},
+): TdxQuoteEvidence {
+  try {
+    const rootDer = options.trustedRootDer ?? INTEL_SGX_ROOT_CA_DER;
+    const quote = parseTdxQuote(rawQuote);
+    const chain = pemChain(quote.pckPem);
+    const [pck, intermediate, root] = checkPckChainSignatures(chain, rootDer);
+    const sgx = pck.sgx;
+    if (!sgx) return fail("PCK extension");
 
-  let ca: "platform" | "processor";
-  if (intermediate.subjectCN === "Intel SGX PCK Platform CA") ca = "platform";
-  else if (intermediate.subjectCN === "Intel SGX PCK Processor CA") ca = "processor";
-  else return fail("PCK CA");
+    let ca: "platform" | "processor";
+    if (intermediate.subjectCN === "Intel SGX PCK Platform CA") ca = "platform";
+    else if (intermediate.subjectCN === "Intel SGX PCK Processor CA") ca = "processor";
+    else return fail("PCK CA");
 
-  return { quote, pck, intermediate, root, ca };
+    const context: ChainContext = { quote, pck, intermediate, root, ca };
+    // Intel authenticates the QE report with the PCK key and binds its report data to the quote key and auth data.
+    verifyQeReportSignature(context);
+    verifyQuoteSignature(context);
+    for (const cert of chain) if (now < cert.notBefore || now > cert.notAfter) fail("PCK certificate validity");
+    return { ...context, fmspc: hex(sgx.fmspc) };
+  } catch (error) {
+    if (error instanceof DcapError) throw error;
+    throw new DcapError(error instanceof Error ? error.message : "invalid quote");
+  }
 }
 
 function verifyCrls(
@@ -131,10 +156,11 @@ function verifyCrls(
   context: ChainContext,
   now: number,
   rootDer: Uint8Array,
+  graceSec: number,
 ): VerifiedChainContext {
   const { root, intermediate, pck } = context;
   const rootCrl = parseCrl(hexToBytes(`0x${collateral.root_ca_crl}`));
-  if (!verifyCrl(rootCrl, root, now)) fail("root CRL");
+  if (!verifyCrl(rootCrl, root, now, graceSec)) fail("root CRL");
   assertSerialNotRevoked(intermediate.serial, rootCrl, "intermediate revoked");
 
   const pckIssuer = pemChain(collateral.pck_crl_issuer_chain);
@@ -143,7 +169,7 @@ function verifyCrls(
   if (!equalBytes(pckIssuer[1]!.der, rootDer)) fail("untrusted root");
   checkTwoCertChain(pckIssuer, rootDer, now);
   const pckCrl = parseCrl(hexToBytes(`0x${collateral.pck_crl}`));
-  if (!verifyCrl(pckCrl, intermediate, now)) fail("PCK CRL");
+  if (!verifyCrl(pckCrl, intermediate, now, graceSec)) fail("PCK CRL");
   assertSerialNotRevoked(pck.serial, pckCrl, "PCK revoked");
 
   return { ...context, rootCrl, pckCrl };
@@ -163,7 +189,7 @@ function checkTwoCertChain(chain: Cert[], rootDer: Uint8Array, now: number, leaf
   return leaf;
 }
 
-function verifyTcbInfo(collateral: TdxCollateral, context: VerifiedChainContext, now: number): JsonObject {
+function verifyTcbInfo(collateral: TdxCollateral, context: VerifiedChainContext, now: number, graceSec: number): JsonObject {
   const chain = pemChain(collateral.tcb_info_issuer_chain);
   if (chain.length !== 2) fail("TCB signer chain");
   const signer = chain[0]!;
@@ -172,7 +198,7 @@ function verifyTcbInfo(collateral: TdxCollateral, context: VerifiedChainContext,
   assertSerialNotRevoked(leaf.serial, context.rootCrl, "TCB signer revoked");
   const tcb = parseSignedObject(collateral.tcb_info, collateral.tcb_info_signature, leaf.publicKey, "TCB signature");
   if (tcb.id !== "TDX" || tcb.version !== 3) fail("TCB schema");
-  if (date(tcb.issueDate) > now || date(tcb.nextUpdate) < now) fail("TCB validity");
+  if (date(tcb.issueDate) > now || date(tcb.nextUpdate) + graceSec < now) fail("TCB validity");
   const sgx = context.pck.sgx!;
   if (hex(sgx.fmspc) !== String(tcb.fmspc).toUpperCase() || hex(sgx.pceId) !== String(tcb.pceId).toUpperCase()) {
     fail("FMSPC mismatch");
@@ -180,7 +206,7 @@ function verifyTcbInfo(collateral: TdxCollateral, context: VerifiedChainContext,
   return tcb;
 }
 
-function verifyQeIdentity(collateral: TdxCollateral, context: VerifiedChainContext, now: number): JsonObject {
+function verifyQeIdentity(collateral: TdxCollateral, context: VerifiedChainContext, now: number, graceSec: number): JsonObject {
   const chain = pemChain(collateral.qe_identity_issuer_chain);
   if (chain.length !== 2) fail("QE signer chain");
   const signer = chain[0]!;
@@ -194,7 +220,7 @@ function verifyQeIdentity(collateral: TdxCollateral, context: VerifiedChainConte
     "QE identity signature",
   );
   if (qe.id !== "TD_QE" || qe.version !== 2) fail("QE schema");
-  if (date(qe.issueDate) > now || date(qe.nextUpdate) < now) fail("QE validity");
+  if (date(qe.issueDate) > now || date(qe.nextUpdate) + graceSec < now) fail("QE validity");
   return qe;
 }
 
@@ -204,11 +230,19 @@ function verifyQuoteSignature(context: ChainContext): void {
   if (!p256.verify(quote.signature, quote.signed, publicKey, { lowS: false, prehash: true })) fail("quote signature");
 }
 
-function verifyQeReport(
-  quote: TdxQuote,
-  qe: JsonObject,
-  pck: Cert,
-): { isvSvn: number; mrSigner: Uint8Array; status: Level } {
+function verifyQeReportSignature(context: ChainContext): void {
+  const { quote, pck } = context;
+  const report = quote.qeReport;
+  if (!p256.verify(quote.qeSignature, report, pck.publicKey, { lowS: false, prehash: true })) {
+    fail("QE report signature");
+  }
+  const bound = sha256(Uint8Array.from([...quote.attestationKey, ...quote.qeAuthData]));
+  if (!equalBytes(bound, report.slice(320, 352)) || report.slice(352).some((byte) => byte !== 0)) {
+    fail("QE report data");
+  }
+}
+
+function verifyQeIdentityMatch(quote: TdxQuote, qe: JsonObject): { isvSvn: number; mrSigner: Uint8Array; status: Level } {
   const report = quote.qeReport;
   const view = new DataView(report.buffer, report.byteOffset, report.byteLength);
   const qeIsvSvn = view.getUint16(258, true);
@@ -225,13 +259,6 @@ function verifyQeReport(
   if (attributeMask.length !== 16 || expectedAttributes.length !== 16) fail("QE identity malformed");
   for (let index = 0; index < 16; index++) {
     if ((attributes[index]! & attributeMask[index]!) !== expectedAttributes[index]) fail("QE identity mismatch");
-  }
-  if (!p256.verify(quote.qeSignature, report, pck.publicKey, { lowS: false, prehash: true })) {
-    fail("QE report signature");
-  }
-  const bound = sha256(Uint8Array.from([...quote.attestationKey, ...quote.qeAuthData]));
-  if (!equalBytes(bound, report.slice(320, 352)) || report.slice(352).some((byte) => byte !== 0)) {
-    fail("QE report data");
   }
 
   const levels = objectArray(qe.tcbLevels, "QE TCB malformed");
@@ -370,24 +397,27 @@ function parseU32Hex(value: unknown): number {
   return Number.parseInt(value, 16) >>> 0;
 }
 
-/** Verify the quote chain, collateral signatures, QE evidence, and Intel TCB levels. */
+/**
+ * Verify the quote evidence, collateral signatures, QE identity and Intel TCB levels. `collateralGraceSec` (default 0)
+ * accepts TCB info, QE identity and CRLs up to that long past their nextUpdate; only a collateral source serving a cached
+ * copy through a PCS outage sets it (see PcsCollateralSource and staleCollateralGraceSec).
+ */
 export function verifyTdxQuote(
   rawQuote: Uint8Array,
   collateral: TdxCollateral,
   now: number,
-  options: { trustedRootDer?: Uint8Array } = {},
+  options: { trustedRootDer?: Uint8Array; collateralGraceSec?: number } = {},
 ): TdxVerification {
   try {
     const rootDer = options.trustedRootDer ?? INTEL_SGX_ROOT_CA_DER;
-    // Intel's quote verification starts by authenticating the quote PCK chain and revocation lists.
-    const quoteContext = verifyQuoteChain(rawQuote, now, rootDer);
-    const context = verifyCrls(collateral, quoteContext, now, rootDer);
+    const graceSec = Number.isFinite(options.collateralGraceSec) ? Math.max(0, options.collateralGraceSec!) : 0;
+    // Intel's quote verification starts by authenticating the PCK chain, the QE report and the quote signature.
+    const evidence = verifyTdxQuoteEvidence(rawQuote, now, { trustedRootDer: rootDer });
+    const context = verifyCrls(collateral, evidence, now, rootDer, graceSec);
     // Intel's TCB info and QE identity signatures cover their complete supplied body text.
-    const tcb = verifyTcbInfo(collateral, context, now);
-    const qeIdentity = verifyQeIdentity(collateral, context, now);
-    // Intel authenticates the QE report and binds its report data to the quote key and auth data.
-    const qe = verifyQeReport(context.quote, qeIdentity, context.pck);
-    verifyQuoteSignature(context);
+    const tcb = verifyTcbInfo(collateral, context, now, graceSec);
+    const qeIdentity = verifyQeIdentity(collateral, context, now, graceSec);
+    const qe = verifyQeIdentityMatch(context.quote, qeIdentity);
     // Intel platform TCB levels compare every component SVN and PCESVN against the PCK values.
     const platform = verifyPlatformTcb(tcb, context);
     // Intel TDX module identity can add a separate status when module SVN2 is nonzero.
@@ -397,7 +427,7 @@ export function verifyTdxQuote(
     return {
       status: merged.status,
       advisoryIds: merged.advisoryIds,
-      fmspc: hex(context.pck.sgx!.fmspc),
+      fmspc: evidence.fmspc,
       ca: context.ca,
       quoteVersion: context.quote.version,
       td: context.quote.td,

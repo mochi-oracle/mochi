@@ -3,12 +3,13 @@ import { mkdir, open, readFile } from "node:fs/promises";
 import { resolve, join } from "node:path";
 import { quoteVerifierFromEnv, type Env } from "@mochi/tee";
 import { isAddress, bytesToHex, hexToBytes, type Address, type Hex } from "viem";
-import { verifyAciReport, type AciReport, type DcapResult } from "@mochi/aci";
+import { parseAciPolicy, verifyAciReport, type AciReport, type DcapResult, type EstablishedAciReport } from "@mochi/aci";
 import { phalaDcap } from "../services/juror/src/phala-dcap.ts";
 import { PRODUCTION_IDENTITY_SPECS, PRODUCTION_SERVICE_SPECS, PRODUCTION_RECEIPT_SIGNING_SPEC } from "../deploy/phala/production-identities/identities.ts";
-import { PRODUCTION_PORTS, type ProductionLaunchConfig } from "../deploy/production/runtime.ts";
+import { DEFAULT_TDX_ALLOWED_TCB_STATUSES, PRODUCTION_PORTS, type ProductionLaunchConfig } from "../deploy/production/runtime.ts";
 import { verifyProductionIdentityReport, type ProductionIdentitySummary } from "./verify-production-identities.ts";
 import { deploymentMinJurorBond, productionChainId, productionTimelockDelay } from "../deploy/production/chain-policy.ts";
+import { recordedPanelEscalation } from "./panel-escalation.ts";
 
 const ZERO32 = `0x${"00".repeat(32)}` as Hex;
 const CLASS_COUNTS = [2, 2, 2, 1, 2] as const;
@@ -45,6 +46,16 @@ export type PreparedProductionLaunch = {
   salt: Hex;
 };
 
+/**
+ * Juror ACI pinning policy (PHALA_ACI_ALLOWED_WORKLOADS): the attested OS measurement of the quoted TD and, when the
+ * report carries event-log evidence, the dstack compose hash. The report's workload_id is not covered by the quote,
+ * so it is not used as an identity. If the provider serves from several VM shapes, add each observed os: pin.
+ */
+export function aciWorkloadPolicy(established: Pick<EstablishedAciReport, "osMeasurement" | "composeHash">): string {
+  if (!established.osMeasurement) throw new Error("ACI report did not expose the TD registers needed to pin the workload");
+  return [`os:${established.osMeasurement}`, ...(established.composeHash ? [`compose:${established.composeHash}`] : [])].join(",");
+}
+
 /** Public, no-auth, no-inference ACI report discovery. The workload is accepted only after nonce/DCAP checks. */
 export async function discoverPhalaAciWorkload(options: {
   baseUrl?: string;
@@ -66,13 +77,15 @@ export async function discoverPhalaAciWorkload(options: {
   if (!report || typeof report !== "object") throw new Error("ACI report is missing");
   const established = await verifyAciReport(report, {
     nonce,
+    // Discovery verifies an unpinned report in order to derive the pin the jurors will then require.
+    allowUnpinned: true,
     dcap: options.dcap ?? phalaDcap,
     ...(options.now ? { now: options.now() } : {}),
   });
   if (typeof established.workloadId !== "string" || !established.workloadId.trim()
     || (report.workload_id !== undefined && established.workloadId !== report.workload_id)
     || established.tcbStatus !== "UpToDate") throw new Error("ACI workload report is not fresh and up to date");
-  return established.workloadId;
+  return aciWorkloadPolicy(established);
 }
 
 async function readBoundedJson(response: Response, maxBytes: number): Promise<unknown> {
@@ -103,6 +116,8 @@ export function prepareProductionLaunch(options: {
   outputDirectory: string;
   now?: () => number;
   randomSalt?: () => Hex;
+  /** Re-preparation after a governed switch-on; launch itself requires panel escalation off. */
+  allowPanelEscalationOn?: boolean;
 }): PreparedProductionLaunch {
   const now = options.now ?? (() => Math.floor(Date.now() / 1000));
   const verifiedAt = options.verified?.summary?.locallyVerifiedAt;
@@ -123,7 +138,7 @@ export function prepareProductionLaunch(options: {
     throw new Error("verified identity report is incomplete");
   }
   const operator = requireAddress(options.operator, "--operator");
-  const deployment = validateDeployment(options.deployment);
+  const deployment = validateDeployment(options.deployment, options.allowPanelEscalationOn === true);
   const identityRows = report.identities;
   for (let index = 0; index < PRODUCTION_IDENTITY_SPECS.length; index += 1) {
     const spec = PRODUCTION_IDENTITY_SPECS[index]!;
@@ -203,6 +218,8 @@ export function prepareProductionLaunch(options: {
     },
     aciApiKeyEnv: "PHALA_API_KEY",
     attestorAdminTokenEnv: "MOCHI_PRODUCTION_ATTESTOR_ADMIN_TOKEN",
+    // Explicit strict Intel TCB policy; widening it is a reviewed launch decision (see ProductionLaunchConfig).
+    tdxAllowedTcbStatuses: [...DEFAULT_TDX_ALLOWED_TCB_STATUSES],
   };
   const roles = {
     owner: deployment.owner,
@@ -244,12 +261,13 @@ export function prepareProductionLaunch(options: {
     intakeAddress: intake.address,
     intakeMeasurement: intake.measurement,
     receiptPublicKey,
-    jurySizes: [3, 5, 7, 9],
+    // Launch checkout offers the default N3 jury only; larger juries are a later governance/website decision.
+    jurySizes: [3],
   };
   return { runtime, identities: identityInput, releaseInput, website, salt };
 }
 
-function validateDeployment(value: Deployment): Deployment {
+function validateDeployment(value: Deployment, allowPanelEscalationOn = false): Deployment {
   if (!value) throw new Error("deployment must be chain 4663 with external MOCHI CA");
   productionChainId(value);
   const rpc = new URL(value.rpcUrl);
@@ -259,6 +277,11 @@ function validateDeployment(value: Deployment): Deployment {
   const required = ["mochiToken", "usdg", "queryEscrow", "jurorRegistry", "verdicts", "receiptAnchor", "panel", "timelock"];
   for (const name of required) requireAddress(value.contracts?.[name], `deployment.contracts.${name}`);
   requireAddress(value.privacy?.entrypoint, "deployment.privacy.entrypoint");
+  // No panel evaluators exist at launch: an escalated query could never be drawn and would hold its fee.
+  // Deployments without a recorded mode predate the option and were wired with the panel on.
+  const panelEscalation = recordedPanelEscalation(value);
+  if (panelEscalation === undefined) throw new Error("deployment does not record panelEscalation; launch requires a deployment made with --panel-escalation off");
+  if (panelEscalation === "on" && !allowPanelEscalationOn) throw new Error("launch requires a deployment made with --panel-escalation off; switch the panel on later through scripts/panel-escalation.ts switch-on (re-preparing after a governed switch-on needs --allow-panel-escalation-on)");
   return {
     chainId: value.chainId,
     rpcUrl: value.rpcUrl,
@@ -278,6 +301,7 @@ function validateDeployment(value: Deployment): Deployment {
     ...(value.rehearsal === true ? { rehearsal: true } : {}),
     ...(value.timelockDelay !== undefined ? { timelockDelay: String(value.timelockDelay) } : {}),
     ...(value.minJurorBond !== undefined ? { minJurorBond: deploymentMinJurorBond(value).toString() } : {}),
+    panelEscalation,
   };
 }
 
@@ -295,9 +319,12 @@ function requireBytes32(value: unknown, field: string): Hex {
 }
 function requireWorkload(workloads: Record<string, string>, name: string): string {
   const workload = workloads?.[name];
-  if (typeof workload !== "string" || !workload.trim() || workload.length > 256) {
+  if (typeof workload !== "string" || !workload.trim() || workload.length > 1024) {
     throw new Error(`a reviewed Phala ACI workload ID is required for ${name}`);
   }
+  let pinned = false;
+  try { const policy = parseAciPolicy(workload.split(",")); pinned = policy.osMeasurements.length + policy.composeHashes.length > 0; } catch { /* reported below */ }
+  if (!pinned) throw new Error(`the Phala ACI workload policy for ${name} needs an attested os: or compose: pin; a workload ID alone is not attested`);
   return workload.trim();
 }
 
@@ -320,8 +347,10 @@ export async function writeProductionLaunch(outputDirectory: string, prepared: P
 
 function parseArgs(argv: string[]) {
   const values = new Map<string, string>();
+  let allowPanelEscalationOn = false;
   for (let i = 0; i < argv.length; i += 1) {
     const arg = argv[i]!;
+    if (arg === "--allow-panel-escalation-on") { allowPanelEscalationOn = true; continue; }
     if (!["--report", "--deployment", "--operator", "--measurement", "--workloads", "--aci-base-url", "--out-dir"].includes(arg) || values.has(arg)) throw new Error("usage: bun scripts/prepare-production-launch.ts --report verified-report.json --deployment deployments/mainnet.json --operator 0x... --measurement 0x<64 hex> [--workloads juror-workloads.json | --aci-base-url https://inference.phala.com/v1] --out-dir <new-directory>");
     const value = argv[++i];
     if (!value || value.startsWith("--")) throw new Error(`missing value for ${arg}`);
@@ -335,6 +364,7 @@ function parseArgs(argv: string[]) {
     ...(values.has("--workloads") ? { workloadsPath: values.get("--workloads")! } : {}),
     ...(values.has("--aci-base-url") ? { aciBaseUrl: values.get("--aci-base-url")! } : {}),
     outputDirectory: values.get("--out-dir")!,
+    allowPanelEscalationOn,
   };
 }
 
@@ -354,6 +384,7 @@ async function main(): Promise<void> {
       : Object.fromEntries(PRODUCTION_IDENTITY_SPECS.filter((identity) => identity.role === "juror").map((identity) => [identity.name, workloadId!]));
     const prepared = prepareProductionLaunch({
       verified: checked, deployment, operator: args.operator, workloads, deploymentPath: args.deploymentPath, outputDirectory: args.outputDirectory,
+      allowPanelEscalationOn: args.allowPanelEscalationOn,
     });
     const paths = await writeProductionLaunch(args.outputDirectory, prepared);
     process.stdout.write(`${JSON.stringify({ status: "prepared", salt: prepared.salt, files: paths })}\n`);

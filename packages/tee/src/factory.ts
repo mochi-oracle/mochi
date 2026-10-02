@@ -1,6 +1,8 @@
+import { resolve } from "node:path";
 import type { Address, Hex, LocalAccount } from "viem";
 import { parseTdxQuote } from "./dcap/quote.ts";
-import { PcsCollateralSource } from "./dcap/pcs.ts";
+import { PcsCollateralSource, sharedPcsCollateralSource } from "./dcap/pcs.ts";
+import type { CollateralSource } from "./dcap/collateral.ts";
 import { dstackConfigMeasurement, tdxMeasurement, type MeasurementScheme } from "./tdx-common.ts";
 import { TdxTeeProvider, type QuoteSource, type TsmPort } from "./tdx-provider.ts";
 import { DstackKeySource, DstackQuoteSource } from "./dstack.ts";
@@ -29,19 +31,19 @@ function measurementSchemeFromEnv(env: Env, mode: string): MeasurementScheme | u
   throw new Error("TEE_MEASUREMENT supports dstack-config-v1 only when TEE_MODE=dstack");
 }
 
-/** QUOTE_VERIFIER = "mock" (default) | "dcap". */
-export function quoteVerifierFromEnv(
-  env: Env,
-  mock?: { rootAddress?: Address },
-  deps?: { fetch?: typeof fetch; now?: () => number },
-): QuoteVerifier {
-  const mode = env.QUOTE_VERIFIER ?? "mock";
-  if (mode === "mock") {
-    if (!mock?.rootAddress) throw new Error("mock root address is required when QUOTE_VERIFIER=mock");
-    return new MockQuoteVerifier({ mockRootAddress: mock.rootAddress });
-  }
-  if (mode !== "dcap") throw new Error(`unsupported QUOTE_VERIFIER=${mode}; expected mock or dcap`);
-
+/**
+ * Intel TDX acceptance policy, from the existing settings TDX_ALLOWED_TCB_STATUSES (default "UpToDate"),
+ * TDX_REJECT_ADVISORIES (default none) and TDX_ALLOW_DEBUG (default "0"). One policy serves both DCAP paths: MOCHI's
+ * own enclave quotes (attestor, consensus, juror) and the Phala ACI gateway quotes that jurors verify.
+ *
+ * Trade-off: the strict default accepts only platforms Intel rates UpToDate. At each Intel TCB recovery, PCS rates every
+ * platform that has not yet installed the new microcode or TDX module OutOfDate (or SWHardeningNeeded) until the
+ * provider patches it, so the attestor lets every MOCHI attestation lapse and jurors refuse the ACI gateway: a full
+ * outage, by design, rather than trusting a platform with a published, unpatched vulnerability. Allowing more statuses
+ * keeps the service up through such a window at the cost of accepting those platforms; pair it with
+ * TDX_REJECT_ADVISORIES for advisories that matter to MOCHI. "Revoked" is never accepted.
+ */
+export function tdxPolicyFromEnv(env: Env): { allowedStatuses: string[]; rejectAdvisories: string[]; allowDebug: boolean } {
   const allowedStatuses = parseCsv(env.TDX_ALLOWED_TCB_STATUSES ?? "UpToDate", "TDX_ALLOWED_TCB_STATUSES");
   for (const status of allowedStatuses) {
     if (!(TCB_STATUSES as readonly string[]).includes(status)) {
@@ -54,17 +56,49 @@ export function quoteVerifierFromEnv(
   if (debug !== undefined && debug !== "0" && debug !== "1") {
     throw new Error('TDX_ALLOW_DEBUG must be "0" or "1"');
   }
+  return { allowedStatuses, rejectAdvisories, allowDebug: debug === "1" };
+}
+
+/**
+ * Where the PCS collateral cache persists: `dcap-collateral` beside the service's SEALED_STORE_DIR, so every service on
+ * the host (each with its own sealed store under one state directory) shares one cache. The files hold only public,
+ * Intel-signed collateral, which is re-verified on every use. Without SEALED_STORE_DIR the cache is in memory only.
+ */
+export function collateralCacheDirFromEnv(env: Env): string | undefined {
+  const sealed = env.SEALED_STORE_DIR?.trim();
+  return sealed ? resolve(sealed, "..", "dcap-collateral") : undefined;
+}
+
+/** The process-wide PCS collateral source for this environment (see sharedPcsCollateralSource). */
+export function collateralSourceFromEnv(env: Env): PcsCollateralSource {
+  return sharedPcsCollateralSource({ baseUrl: env.PCS_BASE_URL, rootCaCrlUrl: env.PCS_ROOT_CA_CRL_URL, cacheDir: collateralCacheDirFromEnv(env) });
+}
+
+/**
+ * QUOTE_VERIFIER = "dcap" | "mock", required. There is no default: a service that forgets the setting must fail to
+ * start rather than silently accept mock quotes that any key holder can forge. "mock" is for local development only.
+ * DCAP verifiers share the process-wide, persisted PCS collateral cache unless a test injects `fetch`, `now` or
+ * `collateral`.
+ */
+export function quoteVerifierFromEnv(
+  env: Env,
+  mock?: { rootAddress?: Address },
+  deps?: { fetch?: typeof fetch; now?: () => number; collateral?: CollateralSource },
+): QuoteVerifier {
+  const mode = env.QUOTE_VERIFIER;
+  if (mode === undefined || mode.trim() === "") throw new Error("QUOTE_VERIFIER must be set explicitly: dcap (or mock for local development only)");
+  if (mode === "mock") {
+    if (!mock?.rootAddress) throw new Error("mock root address is required when QUOTE_VERIFIER=mock");
+    return new MockQuoteVerifier({ mockRootAddress: mock.rootAddress });
+  }
+  if (mode !== "dcap") throw new Error(`unsupported QUOTE_VERIFIER=${mode}; expected mock or dcap`);
+
+  const policy = tdxPolicyFromEnv(env);
   const now = deps?.now;
-  return new DcapQuoteVerifier({
-    collateral: new PcsCollateralSource({
-      baseUrl: env.PCS_BASE_URL,
-      rootCaCrlUrl: env.PCS_ROOT_CA_CRL_URL,
-      fetch: deps?.fetch,
-      now,
-    }),
-    now,
-    policy: { allowedStatuses, rejectAdvisories, allowDebug: debug === "1" },
-  });
+  const collateral = deps?.collateral ?? (deps?.fetch || now
+    ? new PcsCollateralSource({ baseUrl: env.PCS_BASE_URL, rootCaCrlUrl: env.PCS_ROOT_CA_CRL_URL, fetch: deps?.fetch, now })
+    : collateralSourceFromEnv(env));
+  return new DcapQuoteVerifier({ collateral, now, policy });
 }
 
 /** TEE_MODE = "mock" (default) | "tdx" (configfs-tsm) | "dstack" (dstack guest agent, e.g. Phala Cloud CVMs). */

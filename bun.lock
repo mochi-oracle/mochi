@@ -36,7 +36,7 @@
       },
       "devDependencies": {
         "@types/node": "26.6.3",
-        "bun-types": "1.4.2",
+        "bun-types": "1.3.14",
         "drizzle-kit": "0.31.11",
         "fast-check": "4.10.2",
         "typescript": "7.0.2",
@@ -68,7 +68,7 @@
       "name": "@mochi/core",
       "version": "0.1.0",
       "dependencies": {
-        "viem": "*",
+        "viem": "2.56.9",
       },
     },
     "packages/db": {
@@ -85,7 +85,7 @@
         "@zk-kit/lean-imt": "2.2.2",
         "poseidon-lite": "0.3.0",
         "snarkjs": "0.7.6",
-        "viem": "*",
+        "viem": "2.56.9",
       },
     },
     "packages/protocol": {
@@ -275,48 +275,6 @@
   "packages": {
     "@adraffy/ens-normalize": ["@adraffy/ens-normalize@1.11.1", "", {}, "sha512-nhCBV3quEgesuf7c7KYfperqSS14T8bYuvJ8PcLJp6znkZpFc0AuW4qBtr8eKVyPPe/8RSr7sglCWPU5eaxwKQ=="],
 
-    "@mochi/aci": ["@mochi/aci@workspace:packages/aci"],
-
-    "@mochi/chain": ["@mochi/chain@workspace:packages/chain"],
-
-    "@mochi/consensus": ["@mochi/consensus@workspace:packages/consensus"],
-
-    "@mochi/core": ["@mochi/core@workspace:packages/core"],
-
-    "@mochi/db": ["@mochi/db@workspace:packages/db"],
-
-    "@mochi/privacy": ["@mochi/privacy@workspace:packages/privacy"],
-
-    "@mochi/protocol": ["@mochi/protocol@workspace:packages/protocol"],
-
-    "@mochi/receipts": ["@mochi/receipts@workspace:packages/receipts"],
-
-    "@mochi/schemas": ["@mochi/schemas@workspace:packages/schemas"],
-
-    "@mochi/sdk": ["@mochi/sdk@workspace:packages/sdk"],
-
-    "@mochi/svc-anonyma-settle": ["@mochi/svc-anonyma-settle@workspace:services/anonyma-settle"],
-
-    "@mochi/svc-attestor": ["@mochi/svc-attestor@workspace:services/attestor"],
-
-    "@mochi/svc-consensus": ["@mochi/svc-consensus@workspace:services/consensus"],
-
-    "@mochi/svc-feed-runners": ["@mochi/svc-feed-runners@workspace:services/feed-runners"],
-
-    "@mochi/svc-gateway": ["@mochi/svc-gateway@workspace:services/gateway"],
-
-    "@mochi/svc-indexer": ["@mochi/svc-indexer@workspace:services/indexer"],
-
-    "@mochi/svc-intake": ["@mochi/svc-intake@workspace:services/intake"],
-
-    "@mochi/svc-juror": ["@mochi/svc-juror@workspace:services/juror"],
-
-    "@mochi/svc-orchestrator": ["@mochi/svc-orchestrator@workspace:services/orchestrator"],
-
-    "@mochi/svc-panel-desk": ["@mochi/svc-panel-desk@workspace:services/panel-desk"],
-
-    "@mochi/tee": ["@mochi/tee@workspace:packages/tee"],
-
     "@drizzle-team/brocli": ["@drizzle-team/brocli@0.10.2", "", {}, "sha512-z33Il7l5dKjUgGULTqBsQBQwckHh5AbIuxhdsIxDDiZAzBOrZO6q9ogcWC65kU382AfynTfgNumVcNIjuIua6w=="],
 
     "@esbuild-kit/core-utils": ["@esbuild-kit/core-utils@3.3.2", "", { "dependencies": { "esbuild": "~0.18.20", "source-map-support": "^0.5.21" } }, "sha512-sPRAnw9CdSsRmEtnsl2WXWdyquogVpB3yZ3dgwJfe8zrOzTsV7cJvmwrKVa+0ma5BoiGJ+BoqkMvawbayKUsqQ=="],
@@ -380,6 +338,48 @@
     "@iden3/binfileutils": ["@iden3/binfileutils@0.0.12", "", { "dependencies": { "fastfile": "0.0.20", "ffjavascript": "^0.3.0" } }, "sha512-naAmzuDufRIcoNfQ1d99d7hGHufLA3wZSibtr4dMe6ZeiOPV1KwOZWTJ1YVz4HbaWlpDuzVU72dS4ATQS4PXBQ=="],
 
     "@ioredis/commands": ["@ioredis/commands@2.0.0", "", {}, "sha512-vrx0AE/T0h7cRZwfo1M39Cr+ZhZrkf0V8mQN75wucKCxCLD9l/VX6no3gFvrLqD1IlG/1LtzWovqEw3t0Vr9zg=="],
+
+    "@mochi/aci": ["@mochi/aci@workspace:packages/aci"],
+
+    "@mochi/chain": ["@mochi/chain@workspace:packages/chain"],
+
+    "@mochi/consensus": ["@mochi/consensus@workspace:packages/consensus"],
+
+    "@mochi/core": ["@mochi/core@workspace:packages/core"],
+
+    "@mochi/db": ["@mochi/db@workspace:packages/db"],
+
+    "@mochi/privacy": ["@mochi/privacy@workspace:packages/privacy"],
+
+    "@mochi/protocol": ["@mochi/protocol@workspace:packages/protocol"],
+
+    "@mochi/receipts": ["@mochi/receipts@workspace:packages/receipts"],
+
+    "@mochi/schemas": ["@mochi/schemas@workspace:packages/schemas"],
+
+    "@mochi/sdk": ["@mochi/sdk@workspace:packages/sdk"],
+
+    "@mochi/svc-anonyma-settle": ["@mochi/svc-anonyma-settle@workspace:services/anonyma-settle"],
+
+    "@mochi/svc-attestor": ["@mochi/svc-attestor@workspace:services/attestor"],
+
+    "@mochi/svc-consensus": ["@mochi/svc-consensus@workspace:services/consensus"],
+
+    "@mochi/svc-feed-runners": ["@mochi/svc-feed-runners@workspace:services/feed-runners"],
+
+    "@mochi/svc-gateway": ["@mochi/svc-gateway@workspace:services/gateway"],
+
+    "@mochi/svc-indexer": ["@mochi/svc-indexer@workspace:services/indexer"],
+
+    "@mochi/svc-intake": ["@mochi/svc-intake@workspace:services/intake"],
+
+    "@mochi/svc-juror": ["@mochi/svc-juror@workspace:services/juror"],
+
+    "@mochi/svc-orchestrator": ["@mochi/svc-orchestrator@workspace:services/orchestrator"],
+
+    "@mochi/svc-panel-desk": ["@mochi/svc-panel-desk@workspace:services/panel-desk"],
+
+    "@mochi/tee": ["@mochi/tee@workspace:packages/tee"],
 
     "@msgpackr-extract/msgpackr-extract-darwin-arm64": ["@msgpackr-extract/msgpackr-extract-darwin-arm64@3.0.4", "", { "os": "darwin", "cpu": "arm64" }, "sha512-LCkGo6JDfaBhgST7UpPWgNgLINpcpabaHfyz5OBx75nUYxBsaEPxjnyNjWpeb/xBup/682QnBfRBy2/LvPutZQ=="],
 
@@ -479,7 +479,7 @@
 
     "bullmq": ["bullmq@6.3.9", "", { "dependencies": { "cron-parser": "5.10.1", "msgpackr": "2.1.0", "node-abort-controller": "3.1.1", "semver": "7.8.5", "tslib": "2.8.1" }, "peerDependencies": { "bullmq-otel": ">=2.0.0", "ioredis": ">=5.0.0", "pg": ">=8.0.0", "redis": ">=5.0.0" }, "optionalPeers": ["bullmq-otel", "ioredis", "pg", "redis"] }, "sha512-wBGk4tHZRFcQayZlC5DPRxg2EFfCqhgkJq0uQ8EvufMgh2hYmPeH8tK+1U4ffimNmnJzTUhwwW1PNUIQMhvSpQ=="],
 
-    "bun-types": ["bun-types@1.4.2", "", { "dependencies": { "@types/node": "*" } }, "sha512-bxV1FgK7yBIzjRe5zBozIM4Bem11ZJcCXSrjWRG3YWLt8yFDePu4cLjpebO8OvPeIE9trbyPF4fuj3Cia4Fj3w=="],
+    "bun-types": ["bun-types@1.3.14", "", { "dependencies": { "@types/node": "*" } }, "sha512-4N0ig0fEomHt5R0KCFWjovxow98rIoRwKolrYdCcknNwMekCXRnWEUvgu5soYV8QXtVsrUD8B95MBOZGPvr6KQ=="],
 
     "check-types": ["check-types@11.2.3", "", {}, "sha512-+67P1GkJRaxQD6PKK0Et9DhwQB+vGg3PM5+aavopCpZT1lj9jeqfvpgTLAWErNj8qApkkmXlu/Ug74kmhagkXg=="],
 

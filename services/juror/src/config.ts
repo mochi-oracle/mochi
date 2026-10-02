@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { parseAciPolicy } from "@mochi/aci";
 
 const ConfigSchema = z.object({
   PORT: z.coerce.number().int().min(1).max(65535).default(8093),
@@ -27,7 +28,8 @@ const ConfigSchema = z.object({
   TEE_MODE: z.enum(["mock", "tdx", "dstack"]).default("mock"),
   TEE_KEYS: z.enum(["kms", "ephemeral"]).optional(),
   TEE_KEY_LABEL: z.string().min(1).max(64).default("default"),
-  QUOTE_VERIFIER: z.enum(["mock", "dcap"]).default("mock"),
+  // Required, like @mochi/tee quoteVerifierFromEnv: quote verification never defaults to mock.
+  QUOTE_VERIFIER: z.enum(["mock", "dcap"], { error: "QUOTE_VERIFIER must be set explicitly: dcap (or mock for local development only)" }),
   TEE_MOCK_SEED: z.string().regex(/^0x([0-9a-fA-F]{2})+$/).default(`0x${"11".repeat(32)}`),
   TEE_MOCK_MEASUREMENT: z.string().regex(/^0x[0-9a-fA-F]{64}$/).default(`0x${"22".repeat(32)}`),
   TEE_MOCK_ROOT_PRIVATE_KEY: z.string().regex(/^0x[0-9a-fA-F]{64}$/).default(`0x${"33".repeat(32)}`),
@@ -46,5 +48,11 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
   if (config.RUNNER === "phala-aci" && config.MODEL_PROVIDER !== "phala-aci") throw new Error("RUNNER=phala-aci requires MODEL_PROVIDER=phala-aci");
   if (config.MODEL_PROVIDER === "phala-aci" && config.RUNNER !== "phala-aci") throw new Error("MODEL_PROVIDER=phala-aci requires RUNNER=phala-aci");
   if (config.MODEL_PROVIDER === "phala-aci" && (!config.PHALA_AI_API_KEY || !config.PHALA_ACI_MODEL)) throw new Error("PHALA_AI_API_KEY and PHALA_ACI_MODEL are required when MODEL_PROVIDER=phala-aci");
+  if (config.MODEL_PROVIDER === "phala-aci") {
+    // Without an attested os:/compose: pin any TDX VM could pose as the ACI gateway; fail closed, as production does.
+    let pinned = false;
+    try { const policy = parseAciPolicy((config.PHALA_ACI_ALLOWED_WORKLOADS ?? "").split(",")); pinned = policy.osMeasurements.length + policy.composeHashes.length > 0; } catch { /* reported below */ }
+    if (!pinned) throw new Error("PHALA_ACI_ALLOWED_WORKLOADS must include an attested os: or compose: pin when MODEL_PROVIDER=phala-aci");
+  }
   return config;
 }

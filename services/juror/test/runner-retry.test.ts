@@ -9,10 +9,10 @@ const httpError = (httpStatus: number, code = "inference_http") => Object.assign
 const instant = { sleep: async () => {}, random: () => 0 };
 
 test("juror defaults mirror production's 75-second cap and at most three attempts", () => {
-  const config = loadConfig({});
+  const config = loadConfig({ QUOTE_VERIFIER: "dcap" });
   expect(config.MODEL_ATTEMPT_CAP_MS).toBe(Number(productionTiming().MODEL_ATTEMPT_CAP_MS));
   expect(config.MODEL_MAX_ATTEMPTS).toBe(3);
-  for (const limit of [4, 5]) expect(() => loadConfig({ MODEL_MAX_ATTEMPTS: String(limit) })).toThrow();
+  for (const limit of [4, 5]) expect(() => loadConfig({ QUOTE_VERIFIER: "dcap", MODEL_MAX_ATTEMPTS: String(limit) })).toThrow();
 });
 
 test("a 60-second provider completes; a still-running provider aborts at 75 seconds without a hopeless retry", async () => {

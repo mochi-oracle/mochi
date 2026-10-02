@@ -24,6 +24,13 @@ export function openMaterials(materials: { queryId: Hex; evaluator: Hex; docEnve
   return PanelDocPlainSchema.parse(JSON.parse(new TextDecoder().decode(plain)));
 }
 
+/**
+ * Builds an evaluator's answer for the panel document. `salt` is the record salt from the panel document: ZERO32 for a
+ * public query, non-zero for a private one (intake enforces this). `payloadHash` is the value committed, revealed and
+ * posted on-chain, computed like consensus does: keccak256(payload) for a public query, and
+ * privatePayloadHash(salt, payload) for a private one, so a private outcome cannot be found by hashing the few
+ * candidate payloads. Pass `isPublic` (the query's on-chain flag, also in the materials response) to cross-check.
+ */
 export function buildAnswer(
   schemaId: number,
   schemaVersion: number,
@@ -31,7 +38,12 @@ export function buildAnswer(
   params: Record<string, unknown>,
   rawFields: Record<string, unknown>,
   openedAt: bigint,
+  options: { isPublic?: boolean } = {},
 ) {
+  const isPrivate = !/^0x0{64}$/i.test(salt);
+  if (options.isPublic !== undefined && options.isPublic === isPrivate) {
+    throw new Error(options.isPublic ? "public query with a non-zero record salt" : "private query without a record salt");
+  }
   const schema = resolveSchema(schemaId as SchemaDef["id"], params);
   const normalizedParams = normalizeParams(schema, params);
   if (!normalizedParams.ok) throw new Error("invalid schema parameters");
@@ -43,9 +55,8 @@ export function buildAnswer(
   }
   const hash = answerHash({ salt, schemaId: schema.id, schemaVersion, fields });
   const answer = serializeAnswer({ salt, schemaId: schema.id, schemaVersion, fields });
-  const payload = buildPayload(schema, fields, normalizedParams.params, { openedAt });
-  const payloadHex = payload.payload as Hex;
-  return { fields, answerHash: hash, answerJson: answer, payload: payloadHex, payloadHash: keccak256(payloadHex) };
+  const payload = buildPayload(schema, fields, normalizedParams.params, { openedAt, ...(isPrivate ? { privateSalt: salt } : {}) });
+  return { fields, answerHash: hash, answerJson: answer, payload: payload.payload as Hex, payloadHash: payload.payloadHash as Hex };
 }
 
 export function commitment(caseId: Hex, panelIndex: number, evaluator: Hex, answerHashValue: Hex, payloadHash: Hex, salt: Hex): Hex {
@@ -61,3 +72,8 @@ export async function payloadSig(account: SigningAccount, caseId: Hex, panelInde
 }
 
 export function evaluatorSalt(): Hex { return toHex(randomBytes(32)); }
+
+/** A private query's payload carries private field values and never leaves the evaluator: refuse to submit it. */
+export function assertPublicPayload(isPublic: boolean): void {
+  if (!isPublic) throw new Error("refusing to submit: the query is private, so its payload stays with the evaluator");
+}

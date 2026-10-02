@@ -185,6 +185,7 @@ export interface ConsensusResult {
 
 // ───────────────────────── on-chain structs (viem-friendly) ─────────────────────────
 
+/** EIP-712 Provenance signed by the intake: a single-use, expiring grant for `opener` to open one query. */
 export interface Provenance {
   docCommit: Hex;
   kind: ProvenanceKind;
@@ -192,22 +193,32 @@ export interface Provenance {
   fetchedAt: bigint;
   tokensK: number;
   transcriptHash: Hex;
-}
-
-export interface OpenParams {
+  /** The only msg.sender that may open with this grant (payer wallet, shielded/voucher relayer, or feed runner). */
+  opener: Address;
   schemaId: number;
-  n: number;
+  schemaVersion: number;
+  paramsHash: Hex;
+  /** payerCommit(payerResultPubKey) for private queries, ZERO32 for public ones. */
+  payerCommit: Hex;
   isPublic: boolean;
   allowPanelDisclosure: boolean;
-  paramsHash: Hex;
-  payerCommit: Hex;
-  refundTo: Address;
+  /** queryId nonce: queryId = computeQueryId(opener, docCommit, nonce). */
   nonce: bigint;
+  /** Unix seconds; QueryEscrow rejects the grant after this. */
+  expiry: bigint;
 }
 
+/** Payment-side open parameters; everything else comes from the signed Provenance. */
+export interface OpenParams {
+  n: number;
+  refundTo: Address;
+}
+
+/** Pays for exactly one query: its open to `n` jurors, or its expansion to `n`. `queryId` is
+ *  computeQueryId(opener, docCommit, nonce) of the grant the relayer opens with. */
 export interface AnonymaVoucher {
   voucherId: Hex;
-  docCommit: Hex;
+  queryId: Hex;
   schemaId: number;
   n: number;
   maxAmount: bigint;

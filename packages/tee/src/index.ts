@@ -6,5 +6,6 @@ export * from "./sealed-store.ts";
 export * from "./tdx-common.ts";
 export * from "./tdx-provider.ts";
 export * from "./dstack.ts";
+export * from "./dstack-mr-config.ts";
 export * from "./dcap/index.ts";
 export * from "./factory.ts";

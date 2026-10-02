@@ -153,10 +153,14 @@ export interface VerdictView {
 export interface FeedEntryView {
   verdictId: Hex;
   asOf: bigint;
+  /** Block time of the update call; not a freshness signal. */
   updatedAt: bigint;
+  /** On-chain time of the verdict. Age a value from min(asOf, verdictTs), as MochiFeedReader does. */
+  verdictTs: bigint;
   payload: Hex;
 }
 
+/** The intake-signed EIP-712 Provenance (a single-use grant for `opener`; see MochiTypes.Provenance). */
 export interface ProvenanceArg {
   docCommit: Hex;
   kind: number;
@@ -164,17 +168,21 @@ export interface ProvenanceArg {
   fetchedAt: bigint;
   tokensK: number;
   transcriptHash: Hex;
-}
-
-export interface OpenParamsArg {
+  opener: Address;
   schemaId: number;
-  n: number;
-  isPublic: boolean;
-  allowPanelDisclosure: boolean;
+  schemaVersion: number;
   paramsHash: Hex;
   payerCommit: Hex;
-  refundTo: Address;
+  isPublic: boolean;
+  allowPanelDisclosure: boolean;
   nonce: bigint;
+  expiry: bigint;
+}
+
+/** Payment-side open parameters; the rest of the query comes from the signed Provenance. */
+export interface OpenParamsArg {
+  n: number;
+  refundTo: Address;
 }
 
 export interface VerdictInputArg {

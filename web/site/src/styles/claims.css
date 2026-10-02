@@ -28,3 +28,26 @@
 .claim-share input[type=checkbox],.claim-manage input[type=checkbox] { display:inline-block; width:auto; margin-right:.7rem; accent-color:#e50083; }
 .claim-manage summary { cursor:pointer; font-weight:650; }
 .claim-text-button:disabled { opacity:.45; cursor:not-allowed; }
+
+/* Payment hashes, query IDs and wallet addresses are unbroken strings: let them wrap inside their box on phones
+   instead of widening the page and forcing horizontal scrolling. */
+.claim-status,.claim-warning,.claim-error,.claim-method,.claim-protocol-quote,.claim-protocol-result,.claim-recovery-load { min-width:0; max-width:100%; overflow-wrap:anywhere; }
+.claim-protocol code { overflow-wrap:anywhere; word-break:break-all; }
+.claim-recovery-load input[type=file] { max-width:100%; }
+
+/* Header on phones: the logo and the three links shared one row and wrapped onto two to four lines (iPhone SE).
+   Neither the logo nor a link breaks; below 480px the links move to their own row under the logo. */
+.claim-logo,.claim-header nav a { white-space:nowrap; }
+@media (max-width:479px) { .claim-header { flex-direction:column; align-items:flex-start; gap:.8rem; }.claim-header nav { flex-wrap:wrap; } }
+/* The invitation research pilot is secondary to the paid check: a labelled block below it. */
+.claim-pilot-head { margin-top:5rem; }.claim-pilot-note { margin:1rem 0 0; color:#333; }
+/* Paid-check form: live byte counters, problems shown under their field, errors next to the button that failed, and
+   a remove button on every source after the first. */
+.claim-counter { font-variant-numeric:tabular-nums; }
+.claim-counter[data-over] { color:#a3001f; font-weight:650; }
+.claim-field-error { margin:0; color:#a3001f; font-weight:650; overflow-wrap:anywhere; }
+.claim-form [aria-invalid=true] { border-color:#a3001f; box-shadow:inset 0 0 0 1px #a3001f; }
+.claim-inline-error { margin:1rem 0 0; border-left:4px solid #a3001f; background:#fff5f6; }
+.claim-protocol-quote .claim-inline-error { background:#fff; }
+.claim-remove-source { justify-self:start; }
+.claim-total { display:block; }

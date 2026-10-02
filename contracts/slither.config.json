@@ -1,0 +1,4 @@
+{
+  "filter_paths": "(lib/|vendor/|node_modules/|test/|script/|src/mocks/)",
+  "exclude_dependencies": true
+}

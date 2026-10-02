@@ -10,6 +10,8 @@ const errorStatus = (e: unknown) => (e as { status?: number })?.status ?? (e as 
 // IRandomness errors bubble up from the randomness contract, so match either the decoded name or the raw selector.
 const hasSeedWindowMissed = (e: unknown) => /SeedWindowMissed|0x76a607dd/.test(String((e as Error)?.message ?? e));
 const hasSeedNotReady = (e: unknown) => /SeedNotReady|0x484e3916/.test(String((e as Error)?.message ?? e));
+/** How long HUNG-at-N9 feed queries wait before QueryEscrow.panel() is read again after it showed escalation off. */
+export const PANEL_OFF_BACKOFF_MS = 15 * 60_000;
 export class Orchestrator {
   private cursor: bigint;
   private readonly locks = new Set<Hex>();
@@ -17,6 +19,8 @@ export class Orchestrator {
   private readonly inFlight = new Map<Hex, Promise<void>>();
   private stopping = false;
   private lastStarted: Hex | undefined;
+  /** clock.now() before which escalation is not attempted: QueryEscrow.panel() was unset or another contract. */
+  private panelOffUntil = 0;
   constructor(private readonly deps: OrchestratorDeps) { this.cursor = BigInt(deps.chain.dep.startBlock); }
   get lastBlockProcessed() { return this.lastBlock.toString(); }
 
@@ -108,7 +112,7 @@ export class Orchestrator {
       const feed = await store.getFeedQuery(id);
       if (!feed) return;
       if (q.n < 9) { await chain.expand(id, q.n === 3 ? 5 : q.n === 5 ? 7 : 9); return; }
-      const fee = await chain.panelFee(); await chain.usdgApprove(chain.dep.contracts.panel, fee); await chain.escalate(id); return;
+      await this.escalateHung(id); return;
     }
     if (q.status !== QueryStatus.SEALED) return;
 
@@ -146,6 +150,27 @@ export class Orchestrator {
     }
     const tx = await chain.post({ ...decision.verdictInput, queryId: decision.verdictInput.queryId as Hex, answerHash: decision.verdictInput.answerHash as Hex, payloadHash: decision.verdictInput.payloadHash as Hex, evidenceRoot: decision.verdictInput.evidenceRoot as Hex, round: Number(decision.verdictInput.round), status: decision.verdictInput.status }, decision.votes.map(v => ({ juror: v.juror as Address, answerHash: v.answerHash as Hex, spansRoot: v.spansRoot as Hex, quoteHash: v.quoteHash as Hex, sig: v.sig as Hex })), decision.consensusSig as Hex);
     await this.persistDecision(id, q, decision, tx);
+  }
+
+  /**
+   * Escalates a feed query that is HUNG at N9. With panel escalation off (QueryEscrow.panel() == 0, or not the
+   * PanelEscalation this deployment names) PanelEscalation.escalate reverts, so nothing is sent: no approve, no
+   * escalate, and the wiring is read again only after PANEL_OFF_BACKOFF_MS. The panel fee is approved only when the
+   * current allowance does not already cover it (a failed escalate does not cost another approve on the next tick).
+   */
+  private async escalateHung(id: Hex): Promise<void> {
+    const { chain, clock } = this.deps;
+    if (clock.now() < this.panelOffUntil) return;
+    const panel = chain.dep.contracts.panel;
+    const wired = await chain.escrowPanel();
+    if (/^0x0{40}$/i.test(wired) || wired.toLowerCase() !== panel.toLowerCase()) {
+      this.panelOffUntil = clock.now() + PANEL_OFF_BACKOFF_MS;
+      log("warn", "orchestrator.panel_escalation_off", { queryId: id, reason: /^0x0{40}$/i.test(wired) ? "escrow_panel_unset" : "escrow_panel_mismatch", retryInMs: PANEL_OFF_BACKOFF_MS });
+      return;
+    }
+    const fee = await chain.panelFee();
+    if ((await chain.usdgAllowance(panel)) < fee) await chain.usdgApprove(panel, fee);
+    await chain.escalate(id);
   }
 
   private async recoverPosted(id: Hex, q: Awaited<ReturnType<OrchestratorDeps["chain"]["getQuery"]>>): Promise<void> {

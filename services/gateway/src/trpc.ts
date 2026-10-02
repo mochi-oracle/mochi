@@ -1,11 +1,14 @@
-import { initTRPC } from "@trpc/server";
+import { initTRPC, TRPCError } from "@trpc/server";
 import { fetchRequestHandler } from "@trpc/server/adapters/fetch";
 import { z } from "zod";
 import { hex32 } from "@mochi/protocol";
-import { createGatewayApp, prepareQuery } from "./app.ts";
-import type { GatewayDeps } from "./ports.ts";
+import { createGatewayApp, QueryRateLimited } from "./app.ts";
+import type { GatewayDeps, PreparedQuery } from "./ports.ts";
 
-const t = initTRPC.context<GatewayDeps>().create();
+/** Per-request context: the gateway deps plus /v1/query's admission (per-caller and payer-key budgets) for this caller. */
+export type TrpcContext = GatewayDeps & { prepareQuery(input: unknown): Promise<PreparedQuery> };
+const OPEN_ERROR_CODES = new Set(["PRIVATE_KEY_REQUIRED", "PAYER_KEY_MISMATCH", "PROVENANCE_EXPIRED", "INCONSISTENT_INTAKE", "BAD_INTAKE_SIGNATURE"]);
+const t = initTRPC.context<TrpcContext>().create();
 const toJson = <T>(value: T): T => JSON.parse(JSON.stringify(value, (_key, item) => typeof item === "bigint" ? item.toString() : item)) as T;
 export const appRouter = t.router({
   verdict: t.procedure.input(z.object({ verdictId: hex32 })).query(async ({ input, ctx }) => {
@@ -32,10 +35,20 @@ export const appRouter = t.router({
     return response.json();
   }),
   disagreementByModel: t.procedure.input(z.object({ schema: z.number().int().positive(), field: z.string().min(1), window: z.string().default("1d") })).query(({ input, ctx }) => ctx.store.modelDisagreementSeries(input.schema, input.field, input.window)),
-  prepareQuery: t.procedure.input(z.object({ intake: z.unknown(), n: z.union([z.literal(3), z.literal(5), z.literal(7), z.literal(9)]), isPublic: z.boolean(), allowPanelDisclosure: z.boolean().optional(), refundTo: z.string(), nonce: z.string(), sender: z.string(), payerResultPubKey: z.string().optional(), pay: z.any() })).mutation(({ input, ctx }) => prepareQuery(ctx, input as never)),
+  // Visibility, consent, opener and nonce come from the intake-signed provenance in `intake`; prepareQuery validates all,
+  // including the grant's signature, under the same rate limits as POST /v1/query.
+  prepareQuery: t.procedure.input(z.object({ intake: z.unknown(), n: z.union([z.literal(3), z.literal(5), z.literal(7), z.literal(9)]), refundTo: z.string(), payerResultPubKey: z.string().optional(), pay: z.any() })).mutation(async ({ input, ctx }) => {
+    try { return await ctx.prepareQuery(input); }
+    catch (error) {
+      if (error instanceof QueryRateLimited) throw new TRPCError({ code: "TOO_MANY_REQUESTS", message: error.message });
+      if (error instanceof z.ZodError) throw new TRPCError({ code: "BAD_REQUEST", message: "Invalid request" });
+      if (error instanceof Error && OPEN_ERROR_CODES.has(error.message)) throw new TRPCError({ code: "BAD_REQUEST", message: error.message });
+      throw error;
+    }
+  }),
 });
 export type AppRouter = typeof appRouter;
 
-export function trpcFetchHandler(deps: GatewayDeps, req: Request): Promise<Response> {
-  return fetchRequestHandler({ endpoint: "/trpc", req, router: appRouter, createContext: () => deps });
+export function trpcFetchHandler(deps: GatewayDeps, req: Request, admission: Pick<TrpcContext, "prepareQuery">): Promise<Response> {
+  return fetchRequestHandler({ endpoint: "/trpc", req, router: appRouter, createContext: () => ({ ...deps, prepareQuery: admission.prepareQuery }) });
 }

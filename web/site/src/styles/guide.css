@@ -4,3 +4,11 @@ body{margin:0;background:#cfb3d4;color:#111;font:500 1.7rem/1.55 'Hanken Grotesk
 /* This document uses native scrolling rather than the framed site's wrapper. */
 html { position: static; height: auto; min-height: 100%; overflow: auto; }
 body { position: static; height: auto; min-height: 100%; overflow: visible; }
+
+/* The unpaid invitation pilot is a separate service: set it apart from the paid-check guide. */
+.guide-pilot { margin: 4rem 0; padding: 3rem 2.4rem; border: 2px dashed #111; background: #f6f1eb; }
+.guide-pilot details:first-of-type { margin-top: 2rem; }
+.guide-status { font-size: 1.5rem; letter-spacing: .06em; text-transform: uppercase; }
+.guide-status [data-state=available] { color: #184a34; }
+.guide-shell > footer nav { display: flex; flex-wrap: wrap; gap: 2rem; }
+@media (max-width: 700px) { .guide-pilot { padding: 2rem 1.4rem; } }

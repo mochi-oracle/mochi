@@ -7,7 +7,10 @@ const opened = parseAbiItem("event QueryOpened(bytes32 indexed queryId,uint8 pay
 const verdictPosted = parseAbiItem("event VerdictPosted(bytes32 indexed verdictId,bytes32 indexed queryId,uint8 round,uint8 status,uint16 agreementBps,uint32 dissentMask,uint32 timeoutMask,bytes32 answerHash,bytes32 payloadHash,bool isPublic)");
 const expanded = parseAbiItem("event QueryExpanded(bytes32 indexed queryId,uint8 round,uint8 newN,uint256 amount,uint64 sealBlock)");
 const LOG_CHUNK = BigInt(process.env.LOG_CHUNK_BLOCKS ?? "2000");
-const erc20 = [{ type: "function", name: "approve", stateMutability: "nonpayable", inputs: [{ name: "spender", type: "address" }, { name: "value", type: "uint256" }], outputs: [{ type: "bool" }] }] as const;
+const erc20 = [
+  { type: "function", name: "approve", stateMutability: "nonpayable", inputs: [{ name: "spender", type: "address" }, { name: "value", type: "uint256" }], outputs: [{ type: "bool" }] },
+  { type: "function", name: "allowance", stateMutability: "view", inputs: [{ name: "owner", type: "address" }, { name: "spender", type: "address" }], outputs: [{ type: "uint256" }] },
+] as const;
 
 export function createChainAdapter(dep: Deployment, orchestratorKey: Hex, feedRunnerKey: Hex, transport?: Transport): ChainPort {
   const base = createChain(dep, { privateKey: orchestratorKey, ...(transport ? { transport } : {}) });
@@ -61,6 +64,8 @@ export function createChainAdapter(dep: Deployment, orchestratorKey: Hex, feedRu
     expire: (id) => write(base, dep.contracts.queryEscrow, QueryEscrowAbi, "expire", [id]),
     panelFee: () => base.publicClient.readContract({ address: dep.contracts.panel, abi: PanelEscalationAbi, functionName: "panelFee" }),
     usdgApprove: (spender, amount) => write(feed, dep.contracts.usdg, erc20, "approve", [spender, amount]),
+    escrowPanel: () => base.publicClient.readContract({ address: dep.contracts.queryEscrow, abi: QueryEscrowAbi, functionName: "panel" }),
+    usdgAllowance: (spender) => base.publicClient.readContract({ address: dep.contracts.usdg, abi: erc20, functionName: "allowance", args: [feed.account!.address, spender] }),
     expand: (id, n) => write(feed, dep.contracts.queryEscrow, QueryEscrowAbi, "expand", [id, n]),
     escalate: (id) => write(feed, dep.contracts.panel, PanelEscalationAbi, "escalate", [id]),
   };

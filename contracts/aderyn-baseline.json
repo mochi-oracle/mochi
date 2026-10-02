@@ -1,0 +1,4 @@
+{
+  "_comment": "Accepted Aderyn High findings that cannot be annotated inline yet (prefer `// aderyn-fp-next-line(<detector>) <reason>` comments). Checked by scripts/aderyn-gate.ts in the `aderyn` CI job: entries match on detector, file and the trimmed source line.",
+  "accepted": []
+}

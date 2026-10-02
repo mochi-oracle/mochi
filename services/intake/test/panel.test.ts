@@ -3,8 +3,8 @@ import { sha256, type Hex } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
 import { x25519 } from "@noble/curves/ed25519.js";
 import { toHex } from "viem";
-import { aad, evaluatorKeyDigest, PanelDocPlainSchema } from "@mochi/protocol";
-import { docCommit, ZERO32 } from "@mochi/core";
+import { aad, evaluatorKeyDigest, PanelDocPlainSchema, provenanceFromJson } from "@mochi/protocol";
+import { docCommit, provenanceHash, ZERO32 } from "@mochi/core";
 import { MemorySealedStore, MockQuoteVerifier, MockTeeProvider, open, seal } from "@mochi/tee";
 import { IntakeEnclave, IntakeError } from "../src/intake.ts";
 
@@ -16,24 +16,31 @@ const doc = new TextEncoder().encode("Reserve report: supply 100, reserves 99.")
 
 async function setup(opts: { status?: number; isPublic?: boolean; consent?: boolean; panelIndex?: number } = {}) {
   const evaluators = [1, 2, 3].map((i) => privateKeyToAccount(`0x${String(i).repeat(64)}` as Hex));
-  const commit = docCommit(ZERO32, sha256(doc));
+  const isPublic = opts.isPublic ?? true;
+  const salt = isPublic ? ZERO32 : `0x${"5a".repeat(32)}` as Hex;
+  const commit = docCommit(salt, sha256(doc));
+  let openedWith = ZERO32 as Hex;
   const chain = {
     getQuery: async () => ({
       status: opts.status ?? 5, docCommit: commit, paramsHash: ZERO32 as Hex, schemaId: 4, schemaVersion: 1,
-      isPublic: opts.isPublic ?? true, allowPanelDisclosure: opts.consent ?? false,
+      isPublic, allowPanelDisclosure: opts.consent ?? false, provenanceHash: openedWith,
     }),
     jurorsOf: async () => [], isActive: async () => true, getJuror: async () => ({ measurement }),
     getPanelCase: async () => ({ status: 2, panelIndex: opts.panelIndex ?? 0 }),
     panelOf: async () => evaluators.map((e) => e.address as Hex),
   };
+  const store = new MemorySealedStore();
   const intake = new IntakeEnclave({
-    tee, chain, store: new MemorySealedStore(), fetchPolicy: { origins: [] },
+    tee, chain, store, fetchPolicy: { origins: [] },
     httpGetter: { get: async () => { throw new Error("no network"); } },
     quoteVerifier: new MockQuoteVerifier({ mockRootAddress: root.address }), chainId: 31337,
     escrowAddress: `0x${"66".repeat(20)}`, clock: { nowSeconds: () => 1_700_000_000 },
   });
-  const plain = { v: 1, schemaId: 4, salt: ZERO32, params: {}, contentType: "text/plain", docB64: Buffer.from(doc).toString("base64") };
-  await intake.intakeUpload(seal(tee.encryptionPublicKey(), new TextEncoder().encode(JSON.stringify(plain)), aad.intake()));
+  // The grant (and so the stored record) carries the payer's consent exactly as sealed with the document.
+  const open = { opener: "0x00000000000000000000000000000000000000b0", payerCommit: isPublic ? ZERO32 : `0x${"88".repeat(32)}`, isPublic, allowPanelDisclosure: opts.consent ?? false, nonce: "5" };
+  const plain = { v: 1, schemaId: 4, salt, params: {}, contentType: "text/plain", docB64: Buffer.from(doc).toString("base64"), open };
+  const uploaded = await intake.intakeUpload(seal(tee.encryptionPublicKey(), new TextEncoder().encode(JSON.stringify(plain)), aad.intake()));
+  openedWith = provenanceHash(provenanceFromJson(uploaded.provenance));
   const keys = evaluators.map(() => x25519.utils.randomSecretKey());
   const request = async (panelIndex = 0, signers = evaluators) => ({
     queryId, panelIndex: panelIndex as 0 | 1,
@@ -42,7 +49,7 @@ async function setup(opts: { status?: number; isPublic?: boolean; consent?: bool
       return { address: evaluators[i]!.address.toLowerCase(), encryptionPubKey: pub, keySig: await e.signMessage({ message: { raw: evaluatorKeyDigest(queryId, panelIndex, pub) } }) };
     })),
   });
-  return { intake, evaluators, keys, request, commit };
+  return { intake, evaluators, keys, request, commit, store, provenanceHash: () => openedWith };
 }
 
 describe("dispatch-panel", () => {
@@ -56,6 +63,29 @@ describe("dispatch-panel", () => {
       expect(Buffer.from(plain.docB64, "base64").toString()).toBe(new TextDecoder().decode(doc));
     }
     expect(() => open(s.keys[1]!, res.evaluators[0]!.docEnvelope as never, aad.panel(queryId, res.evaluators[0]!.address as Hex))).toThrow();
+  });
+
+  test("retains the grant's record only when the escalated query may be disclosed", async () => {
+    const retained: string[] = [];
+    const s = await setup();
+    s.store.retain = async (key: string) => { retained.push(key); };
+    await s.intake.dispatchPanel(await s.request());
+    // The record and its binding's grant claim (public: opener/nonce only).
+    expect(retained).toEqual([`prov:${s.provenanceHash()}`, "grant:0x00000000000000000000000000000000000000b0:5"]);
+    const priv = await setup({ isPublic: false, consent: false });
+    const privRetained: string[] = [];
+    priv.store.retain = async (key: string) => { privRetained.push(key); };
+    await expect(priv.intake.dispatchPanel(await priv.request())).rejects.toMatchObject({ code: "DISCLOSURE_NOT_ALLOWED" });
+    expect(privRetained).toEqual([]);
+    // Evaluator checks run before retention: a forged key binding or a non-panelist keeps nothing.
+    const forged = await setup();
+    const forgedRetained: string[] = [];
+    forged.store.retain = async (key: string) => { forgedRetained.push(key); };
+    await expect(forged.intake.dispatchPanel(await forged.request(0, [privateKeyToAccount(`0x${"9".repeat(64)}`), ...forged.evaluators.slice(1)]))).rejects.toMatchObject({ code: "BAD_KEY_SIG" });
+    const outsiderReq = await forged.request();
+    outsiderReq.evaluators[0]!.address = privateKeyToAccount(`0x${"9".repeat(64)}`).address.toLowerCase();
+    await expect(forged.intake.dispatchPanel(outsiderReq)).rejects.toMatchObject({ code: "NOT_PANELIST" });
+    expect(forgedRetained).toEqual([]);
   });
 
   test("refuses: not escalated, private without consent, wrong panel, forged key binding, non-panelist", async () => {

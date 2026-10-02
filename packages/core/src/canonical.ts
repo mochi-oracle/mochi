@@ -28,13 +28,15 @@ export function toCanonical(value: unknown, path = "$"): Json {
       if (proto !== Object.prototype && proto !== null) {
         throw new TypeError(`canonical: non-plain object at ${path}`);
       }
-      const out: { [k: string]: Json } = {};
+      const entries: [string, Json][] = [];
       for (const key of Object.keys(value as object).sort()) {
         const v = (value as Record<string, unknown>)[key];
         if (v === undefined) continue; // matches JSON.stringify dropping undefined properties
-        out[key] = toCanonical(v, `${path}.${key}`);
+        entries.push([key, toCanonical(v, `${path}.${key}`)]);
       }
-      return out;
+      // fromEntries defines own properties. Assigning out[key] would treat a "__proto__" key (JSON.parse makes it an
+      // own property) as a prototype write and drop it, so two different documents would hash the same.
+      return Object.fromEntries(entries);
     }
     default:
       throw new TypeError(`canonical: unsupported ${typeof value} at ${path}`);

@@ -13,6 +13,8 @@ const ESCROW = `0x${"00".repeat(20)}` as const;
 const CHAIN_ID = 31337;
 const FIXTURE = "Synthetic hardware rehearsal document. It contains no user or production data.";
 const FIXTURE_QUESTION = "Does the synthetic fixture identify itself as a hardware rehearsal document?";
+/** The only accepted open binding: a public query (zero payer commitment) from a fixed opener and nonce. */
+const FIXTURE_OPEN = { opener: `0x${"00".repeat(19)}02`, payerCommit: `0x${"00".repeat(32)}`, isPublic: true, allowPanelDisclosure: false, nonce: "1" } as const;
 const fetchPolicy: FetchPolicy = { origins: [] };
 const clock: Clock = { nowSeconds: () => Math.floor(Date.now() / 1000) };
 const noFetch: HttpGetter = { async get() { throw new Error("fetch disabled in rehearsal"); } };
@@ -93,7 +95,10 @@ const server = Bun.serve({
         return json({ error: { code: "DOCUMENT_TOO_LARGE" } }, 413);
       }
       const expectedB64 = Buffer.from(FIXTURE, "utf8").toString("base64");
-      if (plain.schemaId !== 7 || plain.salt !== `0x${"00".repeat(32)}` || plain.params.question !== FIXTURE_QUESTION || plain.params.answer_type !== "BOOL" || plain.docB64 !== expectedB64) {
+      const open = plain.open;
+      const fixtureOpen = open.opener === FIXTURE_OPEN.opener && open.payerCommit === FIXTURE_OPEN.payerCommit && open.isPublic === FIXTURE_OPEN.isPublic
+        && open.allowPanelDisclosure === FIXTURE_OPEN.allowPanelDisclosure && open.nonce === FIXTURE_OPEN.nonce;
+      if (plain.schemaId !== 7 || plain.salt !== `0x${"00".repeat(32)}` || plain.params.question !== FIXTURE_QUESTION || plain.params.answer_type !== "BOOL" || plain.docB64 !== expectedB64 || !fixtureOpen) {
         return json({ error: { code: "FIXTURE_ONLY" } }, 400);
       }
       const result = await intake.intakeUpload(envelope);

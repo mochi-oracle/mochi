@@ -71,13 +71,13 @@ describe("OCR framed output", () => {
 
 describe("PDF OCR config", () => {
   test("defaults off and builds hardened docker/native command arrays", () => {
-    expect(loadConfig({}).pdfOcrCommand).toBeUndefined();
-    expect(loadConfig({ PDF_OCR: "off", PDF_OCR_COMMAND: '["custom-ocr"]' }).pdfOcrCommand).toBeUndefined();
-    expect(loadConfig({ PDF_OCR: "native" }).pdfOcrCommand).toEqual(["/usr/local/bin/mochi-ocr"]);
-    expect(loadConfig({ PDF_OCR: "docker" }).pdfOcrCommand).toEqual([
+    expect(loadConfig({ QUOTE_VERIFIER: "mock" }).pdfOcrCommand).toBeUndefined();
+    expect(loadConfig({ QUOTE_VERIFIER: "mock", PDF_OCR: "off", PDF_OCR_COMMAND: '["custom-ocr"]' }).pdfOcrCommand).toBeUndefined();
+    expect(loadConfig({ QUOTE_VERIFIER: "mock", PDF_OCR: "native" }).pdfOcrCommand).toEqual(["/usr/local/bin/mochi-ocr"]);
+    expect(loadConfig({ QUOTE_VERIFIER: "mock", PDF_OCR: "docker" }).pdfOcrCommand).toEqual([
       "docker", "run", "--rm", "-i", "--network", "none", "--read-only", "--tmpfs", "/tmp:rw,size=512m,mode=1777",
       "--cap-drop", "ALL", "--security-opt", "no-new-privileges", "--pids-limit", "128", "--memory", "1g", "mochi-ocr:1",
     ]);
-    expect(loadConfig({ PDF_OCR: "native", PDF_OCR_COMMAND: '["custom-ocr","--safe"]' }).pdfOcrCommand).toEqual(["custom-ocr", "--safe"]);
+    expect(loadConfig({ QUOTE_VERIFIER: "mock", PDF_OCR: "native", PDF_OCR_COMMAND: '["custom-ocr","--safe"]' }).pdfOcrCommand).toEqual(["custom-ocr", "--safe"]);
   });
 });

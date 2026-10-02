@@ -1,16 +1,22 @@
 import { afterEach, expect, test } from "bun:test";
-import { mkdtemp, rm, stat } from "node:fs/promises";
+import { mkdtemp, readFile, rm, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { keyBinding, type Quote, type QuoteVerifier } from "@mochi/tee";
+import {
+  DSTACK_RUNTIME_EVENT_TYPE, dstackMrConfigIdV1, dstackMrConfigIdV2, dstackMrConfigIdV3, dstackMrConfigV3Document,
+  dstackRuntimeEventDigest, keyBinding, replayDstackRtmr3, type Quote, type QuoteVerifier,
+} from "@mochi/tee";
+import { sha256 } from "@noble/hashes/sha2.js";
 import { PRODUCTION_IDENTITY_SPECS, PRODUCTION_SERVICE_SPECS } from "../deploy/phala/production-identities/identities.ts";
 import {
   comparePreviousKeys,
   fetchProductionIdentityReport,
+  parseArgs,
   verifyProductionIdentityReport,
   writeReportNoOverwrite,
+  type ConfigBindingInput,
 } from "./verify-production-identities.ts";
-import type { Hex } from "viem";
+import { bytesToHex, hexToBytes, type Hex } from "viem";
 
 const measurement = `0x${"aa".repeat(32)}` as Hex;
 const now = 1_800_000_000;
@@ -122,4 +128,148 @@ test("report output is private and never overwritten", async () => {
   await writeReportNoOverwrite(path, validReport());
   expect((await stat(path)).mode & 0o777).toBe(0o600);
   await expect(writeReportNoOverwrite(path, validReport())).rejects.toThrow();
+});
+
+// --- dstack configuration identity -------------------------------------------------------------------------------
+// A real DCAP fixture quote with MRCONFIGID and RTMR3 patched; the stub verifier above does not check signatures.
+const FIXTURE_QUOTE = new Uint8Array(await readFile(new URL("../packages/tee/test/fixtures/intel-tdx/tdx_quote", import.meta.url)));
+const MRCONFIGID_OFFSET = 48 + 184;
+const RTMR3_OFFSET = 48 + 472;
+const APP_ID = "21dfb9d71c8d72522bb4372657b96308a190daaa";
+const INSTANCE_ID = "a860de12f1343b31164d9b34f17218f583cb7ad2";
+const KMS_ID = "3059301306072a8648ce3d020106082a8648ce3d030107034200048844eb42ccdf8c52fd4f174f362fcb9bbd19c45fd48f1edec2d8f1ca23536ec1a74021b4cee610c074f8294d431b2b7fee2c39e5333fdaf0a4522d43fb159d9f";
+const OTHER_KMS_ID = `3059301306072a8648ce3d020106082a8648ce3d03010703420004${"ab".repeat(64)}`;
+const DOCKER_COMPOSE = "services:\n  app:\n    image: example@sha256:" + "11".repeat(32) + "\n";
+const bytes = (hex: string) => hexToBytes(`0x${hex}` as Hex);
+const utf8 = (text: string) => new TextEncoder().encode(text);
+
+function appCompose(extra: Record<string, unknown> = {}): string {
+  return JSON.stringify({
+    allowed_envs: ["A"], docker_compose_file: DOCKER_COMPOSE, features: ["kms", "tproxy-net"], kms_enabled: true,
+    local_key_provider_enabled: false, manifest_version: 2, name: "", no_instance_id: false, runner: "docker-compose", ...extra,
+  });
+}
+
+function bootEvents(compose: string, keyProviderId = KMS_ID, instanceId = INSTANCE_ID) {
+  return [
+    ["system-preparing", new Uint8Array()], ["app-id", bytes(APP_ID)], ["compose-hash", sha256(utf8(compose))],
+    ["instance-id", bytes(instanceId)], ["boot-mr-done", new Uint8Array()], ["mr-kms", new Uint8Array(32).fill(7)],
+    ["key-provider", utf8(JSON.stringify({ name: "kms", id: keyProviderId }))], ["system-ready", new Uint8Array()],
+  ].map(([event, payload]) => ({ event: event as string, payload: payload as Uint8Array }));
+}
+
+function attestationFor(compose: string, events = bootEvents(compose)) {
+  const eventLog = [
+    { imr: 0, event_type: 1, digest: "00".repeat(48), event: "", event_payload: "" },
+    ...events.map((event) => ({
+      imr: 3, event_type: DSTACK_RUNTIME_EVENT_TYPE, digest: bytesToHex(dstackRuntimeEventDigest(event)).slice(2),
+      event: event.event, event_payload: bytesToHex(event.payload).slice(2),
+    })),
+  ];
+  return { attestation: { tcb_info: { app_compose: compose, event_log: eventLog } }, rtmr3: replayDstackRtmr3(events) };
+}
+
+function reportWithRegisters(mrConfigId: Uint8Array, rtmr3: Uint8Array = new Uint8Array(48).fill(3)) {
+  const raw = FIXTURE_QUOTE.slice();
+  raw.set(mrConfigId, MRCONFIGID_OFFSET);
+  raw.set(rtmr3, RTMR3_OFFSET);
+  const report = validReport();
+  for (const identity of report.identities) identity.quote.raw = bytesToHex(raw);
+  return report;
+}
+
+const verifyWith = (report: unknown, extra: { requireConfigVersions?: number[]; configBinding?: ConfigBindingInput } = {}) =>
+  verifyProductionIdentityReport(report, { expectedMeasurement: measurement, quoteVerifier: verifier(), now: () => now, ...extra });
+
+function registerFor(version: 1 | 2 | 3, compose: string, options: { instanceId?: Uint8Array } = {}): Uint8Array {
+  const composeHash = sha256(utf8(compose));
+  if (version === 1) return dstackMrConfigIdV1(composeHash);
+  if (version === 2) return dstackMrConfigIdV2({ composeHash, appId: bytes(APP_ID), keyProvider: "kms", keyProviderId: bytes(KMS_ID) });
+  return dstackMrConfigIdV3(dstackMrConfigV3Document({
+    appId: bytes(APP_ID), composeHash, keyProvider: "kms", keyProviderId: bytes(KMS_ID), instanceId: options.instanceId ?? bytes(INSTANCE_ID),
+  }));
+}
+
+test("reports each quote's dstack config version and enforces the required set", async () => {
+  const compose = appCompose();
+  const v1 = reportWithRegisters(registerFor(1, compose));
+  const { summary } = await verifyWith(v1);
+  expect(summary.identities.every(({ configVersion }) => configVersion === 1)).toBe(true);
+  expect(summary.identities[0]!.mrConfigId).toBe(bytesToHex(registerFor(1, compose)));
+  expect(summary.configBinding).toBeUndefined();
+  await expect(verifyWith(v1, { requireConfigVersions: [2, 3] })).rejects.toThrow("dstack config version 1; required 2 or 3");
+  await expect(verifyWith(v1, { requireConfigVersions: [1] })).resolves.toBeDefined();
+  const v3 = reportWithRegisters(registerFor(3, appCompose({ key_provider: "kms", key_provider_id: KMS_ID })));
+  expect((await verifyWith(v3, { requireConfigVersions: [2, 3] })).summary.identities[10]!.configVersion).toBe(3);
+  const unknown = registerFor(1, compose); unknown[0] = 4;
+  await expect(verifyWith(reportWithRegisters(unknown), { requireConfigVersions: [1, 2, 3] })).rejects.toThrow("config version 4");
+  await expect(verifyWith(v1, { requireConfigVersions: [4] })).rejects.toThrow("subset of 1, 2, 3");
+  // Unparseable evidence keeps the previous default behaviour, but cannot satisfy a config requirement.
+  const legacy = validReport();
+  expect((await verifyWith(legacy)).summary.identities[0]!.configVersion).toBeUndefined();
+  await expect(verifyWith(legacy, { requireConfigVersions: [1] })).rejects.toThrow("cannot be parsed");
+});
+
+test("recomputes V1, V2 and V3 registers offline from the attested app-compose, app id and KMS id", async () => {
+  const cases = [
+    { version: 1 as const, compose: appCompose() },
+    { version: 2 as const, compose: appCompose({ key_provider: "kms", key_provider_id: KMS_ID }) },
+    { version: 3 as const, compose: appCompose({ key_provider: "kms", key_provider_id: KMS_ID }) },
+  ];
+  for (const { version, compose } of cases) {
+    const { attestation, rtmr3 } = attestationFor(compose);
+    const report = reportWithRegisters(registerFor(version, compose), rtmr3);
+    const { summary } = await verifyWith(report, {
+      requireConfigVersions: [version],
+      configBinding: { attestation, appId: `0x${APP_ID}`, keyProviderId: KMS_ID, reviewedCompose: DOCKER_COMPOSE },
+    });
+    expect(summary.configBinding).toEqual({
+      configVersion: version, mrConfigId: bytesToHex(registerFor(version, compose)), composeHash: bytesToHex(sha256(utf8(compose))),
+      appId: `0x${APP_ID}`, instanceId: `0x${INSTANCE_ID}`, keyProvider: { name: "kms", id: `0x${KMS_ID}` }, composeKeyProvider: "kms",
+      composeKeyProviderId: version === 1 ? "0x" : `0x${KMS_ID}`, rtmr3: bytesToHex(rtmr3), reviewedComposeMatches: true,
+    });
+  }
+  // no_instance_id drops instance_id from the V3 document.
+  const compose = appCompose({ key_provider: "kms", key_provider_id: KMS_ID, no_instance_id: true });
+  const events = bootEvents(compose, KMS_ID, "");
+  const { attestation, rtmr3 } = attestationFor(compose, events);
+  const report = reportWithRegisters(registerFor(3, compose, { instanceId: new Uint8Array() }), rtmr3);
+  expect((await verifyWith(report, { configBinding: { attestation } })).summary.configBinding?.configVersion).toBe(3);
+});
+
+test("rejects config evidence that does not bind the quotes to the expected app, KMS and compose", async () => {
+  const compose = appCompose();
+  const { attestation, rtmr3 } = attestationFor(compose);
+  const good = reportWithRegisters(registerFor(1, compose), rtmr3);
+  const bind = (overrides: Partial<ConfigBindingInput> = {}): ConfigBindingInput => ({ attestation, appId: APP_ID, keyProviderId: KMS_ID, ...overrides });
+  await expect(verifyWith(good, { configBinding: bind() })).resolves.toBeDefined();
+  await expect(verifyWith(reportWithRegisters(registerFor(1, compose)), { configBinding: bind() })).rejects.toThrow("same boot");
+  await expect(verifyWith(good, { configBinding: bind({ keyProviderId: OTHER_KMS_ID }) })).rejects.toThrow("expected KMS");
+  await expect(verifyWith(good, { configBinding: bind({ appId: "00".repeat(20) }) })).rejects.toThrow("expected app id");
+  await expect(verifyWith(good, { configBinding: bind({ reviewedCompose: "services: {}\n" }) })).rejects.toThrow("reviewed compose");
+  const otherCompose = appCompose({ allowed_envs: ["B"] });
+  await expect(verifyWith(reportWithRegisters(registerFor(1, otherCompose), rtmr3), { configBinding: bind() })).rejects.toThrow("does not match the attested app-compose");
+  const swapped = { tcb_info: { ...attestation.tcb_info, app_compose: otherCompose } };
+  await expect(verifyWith(good, { configBinding: bind({ attestation: swapped }) })).rejects.toThrow("does not hash");
+  const tampered = structuredClone(attestation);
+  tampered.tcb_info.event_log[7]!.event_payload = bytesToHex(utf8(JSON.stringify({ name: "kms", id: OTHER_KMS_ID }))).slice(2);
+  await expect(verifyWith(good, { configBinding: bind({ attestation: tampered }) })).rejects.toThrow("digest does not match");
+  // A KMS that differs from the one the boot event names is caught even when the register itself is consistent.
+  const rogue = attestationFor(compose, bootEvents(compose, OTHER_KMS_ID));
+  await expect(verifyWith(reportWithRegisters(registerFor(1, compose), rogue.rtmr3), { configBinding: bind({ attestation: rogue.attestation }) }))
+    .rejects.toThrow("expected KMS");
+  // A V2 register only verifies when the compose itself pins the key provider id.
+  await expect(verifyWith(reportWithRegisters(registerFor(2, compose), rtmr3), { configBinding: bind() })).rejects.toThrow("version 2");
+  await expect(verifyWith(good, { configBinding: bind({ attestation: { tcb_info: {} } }) })).rejects.toThrow("tcb_info.app_compose");
+});
+
+test("CLI flags stay backward compatible and validate config options", () => {
+  const base = ["--url", "https://example.test/production/identities", "--measurement", measurement];
+  expect(parseArgs(base)).toEqual({ url: "https://example.test/production/identities", measurement });
+  expect(parseArgs([...base, "--require-config-version", "2,3"]).requireConfigVersions).toEqual([2, 3]);
+  expect(() => parseArgs([...base, "--require-config-version", "2,4"])).toThrow("comma-separated");
+  expect(() => parseArgs([...base, "--key-provider-id", KMS_ID])).toThrow("need --attestation");
+  expect(parseArgs([...base, "--attestation", "a.json", "--app-id", APP_ID, "--key-provider-id", KMS_ID, "--reviewed-compose", "c.yml"]))
+    .toMatchObject({ attestation: "a.json", appId: APP_ID, keyProviderId: KMS_ID, reviewedCompose: "c.yml" });
+  expect(() => parseArgs([...base, "--unknown", "x"])).toThrow("usage");
 });

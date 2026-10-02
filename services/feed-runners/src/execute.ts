@@ -1,4 +1,4 @@
-import { aad, AttestationDocSchema, IntakeResultSchema, IntakeUrlPlainSchema, type AttestationDoc, type IntakeResult } from "@mochi/protocol";
+import { aad, AttestationDocSchema, IntakeResultSchema, IntakeUrlPlainSchema, provenanceFromJson, provenanceMatchesBinding, type AttestationDoc, type IntakeResult, type OpenBinding } from "@mochi/protocol";
 import { SchemaId, ZERO32 } from "@mochi/core";
 import { keyBinding, seal, type Quote } from "@mochi/tee";
 import { keccak256, toBytes, type Hex } from "viem";
@@ -8,11 +8,19 @@ export class IntakeHttpError extends Error {
   constructor(readonly status: number) { super(`intake returned HTTP ${status}`); this.name = "IntakeHttpError"; }
 }
 const INTAKE_ROLE = 2;
+/**
+ * A fresh, uniformly random uint64 queryId nonce per grant (as the SDK does). The intake keys its record by the grant's
+ * struct hash, which includes the nonce; a predictable nonce (e.g. a timestamp) would let anyone pre-register a record
+ * for the next grant and make the feed runner's upload fail with 409 PROVENANCE_EXISTS.
+ */
+export function randomGrantNonce(): bigint {
+  const bytes = crypto.getRandomValues(new Uint8Array(8));
+  return bytes.reduce((acc, byte) => (acc << 8n) | BigInt(byte), 0n);
+}
 
 export class FeedQueryExecutor {
   private attestationCache?: { att: AttestationDoc; expires: number };
-  private lastNonce = 0n;
-  constructor(private readonly deps: ExecuteDeps) {}
+  constructor(private readonly deps: ExecuteDeps, private readonly nextNonce: () => bigint = randomGrantNonce) {}
 
   private async verifiedAttestation(): Promise<AttestationDoc> {
     const now = this.deps.clock.now();
@@ -42,7 +50,10 @@ export class FeedQueryExecutor {
 
   async execute(job: FeedJob): Promise<{ queryId: Hex; txHash: Hex }> {
     const att = await this.verifiedAttestation();
-    const plain = IntakeUrlPlainSchema.parse({ v: 1, schemaId: job.schemaId, salt: ZERO32, params: job.params, url: job.url });
+    const nonce = this.nextNonce();
+    // The intake signs this binding into the provenance: only this feed runner can open with it, once, publicly.
+    const open: OpenBinding = { opener: this.deps.feedRunnerAddress.toLowerCase(), payerCommit: ZERO32, isPublic: true, allowPanelDisclosure: true, nonce: nonce.toString() };
+    const plain = IntakeUrlPlainSchema.parse({ v: 1, schemaId: job.schemaId, salt: ZERO32, params: job.params, url: job.url, open });
     const envelope = seal(att.encryptionPubKey as Hex, toBytes(JSON.stringify(plain)), aad.intake());
     let result: IntakeResult;
     try { result = IntakeResultSchema.parse(await this.deps.http.postIntake(`${this.deps.intakeUrl}/v1/intake/url`, envelope, this.deps.intakeTimeoutMs ?? 30_000)); }
@@ -51,19 +62,12 @@ export class FeedQueryExecutor {
     if (result.schemaId !== job.schemaId) throw new Error("intake schema mismatch");
     if (result.intake.toLowerCase() !== att.address.toLowerCase()) throw new Error("intake signer does not match attestation");
     if (result.docCommit !== result.provenance.docCommit) throw new Error("intake document commitment mismatch");
+    if (!provenanceMatchesBinding(result.provenance, open) || result.provenance.schemaId !== job.schemaId) throw new Error("intake grant does not match the sealed binding");
     await this.ensureBudget();
-    const timestampNonce = BigInt(this.deps.clock.now());
-    const nonce = timestampNonce > this.lastNonce ? timestampNonce : this.lastNonce + 1n;
-    this.lastNonce = nonce;
-    const params = { schemaId: job.schemaId, n: job.n, isPublic: true, allowPanelDisclosure: true, paramsHash: result.paramsHash as Hex, payerCommit: ZERO32, refundTo: this.deps.refundTo, nonce };
     const queryId = await this.deps.chain.computeQueryId(this.deps.feedRunnerAddress, result.docCommit as Hex, nonce);
     const feedId = keccak256(toBytes(job.feedName));
     await this.deps.repo.insertFeedQuery(queryId, feedId, job.key);
-    const txHash = await this.deps.chain.openFeed(params, {
-      docCommit: result.provenance.docCommit as Hex, kind: result.provenance.kind,
-      originId: result.provenance.originId as Hex, fetchedAt: BigInt(result.provenance.fetchedAt),
-      tokensK: result.provenance.tokensK, transcriptHash: result.provenance.transcriptHash as Hex,
-    }, result.intakeSig as Hex);
+    const txHash = await this.deps.chain.openFeed({ n: job.n, refundTo: this.deps.refundTo }, provenanceFromJson(result.provenance), result.intakeSig as Hex);
     return { queryId, txHash };
   }
 }

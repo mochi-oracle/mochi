@@ -1,14 +1,15 @@
 import { z } from "zod";
-import { zeroAddress, zeroHash, type Address, type Hex } from "viem";
+import { zeroHash, type Hex } from "viem";
 import { SchemaId } from "@mochi/core";
-import { IntakeResultSchema, payerCommit } from "@mochi/protocol";
+import { IntakeResultSchema, provenanceFromJson, type OpenBinding } from "@mochi/protocol";
 import { getSchema } from "@mochi/schemas";
 import { prepareQuery } from "./app.ts";
 import type { GatewayDeps } from "./ports.ts";
 
 const JsonRpcSchema = z.object({ jsonrpc: z.literal("2.0"), id: z.union([z.string(), z.number(), z.null()]).optional(), method: z.string(), params: z.record(z.string(), z.unknown()).optional() });
-const VoucherSchema = z.object({ voucherId: z.string().regex(/^0x[0-9a-f]{64}$/), docCommit: z.string().regex(/^0x[0-9a-f]{64}$/), schemaId: z.number().int().positive(), n: z.number().int().min(3).max(9), maxAmount: z.string().regex(/^\d+$/), tier: z.number().int().nonnegative(), expiry: z.string().regex(/^\d+$/) });
+const VoucherSchema = z.object({ voucherId: z.string().regex(/^0x[0-9a-f]{64}$/), queryId: z.string().regex(/^0x[0-9a-f]{64}$/), schemaId: z.number().int().positive(), n: z.number().int().min(3).max(9), maxAmount: z.string().regex(/^\d+$/), tier: z.number().int().nonnegative(), expiry: z.string().regex(/^\d+$/) });
 const AskSchema = z.object({ schema: z.string().min(1), docUrl: z.string().url(), n: z.union([z.literal(3), z.literal(5), z.literal(7), z.literal(9)]).optional(), params: z.record(z.string(), z.unknown()).optional(), voucher: VoucherSchema.optional(), voucherSig: z.string().regex(/^0x([0-9a-f]{2})*$/).optional(), sender: z.string().regex(/^0x[0-9a-f]{40}$/).optional(), refundTo: z.string().regex(/^0x[0-9a-f]{40}$/).optional() });
+const randomNonce = () => BigInt(`0x${Buffer.from(crypto.getRandomValues(new Uint8Array(8))).toString("hex")}`);
 const idFor = (name: string): SchemaId => {
   const found = Object.values(SchemaId).find((value) => typeof value === "number" && getSchema(value as SchemaId).name === name.toUpperCase());
   if (typeof found !== "number") throw new Error("Unknown schema");
@@ -53,26 +54,32 @@ export function createMcpHandler(deps: GatewayDeps) {
       if (deps.mcpVoucherMode && !args.voucher) return fail(id, -32602, "Voucher required");
       if (!deps.sealForIntake) throw new Error("MCP intake sealing is not configured");
       const schemaId = idFor(args.schema);
-      const attestation = await deps.intake.attestation();
-      const envelope = await deps.sealForIntake(attestation, { v: 1, schemaId, salt: zeroHash, params: args.params ?? {}, url: args.docUrl });
-      const intake = IntakeResultSchema.parse(await deps.intake.request("/v1/intake/url", { envelope }));
       const n = args.n ?? 3;
+      const voucher = args.voucher;
+      if (deps.mcpVoucherMode && (!deps.relayer || !voucher || !args.voucherSig || voucher.schemaId !== schemaId || voucher.n !== n)) throw new Error("Invalid MCP voucher");
+      // Without a voucher the caller's wallet pays, so the caller must say which address sends and gets refunds.
+      if (!deps.mcpVoucherMode && (!args.sender || !args.refundTo)) return fail(id, -32602, "sender and refundTo are required without a voucher");
+      // The intake signs who may open (relayer for vouchers, else the caller's wallet) into the provenance grant.
+      const opener = (deps.mcpVoucherMode ? deps.relayer!.sender : args.sender!).toLowerCase();
+      const nonce = deps.mcpVoucherMode ? BigInt(voucher!.voucherId) & ((1n << 64n) - 1n) : randomNonce();
+      const open: OpenBinding = { opener, payerCommit: zeroHash, isPublic: true, allowPanelDisclosure: false, nonce: nonce.toString() };
+      const attestation = await deps.intake.attestation();
+      const envelope = await deps.sealForIntake(attestation, { v: 1, schemaId, salt: zeroHash, params: args.params ?? {}, url: args.docUrl, open });
+      const intake = IntakeResultSchema.parse(await deps.intake.request("/v1/intake/url", { envelope }));
+      if (intake.provenance.opener !== opener || BigInt(intake.provenance.nonce) !== nonce || !intake.provenance.isPublic) throw new Error("Intake grant does not match the request");
       if (deps.mcpVoucherMode) {
-        const voucher = args.voucher;
-        if (!deps.relayer || !voucher || !args.voucherSig || voucher.docCommit !== intake.docCommit || voucher.schemaId !== schemaId || voucher.n !== n) throw new Error("Invalid MCP voucher");
-        const nonce = BigInt(voucher.voucherId) & ((1n << 64n) - 1n);
-        const queryId = await deps.chain.computeQueryId(deps.relayer.sender, intake.docCommit as Hex, nonce);
-        const quote = await deps.chain.quote(schemaId, n, intake.tokensK);
+        const relayer = deps.relayer!;
+        const prov = intake.provenance;
+        const queryId = await deps.chain.computeQueryId(relayer.sender, prov.docCommit as Hex, BigInt(prov.nonce));
+        // The voucher is signed for exactly one query (QueryEscrow enforces it too).
+        if (voucher!.queryId.toLowerCase() !== queryId.toLowerCase()) throw new Error("Invalid MCP voucher");
+        const quote = await deps.chain.quote(schemaId, n, prov.tokensK);
         // ANONYMA-path refunds go back into the float; refundTo must still be non-zero for the contract.
-        const p = { schemaId, n, isPublic: true, allowPanelDisclosure: false, paramsHash: intake.paramsHash, payerCommit: zeroHash, refundTo: deps.relayer.sender, nonce };
-        const prov = { ...intake.provenance, fetchedAt: BigInt(intake.provenance.fetchedAt) };
-        const txHash = await deps.relayer.openWithVoucher(p, prov, intake.intakeSig as Hex, { ...voucher, maxAmount: BigInt(voucher.maxAmount), expiry: BigInt(voucher.expiry) }, args.voucherSig as Hex);
-        await deps.store.insertAnonymaVoucher({ voucherId: voucher.voucherId as string, queryId, tier: Number(voucher.tier), usdgAmount: String(quote.jurorFees + quote.protocolFee), settled: false });
+        const txHash = await relayer.openWithVoucher({ n, refundTo: relayer.sender }, provenanceFromJson(prov), intake.intakeSig as Hex, { ...voucher!, maxAmount: BigInt(voucher!.maxAmount), expiry: BigInt(voucher!.expiry) }, args.voucherSig as Hex);
+        await deps.store.insertAnonymaVoucher({ voucherId: voucher!.voucherId as string, queryId, tier: Number(voucher!.tier), usdgAmount: String(quote.jurorFees + quote.protocolFee), settled: false });
         return respond(id, { content: [{ type: "text", text: JSON.stringify({ queryId, txHash, quote: { jurorFees: quote.jurorFees.toString(), protocolFee: quote.protocolFee.toString() } }) }] });
       }
-      // Without a voucher the caller's wallet pays, so the caller must say which address sends and gets refunds.
-      if (!args.sender || !args.refundTo) return fail(id, -32602, "sender and refundTo are required without a voucher");
-      const query = await prepareQuery(deps, { intake, n, isPublic: true, allowPanelDisclosure: false, refundTo: args.refundTo, sender: args.sender, nonce: String(deps.clock.nowSeconds()), pay: { path: "usdg" } });
+      const query = await prepareQuery(deps, { intake, n, refundTo: args.refundTo!, pay: { path: "usdg" } });
       return respond(id, { content: [{ type: "text", text: JSON.stringify(query) }] });
     } catch (error) {
       return fail(id, -32602, error instanceof z.ZodError ? "Invalid parameters" : error instanceof Error && ["Unknown schema", "Verdict not found", "Invalid MCP voucher"].includes(error.message) ? error.message : "Request failed");

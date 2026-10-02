@@ -1,5 +1,6 @@
 import { Database } from 'bun:sqlite';
 import type { ClaimReview, ClaimCorrection, PublicClaimRecord } from './types.ts';
+import type { ProviderBudgetStore } from './budget.ts';
 
 /** Only explicitly published results and aggregate usage counters go to disk. */
 export interface PublicClaimStore {
@@ -11,11 +12,11 @@ export interface PublicClaimStore {
   reserve(day: string, limit: number): boolean;
 }
 
-export class SqlitePublicClaimStore implements PublicClaimStore {
+export class SqlitePublicClaimStore implements PublicClaimStore, ProviderBudgetStore {
   private readonly db: Database;
   constructor(path: string) {
     this.db = new Database(path, { create: true });
-    this.db.exec('PRAGMA journal_mode=WAL; CREATE TABLE IF NOT EXISTS claim_publications (id TEXT PRIMARY KEY, review TEXT NOT NULL, owner_hash TEXT, corrections TEXT NOT NULL DEFAULT \'[]\', published INTEGER NOT NULL DEFAULT 1); CREATE TABLE IF NOT EXISTS claim_usage (day TEXT PRIMARY KEY, actions INTEGER NOT NULL);');
+    this.db.exec('PRAGMA journal_mode=WAL; CREATE TABLE IF NOT EXISTS claim_publications (id TEXT PRIMARY KEY, review TEXT NOT NULL, owner_hash TEXT, corrections TEXT NOT NULL DEFAULT \'[]\', published INTEGER NOT NULL DEFAULT 1); CREATE TABLE IF NOT EXISTS claim_usage (day TEXT PRIMARY KEY, actions INTEGER NOT NULL); CREATE TABLE IF NOT EXISTS claim_provider_usage (day TEXT NOT NULL, juror TEXT NOT NULL, calls INTEGER NOT NULL, tokens INTEGER NOT NULL, PRIMARY KEY (day, juror));');
     const columns = this.db.query('PRAGMA table_info(claim_publications)').all() as { name: string }[];
     if (!columns.some(column => column.name === 'owner_hash')) this.db.exec('ALTER TABLE claim_publications ADD COLUMN owner_hash TEXT');
     if (!columns.some(column => column.name === 'corrections')) this.db.exec("ALTER TABLE claim_publications ADD COLUMN corrections TEXT NOT NULL DEFAULT '[]'");
@@ -52,6 +53,24 @@ export class SqlitePublicClaimStore implements PublicClaimStore {
       const result = this.db.query('UPDATE claim_usage SET actions = actions + 1 WHERE day = ? AND actions < ?').run(day, limit);
       return result.changes === 1;
     })();
+  }
+  reserveProvider(day: string, key: string, tokens: number, limits: { calls: number; tokens: number }): boolean {
+    return this.db.transaction(() => {
+      this.db.query('INSERT OR IGNORE INTO claim_provider_usage (day, juror, calls, tokens) VALUES (?, ?, 0, 0)').run(day, key);
+      const result = this.db.query('UPDATE claim_provider_usage SET calls = calls + 1, tokens = tokens + ? WHERE day = ? AND juror = ? AND calls < ? AND tokens + ? <= ?')
+        .run(tokens, day, key, limits.calls, tokens, limits.tokens);
+      return result.changes === 1;
+    })();
+  }
+  settleProvider(day: string, key: string, tokenDelta: number): void {
+    this.db.query('UPDATE claim_provider_usage SET tokens = MAX(0, tokens + ?) WHERE day = ? AND juror = ?').run(tokenDelta, day, key);
+  }
+  releaseProvider(day: string, key: string, tokens: number): void {
+    this.db.query('UPDATE claim_provider_usage SET calls = MAX(0, calls - 1), tokens = MAX(0, tokens - ?) WHERE day = ? AND juror = ?').run(tokens, day, key);
+  }
+  providerUsage(day: string, key: string): { calls: number; tokens: number } {
+    const row = this.db.query('SELECT calls, tokens FROM claim_provider_usage WHERE day = ? AND juror = ?').get(day, key) as { calls: number; tokens: number } | null;
+    return row ?? { calls: 0, tokens: 0 };
   }
   close(): void { this.db.close(); }
 }

@@ -1,0 +1,13 @@
+{
+  "note": "Harmless public canary claim. Tools must never print or persist these strings; reports carry hashes, ids and the enum label only.",
+  "claim": "The Bitcoin whitepaper was first published in 2010.",
+  "evidence": [
+    {
+      "id": "metzdowd-2008-10-31",
+      "title": "Bitcoin P2P e-cash paper (Cryptography Mailing List, 31 Oct 2008)",
+      "url": "https://www.metzdowd.com/pipermail/cryptography/2008-October/014810.html",
+      "excerpt": "Bitcoin P2P e-cash paper. Satoshi Nakamoto, Fri Oct 31 2008. I've been working on a new electronic cash system that's fully peer-to-peer, with no trusted third party. The paper is available at: http://www.bitcoin.org/bitcoin.pdf"
+    }
+  ],
+  "expected": "contradicted"
+}

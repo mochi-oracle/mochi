@@ -30,6 +30,7 @@ interface IJurorRegistry {
     event Slashed(address indexed key, uint256 amount, bytes32 reason);
     event Delisted(address indexed key, bytes32 reason);
     event ServiceRecorded(address indexed key, bool timedOut);
+    event PoolPruned(MochiTypes.JurorClass indexed jurorClass, uint256 generation, uint256 kept, uint256 removed);
 
     error AlreadyEnrolled(address key);
     error NotEnrolled(address key);
@@ -41,8 +42,11 @@ interface IJurorRegistry {
     error ExitDelayNotElapsed(uint64 readyAt);
     error NoEligibleJuror(MochiTypes.JurorClass jurorClass);
     error TimeoutSlashNotAllowed(address key);
+    // aderyn-ignore-next-line(unused-error) in the generated ABI; drop with the next ABI change
     error Unauthorized(address caller);
     error BadKeySignature();
+    error NoSelectionSnapshot(address owner, bytes32 queryId);
+    error NothingToPrune(MochiTypes.JurorClass jurorClass);
 
     // ── enrollment ──
 
@@ -75,11 +79,17 @@ interface IJurorRegistry {
     /// @notice ATTESTOR sets attestedUntil for each key (after verifying fresh quotes off-chain).
     function refreshAttestation(address[] calldata keys, uint64 until) external;
 
-    /// @notice Operator starts the 7-day exit; the key becomes inactive immediately.
+    /// @notice Operator starts the 7-day exit; the key becomes inactive immediately and permanently.
     function requestExit(address key) external;
 
-    /// @notice Operator withdraws the remaining bond after the exit delay.
+    /// @notice Operator withdraws the remaining bond once the exit delay has passed since both the exit request and the
+    ///         key's last settled seat (`lastServedAt`). The key cannot take a new seat after the exit request, so this
+    ///         only extends the wait for a key that requests exit while a round it sits in is still unsettled: its bond
+    ///         stays slashable, e.g. for equivocation on that query, for the full delay after the round settles.
     function withdrawBond(address key) external;
+
+    /// @notice Last time recordService recorded a settled seat (answered or timed out) for `key`; 0 if never.
+    function lastServedAt(address key) external view returns (uint64);
 
     // ── slashing ──
 
@@ -93,7 +103,7 @@ interface IJurorRegistry {
     ///         slash, slash 1% of the current bond.
     function slashForTimeouts(address key) external;
 
-    /// @notice SLASHER (MochiVerdicts) records one served seat per key.
+    /// @notice SLASHER (MochiVerdicts) records one served seat per key and sets lastServedAt to now.
     function recordService(address[] calldata keys, uint32 timeoutMask) external;
 
     // ── views ──
@@ -104,18 +114,54 @@ interface IJurorRegistry {
 
     function operatorOf(address key) external view returns (address);
 
-    /// @notice Deterministic selection for seats [fromSeat, toSeat) of the nested class mix.
-    /// @dev For each seat s: c = MochiTypes.seatClass(s); list = all JUROR keys ever enrolled with class c
-    ///      (enrollment order); start = uint256(keccak256(abi.encode(seed, s))) % list.length; probe
-    ///      start, start+1, ... (mod length) for at most list.length entries and take the first key that isActive(JUROR)
-    ///      and is not in `exclude` and not already chosen for an earlier seat in this call. Reverts NoEligibleJuror(c).
-    function selectJurors(bytes32 seed, uint8 fromSeat, uint8 toSeat, address[] calldata exclude)
-        external
-        view
-        returns (address[] memory jurors);
+    // ── selection ──
+
+    /// @notice Records, for (msg.sender, queryId), the current selection pool of every class as (generation, length),
+    ///         and returns isActive(intakeKey, INTAKE). Every round of the query selects from this snapshot.
+    /// @dev QueryEscrow calls it once, when it opens the query, in the same transaction that draws the first randomness
+    ///      ticket, so the pools are fixed before any seed of the query can be known; keys enrolled later never take
+    ///      part. Expansion and reseal draw new tickets but keep the snapshot. The intake check rides along so the escrow
+    ///      (near the EIP-170 limit) opens with a single registry call. A later call for the same queryId replaces the
+    ///      snapshot, so callers must call it only before a query's first ticket. Anyone may call it; snapshots are
+    ///      keyed by caller.
+    function openSelection(bytes32 queryId, address intakeKey) external returns (bool intakeKeyActive);
+
+    /// @notice The packed openSelection snapshot of `owner` for `queryId` (0 if none): bit 255 set, and for class c at bit
+    ///         48 * c the pool generation (24 bits) then the pool length (24 bits).
+    function selectionSnapshot(address owner, bytes32 queryId) external view returns (uint256);
+
+    /// @notice Deterministic selection for seats [fromSeat, toSeat) of the class mix, over `owner`'s snapshot for
+    ///         `queryId`. Reverts NoSelectionSnapshot without one.
+    /// @dev For each seat s: c = seatClass(s); (g, len) = the snapshot of class c; pool = poolAt(c, g)[0, len). A key is
+    ///      eligible if isActive(JUROR), not in `exclude` and not chosen for an earlier seat in this call. For
+    ///      attempt = 0..15: i = uint256(keccak256(abi.encode(seed, s, attempt))) % len; take pool[i] if eligible. If all
+    ///      16 draws miss: count the eligible keys of the pool, pick = uint256(keccak256(abi.encode(seed, s, 16))) % count,
+    ///      and take the pick-th eligible key in pool order. Reverts NoEligibleJuror(c) if none is eligible. Every
+    ///      eligible key is equally likely, whatever the inactive entries around it, and the pools a snapshot names never
+    ///      change, so neither enrolling nor pruning after the seed is known can move a seat.
+    function selectJurors(
+        address owner,
+        bytes32 queryId,
+        bytes32 seed,
+        uint8 fromSeat,
+        uint8 toSeat,
+        address[] calldata exclude
+    ) external view returns (address[] memory jurors);
+
+    /// @notice Anyone: starts the next pool generation of `jurorClass` with the keys of the current one that can still
+    ///         serve, i.e. drops keys that requested exit or were delisted (both permanent). Order is kept. Existing
+    ///         snapshots keep their generation. Reverts NothingToPrune when no key would be dropped.
+    function prunePool(MochiTypes.JurorClass jurorClass) external returns (uint256 kept, uint256 removed);
+
+    /// @notice Current pool generation of `jurorClass`.
+    function poolGeneration(MochiTypes.JurorClass jurorClass) external view returns (uint256);
+
+    /// @notice Keys of `jurorClass`'s pool generation `generation`, in enrollment order.
+    function poolAt(MochiTypes.JurorClass jurorClass, uint256 generation) external view returns (address[] memory);
 
     function minJurorBond() external view returns (uint256);
     function exitDelay() external view returns (uint64);
+    /// @notice Keys of `jurorClass`'s current selection pool (enrolled keys, minus those dropped by prunePool).
     function jurorsOfClass(MochiTypes.JurorClass jurorClass) external view returns (address[] memory);
     function setClassMix(IClassMix classMix_) external;
     function seatClass(uint8 seat) external view returns (MochiTypes.JurorClass);

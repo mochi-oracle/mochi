@@ -102,8 +102,6 @@ contract ClerkVotingSnapshotInvariantTest is Test {
         targetContract(address(handler));
     }
 
-    /// forge-config: default.invariant.runs = 128
-    /// forge-config: default.invariant.depth = 40
     function invariant_proposalVotesNeverExceedSnapshot() public view {
         for (uint256 id = 1; id <= voting.proposalCount(); ++id) {
             ClerkVoting.Proposal memory p = voting.getProposal(id);
@@ -111,8 +109,6 @@ contract ClerkVotingSnapshotInvariantTest is Test {
         }
     }
 
-    /// forge-config: default.invariant.runs = 128
-    /// forge-config: default.invariant.depth = 40
     function invariant_totalStakedEqualsSumOfActorStake() public view {
         uint256 sum;
         for (uint256 i; i < 3; ++i) sum += staking.stakeOf(address(handler.actors(i)));

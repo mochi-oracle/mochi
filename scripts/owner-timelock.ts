@@ -45,6 +45,7 @@ else if (action === "set-measurement") {
   if (args.length < 3) throw new Error("grant-role requires <contract-address> <role-bytes32> <account>");
   target = args[0] as Address; signature = "grantRole(bytes32,address)"; fnArgs = [args[1], args[2]];
 } else {
+  // nosemgrep: html-in-template-string -- CLI usage text, not HTML
   if (args.length < 2) throw new Error(`${action} requires <target-address> <function signature> [args…]`);
   target = args[0] as Address; signature = args[1]!;
   fnArgs = args.slice(2);

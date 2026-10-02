@@ -72,4 +72,11 @@ describe('createAciJuror', () => {
     expect(() => createAciJuror({ id: 'j', model: 'm', baseUrl: 'https://aci.test/v1' })).toThrow('API key');
     expect(() => createAciJuror({ id: 'j', model: 'm', baseUrl: 'http://aci.test/v1', apiKey: 'not-a-real-key' })).toThrow('HTTPS');
   });
+  test('runs unpinned only when no attestation policy is configured; a configured policy must carry an attested pin', () => {
+    expect(() => createAciJuror({ id: 'j', model: 'm', baseUrl: 'https://aci.test/v1', apiKey: 'not-a-real-key' })).not.toThrow();
+    expect(() => createAciJuror({ id: 'j', model: 'm', baseUrl: 'https://aci.test/v1', apiKey: 'not-a-real-key', allowedWorkloads: [`os:${'ab'.repeat(32)}`] })).not.toThrow();
+    for (const allowedWorkloads of [[], ['workload-id'], ['model:m']]) {
+      expect(() => createAciJuror({ id: 'j', model: 'm', baseUrl: 'https://aci.test/v1', apiKey: 'not-a-real-key', allowedWorkloads })).toThrow('workload_unpinned');
+    }
+  });
 });

@@ -10,7 +10,7 @@ export function createIntakeChain(dep: Deployment): IntakeChainPort {
       const q = await chain.getQuery(queryId);
       return {
         status: q.status, docCommit: q.docCommit, paramsHash: q.paramsHash, schemaId: q.schemaId,
-        schemaVersion: q.schemaVersion, isPublic: q.isPublic, allowPanelDisclosure: q.allowPanelDisclosure,
+        provenanceHash: q.provenanceHash, schemaVersion: q.schemaVersion, isPublic: q.isPublic, allowPanelDisclosure: q.allowPanelDisclosure,
       };
     },
     async getPanelCase(queryId) {

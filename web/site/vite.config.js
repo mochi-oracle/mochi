@@ -17,5 +17,9 @@ const mochiCssLast = {
 
 export default defineConfig({
   plugins: [mochiCssLast],
-  build: {rollupOptions: {input: Object.fromEntries(['', 'about', 'how-it-works', 'case-study', 'roadmap', 'docs', 'whitepaper', 'dashboard', 'check', 'tokenomics', 'guide'].map(r => [r || 'home', resolve(r, 'index.html')]))}},
+  // 404.html is the branded page web/server.ts returns for unknown non-API URLs.
+  build: {rollupOptions: {input: {
+    ...Object.fromEntries(['', 'about', 'how-it-works', 'case-study', 'roadmap', 'docs', 'whitepaper', 'dashboard', 'check', 'tokenomics', 'guide'].map(r => [r || 'home', resolve(r, 'index.html')])),
+    'not-found': resolve('404.html'),
+  }}},
 });

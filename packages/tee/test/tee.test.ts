@@ -88,8 +88,12 @@ function awaitableHex(hex: Hex): Uint8Array { return Uint8Array.from(hex.slice(2
 
 describe("typed data signatures", () => {
   const chainId = 31337, escrow = `0x${"44".repeat(20)}` as const, verdicts = `0x${"55".repeat(20)}` as const;
-  const prov: Provenance = { docCommit: `0x${"01".repeat(32)}`, kind: 1, originId: `0x${"02".repeat(32)}`, fetchedAt: 1700000000n, tokensK: 4, transcriptHash: `0x${"03".repeat(32)}` };
-  const voucher: AnonymaVoucher = { voucherId: `0x${"11".repeat(32)}`, docCommit: prov.docCommit, schemaId: 3, n: 5, maxAmount: 123456n, tier: 2, expiry: 1700001000n };
+  const prov: Provenance = {
+    docCommit: `0x${"01".repeat(32)}`, kind: 1, originId: `0x${"02".repeat(32)}`, fetchedAt: 1700000000n, tokensK: 4, transcriptHash: `0x${"03".repeat(32)}`,
+    opener: `0x${"06".repeat(20)}`, schemaId: 3, schemaVersion: 1, paramsHash: `0x${"07".repeat(32)}`, payerCommit: `0x${"08".repeat(32)}`,
+    isPublic: false, allowPanelDisclosure: false, nonce: 9n, expiry: 1700000900n,
+  };
+  const voucher: AnonymaVoucher = { voucherId: `0x${"11".repeat(32)}`, queryId: `0x${"12".repeat(32)}`, schemaId: 3, n: 5, maxAmount: 123456n, tier: 2, expiry: 1700001000n };
   const answer = { queryId: `0x${"21".repeat(32)}` as Hex, docCommit: prov.docCommit, schemaId: 3, schemaVersion: 1, answerHash: `0x${"22".repeat(32)}` as Hex, spansRoot: `0x${"23".repeat(32)}` as Hex, quoteHash: `0x${"24".repeat(32)}` as Hex };
   const verdict: VerdictInput = { queryId: answer.queryId, round: 0, status: 1, agreementBps: 8000, dissentMask: 2, timeoutMask: 0, answerHash: answer.answerHash, payloadHash: `0x${"31".repeat(32)}`, evidenceRoot: `0x${"32".repeat(32)}` };
   const votes = `0x${"33".repeat(32)}` as Hex;
@@ -97,9 +101,11 @@ describe("typed data signatures", () => {
     const s1 = await signProvenance(root, chainId, escrow, prov);
     expect(await recoverProvenance(chainId, escrow, prov, s1)).toBe(root.address);
     expect(await recoverProvenance(chainId, escrow, { ...prov, tokensK: 5 }, s1)).not.toBe(root.address);
+    expect(await recoverProvenance(chainId, escrow, { ...prov, opener: `0x${"0a".repeat(20)}` }, s1)).not.toBe(root.address);
     const s2 = await signAnonymaVoucher(root, chainId, escrow, voucher);
     expect(await recoverAnonymaVoucher(chainId, escrow, voucher, s2)).toBe(root.address);
     expect(await recoverAnonymaVoucher(chainId, escrow, { ...voucher, n: 7 }, s2)).not.toBe(root.address);
+    expect(await recoverAnonymaVoucher(chainId, escrow, { ...voucher, queryId: `0x${"13".repeat(32)}` }, s2)).not.toBe(root.address);
     const s3 = await signJurorAnswer(root, chainId, verdicts, answer);
     expect(await recoverJurorAnswer(chainId, verdicts, answer, s3)).toBe(root.address);
     const changedAnswers = [

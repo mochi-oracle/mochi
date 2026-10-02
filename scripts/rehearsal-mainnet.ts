@@ -71,7 +71,7 @@ try {
 
   run("deploy", ["bun", "scripts/deploy-local.ts", "--mainnet", "--rehearsal", "--rpc", RPC, "--key-file", deployerKeyFile,
     "--owner", owner.address, "--guardian", guardian.address, "--usdg", usdg, "--shielded", "privacy-pools", "--randomness", "drand",
-    "--timelock-delay", String(delay), "--out", out, "--yes"]);
+    "--timelock-delay", String(delay), "--panel-escalation", "off", "--out", out, "--yes"]);
   run("verify", ["bun", "scripts/verify-ownership.ts", out]);
   const dep = JSON.parse(readFileSync(out, "utf8")) as { contracts: Record<string, Address> };
   const escrow = dep.contracts.queryEscrow!;

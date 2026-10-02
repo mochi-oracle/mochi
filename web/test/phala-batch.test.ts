@@ -8,20 +8,20 @@ const deployment={contracts:{timelock:a(101),jurorRegistry:a(102),queryEscrow:a(
 const input={salt:m,intake:identity(1),consensus:identity(2),jurors:[0,0,1,1,2,2,3,4,4].map((cls,i)=>({...identity(i+3),class:cls})),attestor:a(110),feedRunner:a(111),orchestrator:a(112),indexer:a(113),postman:a(114)};
 test('configuration cannot unpause; activation is a separate delayed operation',()=>{
  const setup=buildPhalaBatch(deployment,input,'schedule');const live=buildPhalaBatch(deployment,input,'schedule','activate');
- const signature=live.payloads[0];expect(setup.payloads).not.toContain(signature!);expect(live.callCount).toBe(1);expect(live.delaySeconds).toBe(86400);expect(setup.operationId).not.toBe(live.operationId);
+ const signature=live.payloads[0];expect(setup.payloads).not.toContain(signature!);expect(live.callCount).toBe(1);expect(live.delaySeconds).toBe(60);expect(setup.operationId).not.toBe(live.operationId);
  expect(decodeFunctionData({abi:parseAbi(['function unpause()']),data:signature!}).functionName).toBe('unpause');
 });
 test('rejects incomplete juries and duplicated enclave keys',()=>{
  expect(()=>buildPhalaBatch(deployment,{...input,jurors:input.jurors.slice(0,5)},'schedule')).toThrow('nine jurors');
  expect(()=>buildPhalaBatch(deployment,{...input,consensus:input.intake},'schedule')).toThrow('unique key');
 });
-test('mainnet batches always schedule one day; a testnet rehearsal uses its deployed delay',()=>{
+test('batches schedule the recorded delay: 60 seconds by default, 0-3600 seconds on every chain',()=>{
  const schedule=parseAbi(['function scheduleBatch(address[] targets,uint256[] values,bytes[] payloads,bytes32 predecessor,bytes32 salt,uint256 delay)']);
- const mainnet=buildPhalaBatch({...deployment,chainId:4663,timelockDelay:'86400'},input,'schedule');
- expect(mainnet.delaySeconds).toBe(86400);expect(decodeFunctionData({abi:schedule,data:mainnet.calldata}).args[5]).toBe(86400n);
- expect(()=>buildPhalaBatch({...deployment,chainId:4663,timelockDelay:'60'},input,'schedule')).toThrow('86400-second');
+ const mainnet=buildPhalaBatch({...deployment,chainId:4663,timelockDelay:'60'},input,'schedule');
+ expect(mainnet.delaySeconds).toBe(60);expect(decodeFunctionData({abi:schedule,data:mainnet.calldata}).args[5]).toBe(60n);
+ expect(()=>buildPhalaBatch({...deployment,chainId:4663,timelockDelay:'3601'},input,'schedule')).toThrow('0 to 3600');
  const rehearsal=buildPhalaBatch({...deployment,chainId:46630,rehearsal:true,timelockDelay:'120'},input,'schedule');
  expect(rehearsal.delaySeconds).toBe(120);expect(decodeFunctionData({abi:schedule,data:rehearsal.calldata}).args[5]).toBe(120n);
- expect(()=>buildPhalaBatch({...deployment,chainId:46630,rehearsal:true,timelockDelay:'30'},input,'schedule')).toThrow('at least 60');
- expect(buildPhalaBatch({...deployment,chainId:46630,timelockDelay:'120'},input,'schedule').delaySeconds).toBe(86400);
+ expect(()=>buildPhalaBatch({...deployment,chainId:46630,rehearsal:true,timelockDelay:'86400'},input,'schedule')).toThrow('0 to 3600');
+ expect(buildPhalaBatch({...deployment,chainId:4663},input,'schedule').delaySeconds).toBe(60);
 });

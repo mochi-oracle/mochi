@@ -6,7 +6,12 @@ import {MochiTypes} from "../libraries/MochiTypes.sol";
 /// @title IQueryEscrow
 /// @notice Query lifecycle (open → seal → settle | expand | expire), pricing, and payment paths.
 ///
-/// queryId = keccak256(abi.encode(block.chainid, address(this), msg.sender, prov.docCommit, p.nonce))
+/// queryId = keccak256(abi.encode(block.chainid, address(this), msg.sender, prov.docCommit, prov.nonce))
+///
+/// Opening requires an intake-signed Provenance (EIP-712, see MochiTypes.Provenance). It binds the document to the
+/// opener (== msg.sender), schema id/version, paramsHash, payerCommit, both consent flags, the queryId nonce and an
+/// expiry; the query takes all of these from the signed grant. Because queryId is a function of the grant, each grant
+/// opens at most one query.
 ///
 /// Pricing (snapshotted per seat at open / expand so later price changes never affect an open query):
 ///   seatFee(seat) = classBase[seatClass(seat)] + classPerK[seatClass(seat)] * tokensK
@@ -67,14 +72,16 @@ interface IQueryEscrow {
     error DeadlineNotPassed(uint64 deadline);
     error NotAuthorized(address caller);
     error ZeroTokens();
+    error ProvenanceExpired(uint64 expiry);
 
     // ── pricing ──
 
     function quote(uint32 schemaId, uint8 n, uint32 tokensK) external view returns (uint256 jurorFees, uint256 protocolFee);
     function quoteExpansion(bytes32 queryId, uint8 newN) external view returns (uint256 jurorFees, uint256 protocolFee);
 
-    // ── open (all revert when paused; all verify `intakeSig` = EIP-712 Provenance by an active INTAKE key;
-    //    all require an active schema version (latest), valid n, tokensK >= 1, refundTo != 0, fresh queryId) ──
+    // ── open (all revert when paused; all verify `intakeSig` = EIP-712 Provenance by an active INTAKE key, issued for
+    //    msg.sender (NotAuthorized otherwise) and not expired (ProvenanceExpired); all require prov.schemaVersion ==
+    //    the schema's latest active version, valid n, tokensK >= 1, refundTo != 0, fresh queryId) ──
 
     /// @notice Pulls `total` USDG from msg.sender.
     function openWithUSDG(MochiTypes.OpenParams calldata p, MochiTypes.Provenance calldata prov, bytes calldata intakeSig)
@@ -90,9 +97,10 @@ interface IQueryEscrow {
         bytes calldata proof
     ) external returns (bytes32 queryId);
 
-    /// @notice Anonyma path: voucher signed by `anonymaSigner` (EIP-712), unused, unexpired, voucher.docCommit ==
-    ///         prov.docCommit, voucher.schemaId == p.schemaId, voucher.n == p.n, total <= voucher.maxAmount.
-    ///         Draws `total` from anonymaFloat (Anonyma's prepaid USDG float).
+    /// @notice Anonyma path: voucher signed by `anonymaSigner` (EIP-712), unused, unexpired, voucher.queryId == the
+    ///         queryId this open creates (computeQueryId(msg.sender, prov.docCommit, prov.nonce)), voucher.schemaId ==
+    ///         prov.schemaId, voucher.n == p.n, total <= voucher.maxAmount. Draws `total` from anonymaFloat (Anonyma's
+    ///         prepaid USDG float).
     function openWithVoucher(
         MochiTypes.OpenParams calldata p,
         MochiTypes.Provenance calldata prov,
@@ -101,7 +109,7 @@ interface IQueryEscrow {
         bytes calldata anonymaSig
     ) external returns (bytes32 queryId);
 
-    /// @notice FEED_RUNNER only; requires p.isPublic and prov.kind == FETCHED; draws from feedBudget.
+    /// @notice FEED_RUNNER only; requires prov.isPublic and prov.kind == FETCHED; draws from feedBudget.
     function openFeed(MochiTypes.OpenParams calldata p, MochiTypes.Provenance calldata prov, bytes calldata intakeSig)
         external
         returns (bytes32 queryId);
@@ -125,6 +133,8 @@ interface IQueryEscrow {
 
     function expandShielded(bytes32 queryId, uint8 newN, bytes32 nullifier, bytes calldata proof) external;
 
+    /// @notice ANONYMA queries only. The voucher must name this queryId, its schemaId and newN, and cover the
+    ///         expansion price; otherwise the same checks as openWithVoucher.
     function expandWithVoucher(
         bytes32 queryId,
         uint8 newN,

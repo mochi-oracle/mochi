@@ -68,6 +68,22 @@ contract JurorRegistryTest is Test {
         registry.refreshAttestation(keys, uint64(block.timestamp + 30 days));
     }
 
+    uint256 private snapshotNonce;
+
+    /// @dev Snapshots the current pools under a fresh query id (this contract as owner), then selects from it.
+    function _select(bytes32 seed_, uint8 fromSeat, uint8 toSeat, address[] memory exclude)
+        private
+        returns (address[] memory)
+    {
+        bytes32 qid = _snap();
+        return registry.selectJurors(address(this), qid, seed_, fromSeat, toSeat, exclude);
+    }
+
+    function _snap() private returns (bytes32 qid) {
+        qid = keccak256(abi.encode("snapshot", ++snapshotNonce));
+        registry.openSelection(qid, address(0));
+    }
+
     function _addClass(MochiTypes.JurorClass class_, uint256 n) private returns (address[] memory keys) {
         keys = new address[](n);
         for (uint256 i; i < n; ++i) {
@@ -110,7 +126,7 @@ contract JurorRegistryTest is Test {
         assertFalse(registry.isActive(key, MochiTypes.Role.JUROR));
         _attest(key);
         assertTrue(registry.isActive(key, MochiTypes.Role.JUROR));
-        address[] memory selected = registry.selectJurors(bytes32(uint256(1)), 0, 1, new address[](0));
+        address[] memory selected = _select(bytes32(uint256(1)), 0, 1, new address[](0));
         assertEq(selected[0], key);
         vm.prank(ADMIN);
         registry.setUnbondedJuror(key, address(0));
@@ -343,7 +359,7 @@ contract JurorRegistryTest is Test {
         mix.setMix(customMix);
         vm.prank(ADMIN);
         registry.setClassMix(IClassMix(address(mix)));
-        address[] memory selected = registry.selectJurors(keccak256("custom-mix"), 0, 5, new address[](0));
+        address[] memory selected = _select(keccak256("custom-mix"), 0, 5, new address[](0));
         for (uint8 seat; seat < 5; ++seat) {
             assertEq(uint8(registry.getJuror(selected[seat]).jurorClass), customMix[seat]);
         }
@@ -357,8 +373,8 @@ contract JurorRegistryTest is Test {
         _addClass(MochiTypes.JurorClass.DISSENTER, 2);
         bytes32 seed_ = keccak256("fixed-seed");
         address[] memory empty = new address[](0);
-        address[] memory first = registry.selectJurors(seed_, 0, 9, empty);
-        address[] memory again = registry.selectJurors(seed_, 0, 9, empty);
+        address[] memory first = _select(seed_, 0, 9, empty);
+        address[] memory again = _select(seed_, 0, 9, empty);
         assertEq(keccak256(abi.encode(first)), keccak256(abi.encode(again)));
         assertNotEq(first[0], first[5]); // two LARGE_A seats use distinct enrolled keys
         for (uint8 seat; seat < 9; ++seat) {
@@ -368,7 +384,7 @@ contract JurorRegistryTest is Test {
         }
         address[] memory excluded = new address[](1);
         excluded[0] = a[0];
-        address[] memory selection = registry.selectJurors(seed_, 0, 3, excluded);
+        address[] memory selection = _select(seed_, 0, 3, excluded);
         for (uint256 i; i < selection.length; ++i) assertNotEq(selection[i], a[0]);
     }
 
@@ -381,16 +397,19 @@ contract JurorRegistryTest is Test {
         _addClass(MochiTypes.JurorClass.DOC_SPECIALIST, 1);
         _addClass(MochiTypes.JurorClass.DISSENTER, 1);
         address[] memory none = new address[](0);
-        address[] memory picked = registry.selectJurors(bytes32(uint256(4)), 0, 1, none);
+        address[] memory picked = _select(bytes32(uint256(4)), 0, 1, none);
         assertEq(picked[0], active);
+        bytes32 qid = _snap();
         vm.expectRevert(JurorRegistry.BadSeatRange.selector);
-        registry.selectJurors(bytes32(0), 0, 0, none);
+        registry.selectJurors(address(this), qid, bytes32(0), 0, 0, none);
         vm.expectRevert(JurorRegistry.BadSeatRange.selector);
-        registry.selectJurors(bytes32(0), 0, 10, none);
-        vm.expectRevert(abi.encodeWithSelector(IJurorRegistry.NoEligibleJuror.selector, MochiTypes.JurorClass.LARGE_A));
+        registry.selectJurors(address(this), qid, bytes32(0), 0, 10, none);
         address[] memory excluded = new address[](1);
         excluded[0] = active;
-        registry.selectJurors(bytes32(0), 0, 1, excluded);
+        vm.expectRevert(abi.encodeWithSelector(IJurorRegistry.NoEligibleJuror.selector, MochiTypes.JurorClass.LARGE_A));
+        registry.selectJurors(address(this), qid, bytes32(0), 0, 1, excluded);
+        vm.expectRevert(abi.encodeWithSelector(IJurorRegistry.NoSelectionSnapshot.selector, address(this), bytes32(0)));
+        registry.selectJurors(address(this), bytes32(0), bytes32(0), 0, 1, none);
     }
 
     function testFuzzSelectionsAlwaysActiveDistinctAndCorrectClass(bytes32 seed_, uint8 rawN) public {
@@ -405,11 +424,168 @@ contract JurorRegistryTest is Test {
         uint8[4] memory allowed = [uint8(3), 5, 7, 9];
         uint8 n = allowed[rawN % 4];
         address[] memory none = new address[](0);
-        address[] memory selected = registry.selectJurors(seed_, 0, n, none);
+        address[] memory selected = _select(seed_, 0, n, none);
         for (uint8 seat; seat < n; ++seat) {
             assertTrue(registry.isActive(selected[seat], MochiTypes.Role.JUROR));
             assertEq(uint256(registry.getJuror(selected[seat]).jurorClass), uint256(MochiTypes.seatClass(seat)));
             for (uint8 earlier; earlier < seat; ++earlier) assertNotEq(selected[seat], selected[earlier]);
         }
+    }
+
+    uint256 private freshNonce;
+
+    /// @dev Like _addClass, but with keys that never collide with earlier calls.
+    function _addKeys(MochiTypes.JurorClass class_, uint256 n) private returns (address[] memory keys) {
+        keys = new address[](n);
+        for (uint256 i; i < n; ++i) {
+            keys[i] = _key(uint256(keccak256(abi.encode("fresh", ++freshNonce))));
+            _enroll(keys[i], class_, BOND);
+            _attest(keys[i]);
+        }
+    }
+
+    function _retire(address key) private {
+        vm.prank(OP);
+        registry.requestExit(key);
+    }
+
+    function testSnapshotIgnoresKeysEnrolledLater(bytes32 seed_) public {
+        address[] memory early = _addKeys(MochiTypes.JurorClass.LARGE_A, 2);
+        bytes32 qid = _snap();
+        address[] memory late = _addKeys(MochiTypes.JurorClass.LARGE_A, 6);
+        address[] memory none = new address[](0);
+        address picked = registry.selectJurors(address(this), qid, seed_, 0, 1, none)[0];
+        assertTrue(picked == early[0] || picked == early[1]);
+        for (uint256 i; i < late.length; ++i) assertNotEq(picked, late[i]);
+        // A later snapshot sees the new keys.
+        assertEq(registry.jurorsOfClass(MochiTypes.JurorClass.LARGE_A).length, 8);
+        uint256 packed = registry.selectionSnapshot(address(this), qid);
+        assertEq(packed >> 255, 1);
+        assertEq(uint24(packed >> 24), 2); // LARGE_A: generation 0, length 2
+    }
+
+    function testPruneDropsRetiredKeysWithoutMovingExistingSnapshots(bytes32 seed_) public {
+        address[] memory keys = _addKeys(MochiTypes.JurorClass.LARGE_A, 6);
+        bytes32 before = _snap();
+        address[] memory none = new address[](0);
+        address[] memory picked = registry.selectJurors(address(this), before, seed_, 0, 1, none);
+        vm.expectRevert(abi.encodeWithSelector(IJurorRegistry.NothingToPrune.selector, MochiTypes.JurorClass.LARGE_A));
+        registry.prunePool(MochiTypes.JurorClass.LARGE_A);
+        // Retire every key but the picked one and one other, then prune.
+        address other = keys[0] == picked[0] ? keys[1] : keys[0];
+        for (uint256 i; i < keys.length; ++i) {
+            if (keys[i] != picked[0] && keys[i] != other) _retire(keys[i]);
+        }
+        (uint256 keptCount, uint256 removed) = registry.prunePool(MochiTypes.JurorClass.LARGE_A);
+        assertEq(keptCount, 2);
+        assertEq(removed, 4);
+        assertEq(registry.poolGeneration(MochiTypes.JurorClass.LARGE_A), 1);
+        address[] memory current = registry.jurorsOfClass(MochiTypes.JurorClass.LARGE_A);
+        assertEq(current.length, 2);
+        for (uint256 i; i < current.length; ++i) assertTrue(registry.isActive(current[i], MochiTypes.Role.JUROR));
+        assertEq(registry.poolAt(MochiTypes.JurorClass.LARGE_A, 0).length, 6);
+        // The old snapshot still names generation 0 and selects the same key.
+        assertEq(registry.selectJurors(address(this), before, seed_, 0, 1, none)[0], picked[0]);
+        // New enrollments join the new generation.
+        address fresh = _addKeys(MochiTypes.JurorClass.LARGE_A, 1)[0];
+        current = registry.jurorsOfClass(MochiTypes.JurorClass.LARGE_A);
+        assertEq(current.length, 3);
+        assertEq(current[2], fresh);
+        address[] memory after_ = _select(seed_, 0, 1, none);
+        assertTrue(registry.isActive(after_[0], MochiTypes.Role.JUROR));
+    }
+
+    function testPruneKeepsKeysThatOnlyLostAttestation() public {
+        address[] memory keys = _addKeys(MochiTypes.JurorClass.SMALL_FAST, 3);
+        registry.reportAttestationFailure(keys[0]); // reversible: stays in the pool
+        _retire(keys[1]);
+        (uint256 kept, uint256 removed) = registry.prunePool(MochiTypes.JurorClass.SMALL_FAST);
+        assertEq(kept, 2);
+        assertEq(removed, 1);
+        address[] memory current = registry.jurorsOfClass(MochiTypes.JurorClass.SMALL_FAST);
+        assertEq(current[0], keys[0]);
+        assertEq(current[1], keys[2]);
+    }
+
+    /// One active key behind 200 unattested ones: almost every seat goes through the exact fallback, which still
+    /// finds it, and honors exclusion.
+    function testFallbackFindsTheOnlyEligibleKey() public {
+        vm.prank(ADMIN);
+        registry.setMinJurorBond(1 ether);
+        for (uint256 i; i < 200; ++i) _enroll(_key(10_000 + i), MochiTypes.JurorClass.DISSENTER, 1 ether);
+        address only = _addKeys(MochiTypes.JurorClass.DISSENTER, 1)[0];
+        bytes32 qid = _snap();
+        address[] memory none = new address[](0);
+        for (uint256 i; i < 8; ++i) {
+            address[] memory picked = registry.selectJurors(address(this), qid, keccak256(abi.encode(i)), 2, 3, none);
+            assertEq(picked[0], only);
+        }
+        address[] memory excluded = new address[](1);
+        excluded[0] = only;
+        vm.expectRevert(abi.encodeWithSelector(IJurorRegistry.NoEligibleJuror.selector, MochiTypes.JurorClass.DISSENTER));
+        registry.selectJurors(address(this), qid, bytes32(0), 2, 3, excluded);
+    }
+
+    /// Rejection sampling is uniform over the eligible keys whatever sits between them.
+    function testSelectionIsNotFunneledByInactiveRuns() public {
+        address[] memory honest = _addKeys(MochiTypes.JurorClass.LARGE_A, 3);
+        vm.prank(ADMIN);
+        registry.setMinJurorBond(1 ether);
+        for (uint256 i; i < 30; ++i) _enroll(_key(20_000 + i), MochiTypes.JurorClass.LARGE_A, 1 ether);
+        address behind = _addKeys(MochiTypes.JurorClass.LARGE_A, 1)[0];
+        bytes32 qid = _snap();
+        address[] memory none = new address[](0);
+        uint256[4] memory hits;
+        for (uint256 i; i < 400; ++i) {
+            address picked = registry.selectJurors(address(this), qid, keccak256(abi.encode("u", i)), 0, 1, none)[0];
+            if (picked == behind) ++hits[3];
+            else for (uint256 h; h < 3; ++h) if (picked == honest[h]) ++hits[h];
+        }
+        for (uint256 h; h < 4; ++h) {
+            assertGt(hits[h], 60); // expected 100 each
+            assertLt(hits[h], 140);
+        }
+    }
+
+    function testServiceAfterExitRequestExtendsTheBondHold() public {
+        address key = _addKeys(MochiTypes.JurorClass.LARGE_A, 1)[0];
+        address[] memory one = new address[](1);
+        one[0] = key;
+        uint256 t0 = vm.getBlockTimestamp();
+        registry.recordService(one, 0); // served while active: no effect on a later exit
+        assertEq(registry.lastServedAt(key), t0);
+        vm.warp(t0 + 1 hours);
+        vm.prank(OP);
+        registry.requestExit(key);
+        // The round it still sat in settles after the request (as a timeout).
+        vm.warp(t0 + 3 hours);
+        registry.recordService(one, 1);
+        vm.warp(t0 + 1 hours + EXIT_DELAY);
+        vm.prank(OP);
+        vm.expectRevert(abi.encodeWithSelector(IJurorRegistry.ExitDelayNotElapsed.selector, uint64(t0 + 3 hours + EXIT_DELAY)));
+        registry.withdrawBond(key);
+        // Equivocation evidence that lands inside the extended window still takes the whole bond.
+        registry.slashEquivocation(key);
+        assertEq(registry.getJuror(key).bond, 0);
+        assertEq(token.balanceOf(SINK), BOND);
+        vm.warp(t0 + 3 hours + EXIT_DELAY);
+        vm.prank(OP);
+        registry.withdrawBond(key);
+    }
+
+    function testExitAfterLastServiceKeepsTheSevenDayDelay() public {
+        address key = _addKeys(MochiTypes.JurorClass.LARGE_A, 1)[0];
+        address[] memory one = new address[](1);
+        one[0] = key;
+        registry.recordService(one, 0);
+        uint256 t0 = vm.getBlockTimestamp();
+        vm.warp(t0 + 2 days);
+        vm.prank(OP);
+        registry.requestExit(key);
+        vm.warp(t0 + 2 days + EXIT_DELAY);
+        uint256 before = token.balanceOf(OP);
+        vm.prank(OP);
+        registry.withdrawBond(key);
+        assertEq(token.balanceOf(OP), before + BOND);
     }
 }

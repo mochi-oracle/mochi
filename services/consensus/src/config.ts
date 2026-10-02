@@ -8,7 +8,7 @@ const schema = z.object({
   TEE_MODE: z.enum(["mock", "tdx", "dstack"]).default("mock"),
   TEE_KEYS: z.enum(["kms", "ephemeral"]).optional(),
   TEE_KEY_LABEL: z.string().min(1).max(64).default("default"),
-  QUOTE_VERIFIER: z.enum(["mock", "dcap"]).default("mock"),
+  QUOTE_VERIFIER: z.enum(["mock", "dcap"], { error: "QUOTE_VERIFIER must be set explicitly: dcap (or mock for local development only)" }),
   TEE_MOCK_SEED: z.string().default("0x" + "11".repeat(32)),
   TEE_MOCK_MEASUREMENT: z.string().regex(/^0x[0-9a-f]{64}$/).default("0x" + "22".repeat(32)),
   TEE_MOCK_ROOT_PRIVATE_KEY: z.string().regex(/^0x[0-9a-f]{64}$/).default("0x" + "33".repeat(32)),

@@ -22,10 +22,22 @@ contract JurorRegistry is IJurorRegistry, AccessControl, ReentrancyGuard {
     bytes32 public constant ATTESTOR_ROLE = MochiRoles.ATTESTOR_ROLE;
     uint64 private constant TIMEOUT_SLASH_INTERVAL = 1 days;
     uint256 private constant BPS = 10_000;
+    /// @dev Rehash draws per seat before the exact (enumerating) fallback.
+    uint256 private constant MAX_DRAWS = 16;
+    uint256 private constant SNAPSHOT_TAKEN = 1 << 255;
 
     mapping(address => Juror) public jurors;
     mapping(bytes32 => mapping(MochiTypes.Role => bool)) public allowedMeasurement;
-    mapping(MochiTypes.JurorClass => address[]) private _jurorsByClass;
+    /// @dev Selection pools: class => generation => keys, in enrollment order. Enrollment appends to the current
+    ///      generation; prunePool copies the keys that can still serve into the next one. A generation is never
+    ///      reordered or shortened, so a (generation, length) snapshot keeps naming exactly the same keys.
+    mapping(MochiTypes.JurorClass => mapping(uint256 => address[])) private _pools;
+    /// @dev Current pool of every class, 48 bits per class at bit 48 * class: generation (low 24) | length (high 24).
+    uint256 private _poolState;
+    /// @dev owner (the escrow) => queryId => _poolState as of the owner's openSelection call, | SNAPSHOT_TAKEN.
+    mapping(address => mapping(bytes32 => uint256)) private _snapshots;
+    /// @inheritdoc IJurorRegistry
+    mapping(address => uint64) public override lastServedAt;
 
     IERC20 public immutable mochi;
     address public slashSink;
@@ -39,6 +51,7 @@ contract JurorRegistry is IJurorRegistry, AccessControl, ReentrancyGuard {
     IClassMix public classMix;
 
     error BadSeatRange();
+    error PoolFull(MochiTypes.JurorClass jurorClass);
 
     /// @param admin Initial administrator and governor.
     /// @param mochi_ MOCHI token used for juror bonds.
@@ -65,6 +78,7 @@ contract JurorRegistry is IJurorRegistry, AccessControl, ReentrancyGuard {
         if (key == address(0)) revert NotEnrolled(key);
         if (jurors[key].operator != address(0)) revert AlreadyEnrolled(key);
         bytes32 digest = MessageHashUtils.toEthSignedMessageHash(enrollmentDigest(msg.sender, key, measurement, jurorClass));
+        // slither-disable-next-line unused-return -- err is checked; the third value only details err
         (address signer, ECDSA.RecoverError err,) = ECDSA.tryRecover(digest, keySig);
         if (err != ECDSA.RecoverError.NoError || signer != key) revert BadKeySignature();
         if (!allowedMeasurement[measurement][MochiTypes.Role.JUROR]) {
@@ -74,7 +88,13 @@ contract JurorRegistry is IJurorRegistry, AccessControl, ReentrancyGuard {
         if (minJurorBond == 0 && unbondedJurorOperator[key] != msg.sender) revert UnbondedJurorNotApproved(key, msg.sender);
         if (bond != 0) mochi.safeTransferFrom(msg.sender, address(this), bond);
         jurors[key] = Juror(msg.sender, measurement, MochiTypes.Role.JUROR, jurorClass, bond, 0, 0, false, 0, 0, 0);
-        _jurorsByClass[jurorClass].push(key);
+        uint256 shift = uint256(uint8(jurorClass)) * 48;
+        uint256 state = _poolState;
+        address[] storage pool = _pools[jurorClass][uint24(state >> shift)];
+        pool.push(key);
+        uint256 len = pool.length;
+        if (len > type(uint24).max) revert PoolFull(jurorClass);
+        _poolState = (state & ~(uint256(type(uint24).max) << (shift + 24))) | (len << (shift + 24));
         emit Enrolled(key, msg.sender, MochiTypes.Role.JUROR, jurorClass, measurement, bond);
     }
 
@@ -132,7 +152,10 @@ contract JurorRegistry is IJurorRegistry, AccessControl, ReentrancyGuard {
         Juror storage j = jurors[key];
         if (j.operator != msg.sender || j.operator == address(0)) revert NotOperator(msg.sender);
         if (j.exitRequestedAt == 0) revert ExitNotRequested(key);
-        uint64 readyAt = j.exitRequestedAt + exitDelay;
+        // The delay runs from the later of the exit request and the key's last settled seat, so a key that exits while
+        // seated stays slashable (e.g. for equivocation on that query) for the whole delay after the seat settles.
+        uint64 servedAt = lastServedAt[key];
+        uint64 readyAt = (servedAt > j.exitRequestedAt ? servedAt : j.exitRequestedAt) + exitDelay;
         uint256 timestamp = block.timestamp;
         if (timestamp < readyAt) revert ExitDelayNotElapsed(readyAt);
         uint256 amount = j.bond;
@@ -143,6 +166,7 @@ contract JurorRegistry is IJurorRegistry, AccessControl, ReentrancyGuard {
     }
 
     /// @inheritdoc IJurorRegistry
+    // aderyn-ignore-next-line(non-reentrant-not-first) the onlyRole check ahead of it makes no external call
     function reportAttestationFailure(address key) external override onlyRole(MochiRoles.ATTESTOR_ROLE) nonReentrant {
         Juror storage j = jurors[key];
         if (j.operator == address(0)) revert NotEnrolled(key);
@@ -152,6 +176,7 @@ contract JurorRegistry is IJurorRegistry, AccessControl, ReentrancyGuard {
     }
 
     /// @inheritdoc IJurorRegistry
+    // aderyn-ignore-next-line(non-reentrant-not-first) the onlyRole check ahead of it makes no external call
     function slashEquivocation(address key) external override onlyRole(SLASHER_ROLE) nonReentrant {
         Juror storage j = jurors[key];
         if (j.operator == address(0)) revert NotEnrolled(key);
@@ -163,11 +188,13 @@ contract JurorRegistry is IJurorRegistry, AccessControl, ReentrancyGuard {
 
     /// @inheritdoc IJurorRegistry
     function recordService(address[] calldata keys, uint32 timeoutMask) external override onlyRole(SLASHER_ROLE) {
+        uint64 now_ = uint64(block.timestamp);
         for (uint256 i; i < keys.length; ++i) {
             Juror storage j = jurors[keys[i]];
             bool timedOut = (uint256(timeoutMask) & (uint256(1) << i)) != 0;
             ++j.served;
             if (timedOut) ++j.timeouts;
+            lastServedAt[keys[i]] = now_;
             emit ServiceRecorded(keys[i], timedOut);
         }
     }
@@ -205,35 +232,120 @@ contract JurorRegistry is IJurorRegistry, AccessControl, ReentrancyGuard {
     }
 
     /// @inheritdoc IJurorRegistry
-    function selectJurors(bytes32 seed_, uint8 fromSeat, uint8 toSeat, address[] calldata exclude)
-        external view override returns (address[] memory selected)
-    {
+    function openSelection(bytes32 queryId, address intakeKey) external override returns (bool) {
+        _snapshots[msg.sender][queryId] = _poolState | SNAPSHOT_TAKEN;
+        return isActive(intakeKey, MochiTypes.Role.INTAKE);
+    }
+
+    /// @inheritdoc IJurorRegistry
+    function selectionSnapshot(address owner, bytes32 queryId) external view override returns (uint256) {
+        return _snapshots[owner][queryId];
+    }
+
+    /// @inheritdoc IJurorRegistry
+    function selectJurors(
+        address owner,
+        bytes32 queryId,
+        bytes32 seed_,
+        uint8 fromSeat,
+        uint8 toSeat,
+        address[] calldata exclude
+    ) external view override returns (address[] memory selected) {
         if (fromSeat >= toSeat || toSeat > MochiTypes.MAX_N) revert BadSeatRange();
+        uint256 snapshot = _snapshots[owner][queryId];
+        if (snapshot == 0) revert NoSelectionSnapshot(owner, queryId);
         selected = new address[](toSeat - fromSeat);
         for (uint8 seat = fromSeat; seat < toSeat; ++seat) {
             MochiTypes.JurorClass class_ = seatClass(seat);
-            address[] storage list = _jurorsByClass[class_];
-            uint256 len = list.length;
-            if (len == 0) revert NoEligibleJuror(class_);
-            uint256 start = uint256(keccak256(abi.encode(seed_, seat))) % len;
-            bool found;
-            for (uint256 i; i < len; ++i) {
-                address candidate = list[(start + i) % len];
-                if (!isActive(candidate, MochiTypes.Role.JUROR) || _contains(exclude, candidate) || _containsMemory(selected, candidate)) continue;
-                selected[seat - fromSeat] = candidate;
-                found = true;
-                break;
-            }
-            if (!found) revert NoEligibleJuror(class_);
+            uint256 word = snapshot >> (uint256(uint8(class_)) * 48);
+            selected[seat - fromSeat] =
+                _draw(_pools[class_][uint24(word)], uint24(word >> 24), seed_, seat, exclude, selected, class_);
         }
+    }
+
+    /// @dev Rejection sampling over the snapshot: draw an index, and if that key cannot take the seat draw a fresh index
+    ///      (never probe forward, which would hand every dead entry's share to the next live key). After MAX_DRAWS misses,
+    ///      pick uniformly among all eligible keys of the snapshot. Either way each eligible key is equally likely.
+    function _draw(
+        address[] storage pool,
+        uint256 len,
+        bytes32 seed_,
+        uint8 seat,
+        address[] calldata exclude,
+        address[] memory chosen,
+        MochiTypes.JurorClass class_
+    ) private view returns (address) {
+        if (len != 0) {
+            for (uint256 attempt; attempt < MAX_DRAWS; ++attempt) {
+                address candidate = pool[uint256(keccak256(abi.encode(seed_, seat, attempt))) % len];
+                if (_eligible(candidate, exclude, chosen)) return candidate;
+            }
+            uint256 count;
+            for (uint256 i; i < len; ++i) {
+                if (_eligible(pool[i], exclude, chosen)) ++count;
+            }
+            if (count != 0) {
+                uint256 pick = uint256(keccak256(abi.encode(seed_, seat, MAX_DRAWS))) % count;
+                for (uint256 i; i < len; ++i) {
+                    address candidate = pool[i];
+                    if (!_eligible(candidate, exclude, chosen)) continue;
+                    if (pick == 0) return candidate;
+                    --pick;
+                }
+            }
+        }
+        revert NoEligibleJuror(class_);
+    }
+
+    function _eligible(address candidate, address[] calldata exclude, address[] memory chosen)
+        private
+        view
+        returns (bool)
+    {
+        return isActive(candidate, MochiTypes.Role.JUROR) && !_contains(exclude, candidate)
+            && !_containsMemory(chosen, candidate);
+    }
+
+    /// @inheritdoc IJurorRegistry
+    function prunePool(MochiTypes.JurorClass jurorClass) external override returns (uint256 kept, uint256 removed) {
+        uint256 shift = uint256(uint8(jurorClass)) * 48;
+        uint256 state = _poolState;
+        uint256 gen = uint24(state >> shift);
+        if (gen == type(uint24).max) revert PoolFull(jurorClass);
+        address[] storage pool = _pools[jurorClass][gen];
+        address[] storage next = _pools[jurorClass][gen + 1];
+        uint256 len = pool.length;
+        for (uint256 i; i < len; ++i) {
+            address key = pool[i];
+            Juror storage j = jurors[key];
+            // Exit and delisting are permanent; attestation lapses and measurement or approval changes are not.
+            if (j.delisted || j.exitRequestedAt != 0) continue;
+            next.push(key);
+        }
+        kept = next.length;
+        removed = len - kept;
+        if (removed == 0) revert NothingToPrune(jurorClass);
+        _poolState = (state & ~(uint256(type(uint48).max) << shift)) | ((gen + 1) | (kept << 24)) << shift;
+        emit PoolPruned(jurorClass, gen + 1, kept, removed);
+    }
+
+    /// @inheritdoc IJurorRegistry
+    function poolGeneration(MochiTypes.JurorClass jurorClass) public view override returns (uint256) {
+        return uint24(_poolState >> (uint256(uint8(jurorClass)) * 48));
     }
 
     /// @inheritdoc IJurorRegistry
     function jurorsOfClass(MochiTypes.JurorClass jurorClass) external view override returns (address[] memory) {
-        return _jurorsByClass[jurorClass];
+        return _pools[jurorClass][poolGeneration(jurorClass)];
     }
 
     /// @inheritdoc IJurorRegistry
+    function poolAt(MochiTypes.JurorClass jurorClass, uint256 generation) external view override returns (address[] memory) {
+        return _pools[jurorClass][generation];
+    }
+
+    /// @inheritdoc IJurorRegistry
+    // aderyn-ignore-next-line(state-change-without-event) governor-only; the timelock's CallScheduled logs it
     function setClassMix(IClassMix classMix_) external override onlyRole(MochiRoles.GOVERNOR_ROLE) {
         classMix = classMix_;
     }
@@ -253,9 +365,11 @@ contract JurorRegistry is IJurorRegistry, AccessControl, ReentrancyGuard {
     }
 
     /// @notice Sets the minimum bond; zero selects team-approved admission and eligibility.
+    // aderyn-ignore-next-line(state-change-without-event) governor-only; the timelock's CallScheduled logs it
     function setMinJurorBond(uint256 value) external onlyRole(MochiRoles.GOVERNOR_ROLE) { minJurorBond = value; }
 
     /// @notice Sets the recipient of future slashes.
+    // aderyn-ignore-next-line(state-change-without-event) governor-only; the timelock's CallScheduled logs it
     function setSlashSink(address value) external onlyRole(MochiRoles.GOVERNOR_ROLE) { slashSink = value; }
 
     function _slash(address key, Juror storage j, uint256 amount, bytes32 reason) private {

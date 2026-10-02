@@ -29,6 +29,9 @@ scripts/            deploy-local.ts, e2e-core.ts, gen-abis.ts
 ```bash
 bun install
 ```
+Install policy (`bunfig.toml` here and in `web/site`): new dependencies are added at exact versions, version
+resolution only picks releases at least 7 days old, and `"trustedDependencies": []` in `package.json` means no
+dependency install script ever runs. Installs from the frozen lockfile are unaffected by the age rule.
 ```bash
 cd contracts && forge test
 ```
@@ -103,7 +106,7 @@ payer address, while the proof remains bound to the configured adapter, QueryEsc
 Set `TEE_MODE=tdx` for the intake, juror, and consensus services. `TSM_ROOT` selects the Linux configfs TSM report
 directory (default `/sys/kernel/config/tsm/report`). Each service obtains its signing and encryption keys from the TDX
 guest and reports its address and measurement at startup. Set `QUOTE_VERIFIER=dcap` on services that verify enclave
-quotes (including attestor and feed-runners); mock mode remains the default for local development.
+quotes (including attestor and feed-runners). Local development sets `QUOTE_VERIFIER=mock` explicitly; there is no default.
 
 DCAP collateral and policy settings are:
 
@@ -112,12 +115,27 @@ DCAP collateral and policy settings are:
 | `TEE_MODE` | `mock` | `mock`, `tdx` (configfs-tsm), or `dstack` (Phala Cloud / dstack CVMs) for intake, juror, consensus |
 | `DSTACK_SOCKET` | probes `/var/run/dstack.sock` … | dstack guest-agent socket (`TEE_MODE=dstack`) |
 | `TSM_ROOT` | `/sys/kernel/config/tsm/report` | Linux configfs TSM report root |
-| `QUOTE_VERIFIER` | `mock` | `mock` or Intel `dcap` quote verification |
+| `QUOTE_VERIFIER` | required | Intel `dcap` quote verification, or `mock` for local development only; services refuse to start when it is unset |
 | `PCS_BASE_URL` | Intel PCS default | Intel PCS API base URL |
 | `PCS_ROOT_CA_CRL_URL` | Intel certificate service default | Root CA CRL URL |
 | `TDX_ALLOWED_TCB_STATUSES` | `UpToDate` | Comma-separated accepted Intel TCB statuses; `Revoked` is forbidden |
 | `TDX_REJECT_ADVISORIES` | empty | Comma-separated Intel advisory IDs to reject |
 | `TDX_ALLOW_DEBUG` | `0` | Set to `1` only to permit debug TDs |
+
+`TDX_ALLOWED_TCB_STATUSES` is one policy for every DCAP check, including the jurors' check of the Phala ACI gateway.
+The strict default refuses any platform Intel does not rate `UpToDate`. At an Intel TCB recovery, every platform that has
+not yet installed the new microcode or TDX module is rated `OutOfDate` (or `SWHardeningNeeded`) until its provider
+patches it. During that window MOCHI attestations lapse and jurors refuse the gateway: a deliberate outage rather than
+trust in a platform with a published, unpatched vulnerability. Adding statuses keeps the service up through the window
+and accepts those platforms; pair it with `TDX_REJECT_ADVISORIES`. Production sets the list explicitly from the reviewed
+runtime config field `tdxAllowedTcbStatuses` (default `["UpToDate"]`).
+
+Intel PCS collateral is cached once per process and, when `SEALED_STORE_DIR` is set, persisted in `dcap-collateral`
+beside it. All services on a host share that directory, and a restart does not need PCS. Entries are refreshed in the
+background daily, and at the latest 6 hours before their earliest `nextUpdate`. While PCS is unreachable (network
+failure, timeout, HTTP 408, 429 or 5xx), cached collateral is served for at most 48 hours past `nextUpdate`. Any answer
+from PCS, including a newer CRL or TCB info, replaces the cached copy at once. Failed requests back off exponentially
+with jitter. The grace and refresh timings are code defaults in `PcsCollateralSource`; the grace is capped at 72 hours.
 
 To get the on-chain measurement from inside the new TDX VM, run `bun scripts/tdx-measurement.ts <quote-file>` or pipe a
 hex-encoded quote to `bun scripts/tdx-measurement.ts -`. Add `--verify` to fetch Intel PCS collateral and check the
@@ -147,10 +165,10 @@ Jurors can send extraction requests to Phala's GPU TEE endpoint. The juror verif
 | `PHALA_ACI_BASE_URL` | OpenAI-compatible API base URL | `https://inference.phala.com/v1` |
 | `PHALA_AI_API_KEY` | Phala API key (secret; never logged) | required for `phala-aci` |
 | `PHALA_ACI_MODEL` | Model slug served by this juror process | required for `phala-aci` |
-| `PHALA_ACI_ALLOWED_WORKLOADS` | Optional comma-separated attested workload IDs | unset |
+| `PHALA_ACI_ALLOWED_WORKLOADS` | Comma-separated pinning policy: `os:<sha256(MRTD‖RTMR0‖RTMR1‖RTMR2)>`, `compose:<dstack compose hash>`, `model:<id>`, plus workload IDs. At least one `os:` or `compose:` pin is required: without one any TDX VM could pose as the gateway, so the juror refuses to start. Workload IDs are unsigned and never substitute for a pin | required for `phala-aci` |
 | `PCS_BASE_URL` | Intel PCS collateral endpoint for gateway quote verification | Intel default |
 | `PCS_ROOT_CA_CRL_URL` | Intel root CA CRL endpoint | Intel default |
-| `TDX_ALLOWED_TCB_STATUSES` | Accepted Intel TCB statuses | `UpToDate` |
+| `TDX_ALLOWED_TCB_STATUSES` | Gateway TCB statuses the juror accepts (the same policy as MOCHI's own quotes; see the trade-off above) | `UpToDate` |
 | `TDX_REJECT_ADVISORIES` | Comma-separated advisory IDs to reject | unset |
 | `TDX_ALLOW_DEBUG` | Permit debug TDX VMs | `0` |
 

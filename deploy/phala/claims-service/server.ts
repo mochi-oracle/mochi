@@ -6,7 +6,8 @@ import { createProductionIdentityReadiness } from '../production-identities/iden
 import { createIdentityEndpoint } from '../production-identities/http.ts';
 import { DstackKeySource } from '@mochi/tee';
 import { startProductionRuntime, startupFailureReason, PRODUCTION_PORTS } from '../../production/runtime.ts';
-import { createProductionProxy, createEnrollmentEndpoint } from '../../production/public-proxy.ts';
+import { createProductionProxy, createEnrollmentEndpoint, publicProxySettings } from '../../production/public-proxy.ts';
+import { createFrontHandler } from './front.ts';
 const identities = createIdentityEndpoint(() => createProductionIdentityReadiness({
   env:process.env,
   // Required only by the shared factory signature; dstack+kms is enforced before use.
@@ -26,23 +27,22 @@ const production = await startProductionRuntime(launchConfig, {
 const productionMode = launchConfig ? JSON.parse(launchConfig).mode : 'standby';
 const productionReady = () => production.status === 'running' && productionMode === 'active'
   && Object.keys(production.childhealth).length > 0 && Object.values(production.childhealth).every(status => status === 'healthy');
-const protocol = createProductionProxy({ ready: productionReady, gatewayPort: PRODUCTION_PORTS.gateway, indexerPort: PRODUCTION_PORTS.indexer });
+// Per-client keys: the website's signed per-visitor header (same invitation token as the website), else the transport
+// peer; X-Forwarded-For only if the launch config's publicProxy.trustForwardedFor says the ingress appends it.
+const protocol = createProductionProxy({
+  ready: productionReady, gatewayPort: PRODUCTION_PORTS.gateway, indexerPort: PRODUCTION_PORTS.indexer,
+  visitorSecret: process.env.MOCHI_CLAIMS_ACCESS_TOKEN, ...publicProxySettings(launchConfig),
+});
 const enrollment = createEnrollmentEndpoint({ready:()=>production.status === 'running',jurorPorts:PRODUCTION_PORTS.jurors});
+const front = createFrontHandler({
+  enrollment, protocol, claims: handler, revenue, clientDiagnostics: protocol.clientDiagnostics,
+  // The identity endpoint's Response is typed from Node's fetch types; at runtime it is the same Bun Response.
+  identities: request => identities(request) as Promise<Response>,
+  productionStatus: () => ({ status: production.status, mode: productionMode, payments: productionReady(), services: production.childhealth }),
+});
 const server = Bun.serve({
   hostname: '0.0.0.0', port: 8080, idleTimeout: 120, maxRequestBodySize: 1_048_576,
-  fetch: async request => new URL(request.url).pathname === '/production/enrollment'
-    ? enrollment(request)
-    : new URL(request.url).pathname.startsWith('/v1/')
-    ? protocol(request)
-    : new URL(request.url).pathname === '/production/status' && request.method === 'GET'
-    ? Response.json({ status: production.status, mode: productionMode, payments: productionReady(), services: production.childhealth }, {headers:{'cache-control':'no-store'}})
-    : new URL(request.url).pathname === '/production/identities'
-    ? identities(request)
-    : new URL(request.url).pathname === '/api/tokenomics/report' && request.method === 'GET'
-    ? Response.json(await revenue(), { headers: { 'cache-control': 'no-store' } })
-    : new URL(request.url).pathname === '/health' && request.method === 'GET'
-    ? Response.json({ ok: true, service: 'claims-research', mode: 'invitation-pilot', payments: false, publicSourcesOnly: true })
-    : handler(request),
+  fetch: (request, bun) => front(request, bun.requestIP(request)?.address),
 });
 // Optional worker shares the existing persistent volume; absent config performs no chain or wallet work.
 const workerManifest = process.env.MOCHI_REVENUE_WORKER_MANIFEST;

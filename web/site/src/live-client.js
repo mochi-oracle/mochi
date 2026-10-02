@@ -1,7 +1,7 @@
 import { x25519, ed25519 } from '@noble/curves/ed25519.js';
 import { createPublicClient, createWalletClient, custom, http, defineChain, encodeFunctionData, parseAbi, toHex, fromHex, keccak256, zeroHash, formatUnits } from 'viem';
 import { canonicalJson, canonicalBytes, docHash, docCommit } from '@mochi/core';
-import { aad, AttestationDocSchema, IntakeResultSchema, PrivateResultPlainSchema, payerCommit } from '@mochi/protocol';
+import { aad, AttestationDocSchema, IntakeResultSchema, PrivateResultPlainSchema, payerCommit, privateResultMismatch, provenanceFromJson, provenanceMatchesBinding } from '@mochi/protocol';
 import { SCHEMAS, resolveSchema, normalizeParams, paramsHash } from '@mochi/schemas';
 import { seal, open } from '../../../packages/tee/src/envelope.ts';
 import { keyBinding } from '../../../packages/tee/src/provider.ts';
@@ -30,6 +30,28 @@ export function validateConfig(config) {
   if (!Array.isArray(config.jurySizes) || !config.jurySizes.length || config.jurySizes.some(n=>![3,5,7,9].includes(n))) throw new Error('Supported jury sizes are required.');
   if (typeof config.rpcUrl !== 'string' || !config.rpcUrl.startsWith('/rpc')) throw new Error('Use the same-origin read-only RPC endpoint.');
   return config;
+}
+
+/** How far a submit() call got with the escrow payment transaction itself (approvals do not move escrow funds). */
+export const PAYMENT_STAGE=Object.freeze({CHECKS:'checks',REQUESTED:'payment_requested',BROADCAST:'payment_broadcast'});
+function withPaymentAttempt(error,attempt) {
+  const target=error instanceof Error?error:new Error(String(error));
+  try { Object.defineProperty(target,'paymentAttempt',{value:{...attempt},configurable:true}); } catch {}
+  return target;
+}
+/** EIP-1193 4001 (or viem's wrapper for it): the user declined in the wallet, so that request was not signed or sent. */
+export function isUserRejection(error) {
+  for(let e=error,depth=0;e&&typeof e==='object'&&depth<8;e=e.cause,depth++) if(e.code===4001||e.name==='UserRejectedRequestError') return true;
+  return false;
+}
+/**
+ * True only when a failed submit() definitely sent no escrow payment: it failed before the payment transaction was
+ * requested, or the wallet rejected that request. Anything else (unknown errors, a broadcast hash) may have paid.
+ */
+export function paymentNotSent(error) {
+  const attempt=error?.paymentAttempt;
+  if(attempt?.stage===PAYMENT_STAGE.CHECKS) return true;
+  return attempt?.stage===PAYMENT_STAGE.REQUESTED&&isUserRejection(error);
 }
 
 export class LiveClient {
@@ -78,47 +100,57 @@ export class LiveClient {
     if(!schemaId) throw new Error("Unknown schema.");
     const normalized=normalizeParams(resolveSchema(schemaId,params),params); if(!normalized.ok) throw new Error('Invalid schema parameters.');
     const salt=isPublic?zeroHash:rand(32), pair=isPublic?null:x25519.keygen();
-    const plain={v:1,schemaId,salt,params,contentType,docB64:base64(bytes)};
+    const nonce=BigInt(rand(8)), pub=pair?toHex(pair.publicKey):undefined;
+    // Sealed with the document: the intake signs it into a grant only this wallet can open, once, with this result key.
+    const open={opener:this.account,payerCommit:pub?payerCommit(pub):zeroHash,isPublic,allowPanelDisclosure:false,nonce:String(nonce)};
+    const plain={v:1,schemaId,salt,params,contentType,docB64:base64(bytes),open};
     const envelope=seal(doc.encryptionPubKey,encoder.encode(canonicalJson(plain)),aad.intake());
     const intake=IntakeResultSchema.parse(await this.request(`/api/v1/intake/upload?n=${n}`,{envelope}));
-    const commitment=docCommit(salt,docHash(bytes));
-    if(!same(intake.docCommit,commitment)||!same(intake.provenance.docCommit,commitment)||intake.schemaId!==schemaId||!same(intake.paramsHash,paramsHash(normalized.params))||!same(intake.intake,doc.address)||intake.tokensK!==intake.provenance.tokensK) throw new Error('Intake response does not match the submitted document.');
-    const provenance={...intake.provenance,fetchedAt:BigInt(intake.provenance.fetchedAt)};
+    const commitment=docCommit(salt,docHash(bytes)), pHash=paramsHash(normalized.params);
+    if(!same(intake.docCommit,commitment)||!same(intake.provenance.docCommit,commitment)||intake.schemaId!==schemaId||intake.provenance.schemaId!==schemaId||!same(intake.paramsHash,pHash)||!same(intake.provenance.paramsHash,pHash)||!same(intake.intake,doc.address)||intake.tokensK!==intake.provenance.tokensK) throw new Error('Intake response does not match the submitted document.');
+    if(!provenanceMatchesBinding(intake.provenance,open)) throw new Error('Intake grant does not match this wallet or result key.');
+    const provenance=provenanceFromJson(intake.provenance);
     if(!same(await recoverProvenance(this.config.chainId,this.config.contracts.queryEscrow,provenance,intake.intakeSig),doc.address)) throw new Error('Invalid intake signature.');
-    const nonce=BigInt(rand(8)), pub=pair?toHex(pair.publicKey):undefined;
-    const openParams={schemaId,n,isPublic,allowPanelDisclosure:false,paramsHash:intake.paramsHash,payerCommit:pub?payerCommit(pub):zeroHash,refundTo:this.account,nonce};
+    const openParams={n,refundTo:this.account};
     const queryId=await this.read('queryEscrow',QueryEscrowAbi,'computeQueryId',[this.account,commitment,nonce]);
     const [jurorFees,protocolFee]=await this.read('queryEscrow',QueryEscrowAbi,'quote',[schemaId,n,intake.tokensK]);
     const decimals=Number(await this.read('usdg',erc20,'decimals')); if(decimals!==6) throw new Error('Unexpected USDG token decimals.');
     // The gateway stores only the result public key. Never trust its payment calldata or price.
-    const relay=await this.request('/api/v1/query',{intake,n,isPublic,allowPanelDisclosure:false,refundTo:this.account,nonce:String(nonce),sender:this.account,...(pub?{payerResultPubKey:pub}:{}),pay:{path:'usdg'}});
+    const relay=await this.request('/api/v1/query',{intake,n,refundTo:this.account,...(pub?{payerResultPubKey:pub}:{}),pay:{path:'usdg'}});
     if(!same(relay.queryId,queryId)) throw new Error('Gateway query ID mismatch.');
     const data=encodeFunctionData({abi:QueryEscrowAbi,functionName:'openWithUSDG',args:[openParams,provenance,intake.intakeSig]});
-    return {queryId,account:this.account,chainId:this.config.chainId,escrow:this.config.contracts.queryEscrow,data,schema,n,isPublic,tokensK:intake.tokensK,schemaId,amount:jurorFees+protocolFee,displayAmount:formatUnits(jurorFees+protocolFee,6),createdAt:Date.now(),secrets:{salt,...(pair?{resultPrivateKey:toHex(pair.secretKey)}:{})}};
+    return {queryId,account:this.account,chainId:this.config.chainId,escrow:this.config.contracts.queryEscrow,data,schema,n,isPublic,tokensK:intake.tokensK,schemaId,amount:jurorFees+protocolFee,displayAmount:formatUnits(jurorFees+protocolFee,6),createdAt:Date.now(),grantExpiry:Number(provenance.expiry),secrets:{salt,...(pair?{resultPrivateKey:toHex(pair.secretKey)}:{})}};
   }
   async submit(prepared,onProgress=()=>{}) {
-    if(prepared.chainId!==this.config.chainId||!same(prepared.escrow,this.config.contracts.queryEscrow)) throw new Error('Quote belongs to another deployment.');
-    await this.checkNetwork(); await this.assertWallet(prepared.account);
-    if(Date.now()-prepared.createdAt>5*60*1000) throw new Error('Quote expired. Prepare a new quote.');
-    const [fees,protocol]=await this.read('queryEscrow',QueryEscrowAbi,'quote',[prepared.schemaId,prepared.n,prepared.tokensK]);
-    if(fees+protocol!==prepared.amount) throw new Error('Price changed. Prepare a new quote before paying.');
-    const send=async(to,data)=>{
+    // Errors carry how far the escrow payment got (see paymentNotSent), so callers can tell a failure before
+    // the payment transaction was requested from the wallet from one where it may have been broadcast.
+    const attempt={stage:PAYMENT_STAGE.CHECKS};
+    try {
+      if(prepared.chainId!==this.config.chainId||!same(prepared.escrow,this.config.contracts.queryEscrow)) throw new Error('Quote belongs to another deployment.');
+      await this.checkNetwork(); await this.assertWallet(prepared.account);
+      if(Date.now()-prepared.createdAt>5*60*1000||(prepared.grantExpiry&&Date.now()/1000>prepared.grantExpiry-30)) throw new Error('Quote expired. Prepare a new quote.');
+      const [fees,protocol]=await this.read('queryEscrow',QueryEscrowAbi,'quote',[prepared.schemaId,prepared.n,prepared.tokensK]);
+      if(fees+protocol!==prepared.amount) throw new Error('Price changed. Prepare a new quote before paying.');
+      const send=async(to,data,payment=false)=>{
+        await this.assertWallet(prepared.account);
+        if(payment) attempt.stage=PAYMENT_STAGE.REQUESTED;
+        const hash=await this.wallet.sendTransaction({account:prepared.account,to,data,chain:this.chain});
+        if(payment) Object.assign(attempt,{stage:PAYMENT_STAGE.BROADCAST,hash});
+        onProgress('Transaction submitted',hash);
+        const receipt=await this.public.waitForTransactionReceipt({hash,timeout:120000});
+        if(receipt.status!=='success') throw new Error('Transaction reverted.'); return hash;
+      };
+      const allowance=await this.read('usdg',erc20,'allowance',[prepared.account,prepared.escrow]);
+      if(allowance!==prepared.amount) {
+        if(allowance>0n) { onProgress('Reset USDG allowance in your wallet'); await send(this.config.contracts.usdg,encodeFunctionData({abi:erc20,functionName:'approve',args:[prepared.escrow,0n]})); }
+        onProgress(`Approve exactly ${prepared.displayAmount} USDG in your wallet`);
+        await send(this.config.contracts.usdg,encodeFunctionData({abi:erc20,functionName:'approve',args:[prepared.escrow,prepared.amount]}));
+      }
       await this.assertWallet(prepared.account);
-      const hash=await this.wallet.sendTransaction({account:prepared.account,to,data,chain:this.chain});
-      onProgress('Transaction submitted',hash);
-      const receipt=await this.public.waitForTransactionReceipt({hash,timeout:120000});
-      if(receipt.status!=='success') throw new Error('Transaction reverted.'); return hash;
-    };
-    const allowance=await this.read('usdg',erc20,'allowance',[prepared.account,prepared.escrow]);
-    if(allowance!==prepared.amount) {
-      if(allowance>0n) { onProgress('Reset USDG allowance in your wallet'); await send(this.config.contracts.usdg,encodeFunctionData({abi:erc20,functionName:'approve',args:[prepared.escrow,0n]})); }
-      onProgress(`Approve exactly ${prepared.displayAmount} USDG in your wallet`);
-      await send(this.config.contracts.usdg,encodeFunctionData({abi:erc20,functionName:'approve',args:[prepared.escrow,prepared.amount]}));
-    }
-    await this.assertWallet(prepared.account);
-    await this.public.call({account:prepared.account,to:prepared.escrow,data:prepared.data});
-    onProgress('Confirm the review payment in your wallet');
-    return send(prepared.escrow,prepared.data);
+      await this.public.call({account:prepared.account,to:prepared.escrow,data:prepared.data});
+      onProgress('Confirm the review payment in your wallet');
+      return await send(prepared.escrow,prepared.data,true);
+    } catch(error) { throw withPaymentAttempt(error,attempt); }
   }
   async poll(queryId,{signal,onProgress=()=>{},timeoutMs=180000}={}) {
     if(!hex32.test(queryId)) throw new Error('Invalid query ID.');
@@ -147,6 +179,8 @@ export class LiveClient {
       const envelope=JSON.parse(new TextDecoder().decode(fromHex(item.packet.ciphertext,'bytes')));
       const result=PrivateResultPlainSchema.parse(JSON.parse(new TextDecoder().decode(open(fromHex(secrets.resultPrivateKey,'bytes'),envelope,aad.result(item.verdictId)))));
       if(!same(result.verdictId,item.verdictId)||!same(result.salt,secrets.salt)) throw new Error('Private result binding mismatch.');
+      // A private verdict's payloadHash is salted with the query salt; check it as well as the answerHash.
+      if(privateResultMismatch(result,chain)==='payloadHash') throw new Error('Payload does not match the on-chain commitment.');
       answerJson=result.answerJson; fields=result.fields;
     } else { answerJson=typeof item.packet.answer==='string'?item.packet.answer:canonicalJson(item.packet.answer); }
     if(!same(keccak256(toHex(answerJson)),chain.answerHash)) throw new Error('Answer does not match the on-chain commitment.');

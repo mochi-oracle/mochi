@@ -2,7 +2,8 @@ import { createHash, X509Certificate } from "node:crypto";
 import https from "node:https";
 import http from "node:http";
 import { checkServerIdentity } from "node:tls";
-import { encodeAbiParameters, keccak256, sha256, type Hex } from "viem";
+import type { Hex } from "viem";
+import { docHash, tlsTranscriptHash } from "@mochi/core";
 import type { Clock, FetchPolicy, HttpGetter, HttpResponse } from "./ports.ts";
 
 export class FetchError extends Error {
@@ -47,11 +48,11 @@ export async function fetchDocument(urlInput: string, policy: FetchPolicy, deps:
     }
     if (response.status < 200 || response.status >= 300) throw new FetchError("UPSTREAM_ERROR", "Document origin returned an unsuccessful response", 502);
     const contentType = headers["content-type"]?.trim() || "application/octet-stream";
-    const transcriptHash = keccak256(encodeAbiParameters(
-      [{ type: "string" }, { type: "string" }, { type: "uint16" }, { type: "string" }, { type: "bytes32" }, { type: "bytes32[]" }],
-      [host, url.toString(), response.status, contentType, sha256(response.bytes), fingerprints.map((fp) => `0x${Buffer.from(fp, "base64").toString("hex")}` as Hex)],
-    ));
-    return { bytes: response.bytes, contentType, finalUrl: url.toString(), host, fetchedAt: deps.clock.nowSeconds(), transcriptHash };
+    const certFingerprints = fingerprints.map((fp) => `0x${Buffer.from(fp, "base64").toString("hex")}` as Hex);
+    const finalUrl = url.toString();
+    // The TLS transcript (core tlsTranscriptHash). A public grant signs it as is; a private one signs it salted.
+    const transcriptHash = tlsTranscriptHash({ host, finalUrl, status: response.status, contentType, docHash: docHash(response.bytes), certFingerprints });
+    return { bytes: response.bytes, contentType, finalUrl, host, status: response.status, certFingerprints, fetchedAt: deps.clock.nowSeconds(), transcriptHash };
   }
 }
 

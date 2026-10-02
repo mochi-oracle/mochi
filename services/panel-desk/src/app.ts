@@ -22,7 +22,7 @@ export function createPanelDeskApp(deps: PanelDeps) {
       return c.json({ caseId: c.req.param("caseId"), queryId: item.queryId, status: item.status, panelIndex: item.panelIndex,
         sealBlock: item.sealBlock.toString(), commitDeadline: item.commitDeadline.toString(), revealDeadline: item.revealDeadline.toString(),
         appealDeadline: item.appealDeadline.toString(), payer: item.payer.toLowerCase(), fee: item.fee.toString(),
-        outcomeAnswerHash: item.outcomeAnswerHash, outcomePayloadHash: item.outcomePayloadHash });
+        outcomeAnswerHash: item.outcomeAnswerHash, outcomePayloadHash: item.outcomePayloadHash, drawDeadline: item.drawDeadline.toString() });
     } catch { return c.json({ error: { code: "CHAIN_UNAVAILABLE", message: "Could not read panel case" } }, 502); }
   });
 
@@ -32,7 +32,9 @@ export function createPanelDeskApp(deps: PanelDeps) {
     const caseId = asHex(c.req.param("caseId"));
     try {
       const item = await deps.chain.getCase(caseId);
-      if (item.status === 0 || item.status === 7) return c.json({ error: { code: "CASE_CLOSED", message: "Panel case is not open" } }, 409);
+      // Only a seated panel that is still voting gets the document: 2 COMMIT, 3 REVEAL. While DRAWING (1) panelOf can
+      // already show seats chosen by a draw that spans calls; resolved (4, 5), FINAL (7) and DRAW_EXPIRED (8) are closed.
+      if (item.status !== 2 && item.status !== 3) return c.json({ error: { code: "CASE_CLOSED", message: "Panel case is not open" } }, 409);
       const evaluator = parsed.data.evaluator as Address;
       const panel = await deps.chain.panelOf(caseId, item.panelIndex);
       if (!panel.some((member) => same(member, evaluator))) return c.json({ error: { code: "NOT_PANELIST", message: "Evaluator is not on the current panel" } }, 403);
@@ -49,7 +51,10 @@ export function createPanelDeskApp(deps: PanelDeps) {
           if (record?.verdict.isPublic && record.publicPart) jurorSummary = { dissent: record.publicPart.dissent, agreement: record.publicPart.fieldAgreement };
         }
       }
-      return c.json({ caseId, queryId: item.queryId, panelIndex: item.panelIndex, evaluator, schemaId: query.schemaId, schemaVersion: query.schemaVersion, docEnvelope: envelope, jurorSummary });
+      // isPublic tells the evaluator which payload hash to commit (buildAnswer cross-checks it with the record salt).
+      // openedAt is the query's on-chain open time, buildAnswer's `openedAt` (the payload asOf for schemas without a
+      // date field), so every evaluator builds the same payload.
+      return c.json({ caseId, queryId: item.queryId, panelIndex: item.panelIndex, evaluator, schemaId: query.schemaId, schemaVersion: query.schemaVersion, isPublic: query.isPublic, openedAt: query.openedAt.toString(), docEnvelope: envelope, jurorSummary });
     } catch (error) {
       log("warn", "panel_materials_failed", { caseId, code: error instanceof Error && "code" in error ? String(error.code) : "UPSTREAM_ERROR" });
       const status = error instanceof Error && "status" in error && typeof error.status === "number" ? error.status : 502;
@@ -74,8 +79,14 @@ export function createPanelDeskApp(deps: PanelDeps) {
       catch { return c.json({ error: { code: "BAD_SIGNATURE", message: "Payload signature is invalid" } }, 403); }
       if (!same(signer, evaluator)) return c.json({ error: { code: "BAD_SIGNATURE", message: "Payload signature is invalid" } }, 403);
       const query = await deps.chain.getQuery(item.queryId);
-      // Private answers can contain private field values. They are used to form the signed commitment but never kept by the relay.
-      if (query.isPublic) await deps.store.insertPanelPayload({ caseId, panelIndex: item.panelIndex, evaluator, payloadHash, payload: fromHex(payload, "bytes"), answerJson: parsed.data.answerJson });
+      // Private answers can contain private field values: they never leave the evaluator (its CLI refuses to send them).
+      if (!query.isPublic) return c.json({ error: { code: "PRIVATE_QUERY", message: "Payloads of private queries are not accepted" } }, 409);
+      // Only the payload the evaluator revealed on chain is kept, and only after that reveal: before it, a stored
+      // public payload would publish an answer that is still committed (hidden) on chain.
+      const revealed = await deps.chain.revealOf(caseId, item.panelIndex, evaluator);
+      if (same(revealed.payloadHash, ZERO32)) return c.json({ error: { code: "NOT_REVEALED", message: "Reveal on chain before submitting the payload" } }, 409);
+      if (!same(revealed.payloadHash, payloadHash)) return c.json({ error: { code: "PAYLOAD_MISMATCH", message: "Payload does not match the revealed payload hash" } }, 409);
+      await deps.store.insertPanelPayload({ caseId, panelIndex: item.panelIndex, evaluator, payloadHash, payload: fromHex(payload, "bytes"), answerJson: parsed.data.answerJson });
       return c.json({ caseId, panelIndex: item.panelIndex, evaluator, payloadHash }, 201);
     } catch {
       return c.json({ error: { code: "PAYLOAD_FAILED", message: "Could not accept payload" } }, 500);

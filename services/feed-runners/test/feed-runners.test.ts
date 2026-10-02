@@ -1,13 +1,14 @@
 import { describe, expect, it } from "bun:test";
 import { readFile, rm } from "node:fs/promises";
 import { privateKeyToAccount } from "viem/accounts";
-import { keccak256, toBytes, toHex } from "viem";
-import { aad, type AttestationDoc, type IntakeResult } from "@mochi/protocol";
+import { ContractFunctionExecutionError, ContractFunctionRevertedError, encodeErrorResult, keccak256, toBytes, toHex } from "viem";
+import { StockTokenCrosscheckAbi } from "@mochi/chain";
+import { aad, provenanceFromJson, type AttestationDoc, type IntakeResult, type OpenBinding } from "@mochi/protocol";
 import { SchemaId, toBytes32String, ZERO32 } from "@mochi/core";
 import { MockQuoteVerifier, MockTeeProvider } from "@mochi/tee";
 import { FeedsConfigSchema, ServiceEnvSchema } from "../src/config.ts";
 import type { ChainPort, ExecuteDeps, FeedJob, FeedQueryRepo, HttpPort } from "../src/ports.ts";
-import { FeedQueryExecutor, IntakeHttpError } from "../src/execute.ts";
+import { FeedQueryExecutor, IntakeHttpError, randomGrantNonce } from "../src/execute.ts";
 import { planCorpActions } from "../src/runners/corp-actions.ts";
 import { planEarnings } from "../src/runners/earnings.ts";
 import { planAttestations } from "../src/runners/attestations.ts";
@@ -15,6 +16,7 @@ import { createFeedRunnersApp } from "../src/app.ts";
 import { FeedScheduler } from "../src/scheduler.ts";
 import { parseEdgarAtom, selectPressRelease } from "../src/runners/edgar.ts";
 import { EdgarHttpClient } from "../src/adapters/http.ts";
+import { failureReason, observationIsCurrent } from "../src/observation.ts";
 
 const root = privateKeyToAccount(`0x${"01".repeat(32)}`);
 const intakeMeasurement = `0x${"03".repeat(32)}` as const;
@@ -58,17 +60,26 @@ describe("feed runner planners", () => {
   });
 });
 
-const intakeResult: IntakeResult = {
-  provenance: { docCommit: `0x${"11".repeat(32)}`, kind: 1, originId: `0x${"12".repeat(32)}`, fetchedAt: "1790427600", tokensK: 1, transcriptHash: `0x${"13".repeat(32)}` },
+/** What the intake returns for a sealed URL request: a FETCHED grant signing the sealed open binding. */
+const intakeResultFor = (open: OpenBinding): IntakeResult => ({
+  provenance: {
+    docCommit: `0x${"11".repeat(32)}`, kind: 1, originId: `0x${"12".repeat(32)}`, fetchedAt: "1790427600", tokensK: 1, transcriptHash: `0x${"13".repeat(32)}`,
+    schemaId: SchemaId.EX_DIVIDEND, schemaVersion: 1, paramsHash: `0x${"14".repeat(32)}`, expiry: "1790428500", ...open,
+  },
   intakeSig: "0x1234", intake: intake.signer().address.toLowerCase(), docCommit: `0x${"11".repeat(32)}`, paramsHash: `0x${"14".repeat(32)}`, schemaId: SchemaId.EX_DIVIDEND, tokensK: 1,
-};
+});
+let intakeResult: IntakeResult | undefined;
 function makeExecutor(options: { active?: boolean; budget?: bigint; autoFund?: boolean; onOpen?: () => void; registeredMeasurement?: `0x${string}` } = {}) {
   const order: string[] = [];
   const attestation: AttestationDoc = { role: "INTAKE", address: intake.signer().address.toLowerCase() as `0x${string}`, encryptionPubKey: intake.encryptionPublicKey(), measurement: intake.measurement(), quote: signedQuote };
   let submitted: { envelope: { v: 1; epk: `0x${string}`; nonce: `0x${string}`; ct: `0x${string}` } } | undefined;
   const http: HttpPort = {
     getAttestation: async () => attestation,
-    postIntake: async (_url, envelope) => { submitted = { envelope }; return intakeResult; },
+    postIntake: async (_url, envelope) => {
+      submitted = { envelope };
+      intakeResult = intakeResultFor(JSON.parse(new TextDecoder().decode(intake.decryptEnvelope(envelope, aad.intake()))).open);
+      return intakeResult;
+    },
   };
   const chainCalls: Record<string, unknown> = {};
   let currentBudget = options.budget ?? 0n;
@@ -108,14 +119,39 @@ describe("feed query execution", () => {
     expect(fixture.chainCalls.funded).toBe(50n);
     expect(fixture.chainCalls.role).toBe(2);
     expect(fixture.chainCalls.open).toEqual({
-      params: { schemaId: SchemaId.EX_DIVIDEND, n: 3, isPublic: true, allowPanelDisclosure: true, paramsHash: intakeResult.paramsHash, payerCommit: ZERO32, refundTo: `0x${"32".repeat(20)}`, nonce: expect.any(BigInt) },
-      provenance: { docCommit: intakeResult.provenance.docCommit, kind: 1, originId: intakeResult.provenance.originId, fetchedAt: BigInt(intakeResult.provenance.fetchedAt), tokensK: 1, transcriptHash: intakeResult.provenance.transcriptHash },
-      sig: intakeResult.intakeSig,
+      params: { n: 3, refundTo: `0x${"32".repeat(20)}` },
+      provenance: provenanceFromJson(intakeResult!.provenance),
+      sig: intakeResult!.intakeSig,
     });
+    // The grant names this feed runner as opener, public, with the nonce the queryId was computed from.
+    expect(intakeResult!.provenance).toMatchObject({ opener: `0x${"31".repeat(20)}`, payerCommit: ZERO32, isPublic: true, allowPanelDisclosure: true });
     expect(fixture.chainCalls.insert).toEqual([out.queryId, keccak256(toBytes(job.feedName)), job.key]);
     const envelope = fixture.submitted()!.envelope;
     const plaintext = JSON.parse(new TextDecoder().decode(intake.decryptEnvelope(envelope, aad.intake())));
-    expect(plaintext).toEqual({ v: 1, schemaId: SchemaId.EX_DIVIDEND, salt: ZERO32, params: { multiplier_token: true }, url: job.url });
+    expect(plaintext).toEqual({ v: 1, schemaId: SchemaId.EX_DIVIDEND, salt: ZERO32, params: { multiplier_token: true }, url: job.url, open: { opener: `0x${"31".repeat(20)}`, payerCommit: ZERO32, isPublic: true, allowPanelDisclosure: true, nonce: expect.any(String) } });
+  });
+  it("uses a fresh random 64-bit grant nonce, not the clock, and computes the queryId from it", async () => {
+    const fixture = await withSignedAttestation();
+    const nonces: string[] = [];
+    for (let i = 0; i < 4; i++) {
+      await fixture.executor.execute(job);
+      const plain = JSON.parse(new TextDecoder().decode(intake.decryptEnvelope(fixture.submitted()!.envelope, aad.intake())));
+      nonces.push(plain.open.nonce);
+      expect(intakeResult!.provenance.nonce).toBe(plain.open.nonce);
+    }
+    expect(new Set(nonces).size).toBe(4);
+    const draws = Array.from({ length: 256 }, () => randomGrantNonce());
+    expect(draws.every((n) => n >= 0n && n < 1n << 64n)).toBe(true);
+    expect(new Set(draws).size).toBe(256);
+    expect(draws.some((n) => n >= 1n << 63n)).toBe(true); // all 64 bits are used
+    // The executor takes the nonce from its source, never from the clock, and computes the queryId from it.
+    const seen: bigint[] = [];
+    const injected = makeExecutor();
+    const executor = new FeedQueryExecutor((injected.executor as unknown as { deps: ExecuteDeps }).deps, () => 0xfedcba9876543210n);
+    (injected.executor as unknown as { deps: ExecuteDeps }).deps.chain.computeQueryId = async (_sender, _doc, nonce) => { seen.push(nonce); return `0x${"21".repeat(32)}`; };
+    await executor.execute(job);
+    expect(seen).toEqual([0xfedcba9876543210n]);
+    expect(intakeResult!.provenance.nonce).toBe(0xfedcba9876543210n.toString());
   });
   it("requires active intake and maps intake caller errors for retry", async () => {
     const fixture = await withSignedAttestation();
@@ -251,12 +287,148 @@ describe("multiplier baseline (real Stock Token semantics)", () => {
   });
 });
 
+describe("multiplier observations (StockTokenCrosscheck.observeMultiplier)", () => {
+  const tokens = [
+    { ticker: "NVDA", token: `0x${"04".repeat(20)}`, noticeUrls: [{ url: "https://sec.gov/a", kind: "EX_DIVIDEND" }] },
+    { ticker: "aapl", token: `0x${"05".repeat(20)}`, noticeUrls: [] },
+  ];
+  const makeConfig = (stateFile: string) => ({ feeds: { ...feeds, "corp-actions": { tokens }, earnings: { ...feeds.earnings, releases: [], edgar: undefined } }, stateFile,
+    CORP_ACTIONS_UTC_HOUR: 13, ATTESTATIONS_WEEKDAY: 1, MULTIPLIER_POLL_MS: 60_000, EDGAR_POLL_MS: 60_000 }) as unknown as import("../src/config.ts").ServiceConfig;
+  const start = Date.parse("2026-09-26T14:00:00Z");
+  const executor = { execute: async () => ({ queryId: ZERO32, txHash: ZERO32 }) } as unknown as FeedQueryExecutor;
+  const captureLogs = async (fn: () => Promise<void>) => {
+    const lines: string[] = [];
+    const write = process.stdout.write.bind(process.stdout);
+    process.stdout.write = ((chunk: string) => { lines.push(String(chunk)); return true; }) as typeof process.stdout.write;
+    try { await fn(); } finally { process.stdout.write = write; }
+    return lines.map((line) => JSON.parse(line) as Record<string, unknown>);
+  };
+
+  it("observes every configured ticker on every poll, with or without a pending change, before the baseline fallback", async () => {
+    const stateFile = `/tmp/feed-observe-${process.pid}.json`;
+    const calls: string[] = [];
+    let now = start;
+    const reader = {
+      // No change pending on either token: the poll used to stop here without touching the crosscheck.
+      readMultiplierSchedule: async () => { calls.push("read"); return { uiMultiplier: 10n ** 18n, newUIMultiplier: 0n, effectiveAt: 0n }; },
+      recordBaseline: async () => { calls.push("recordBaseline"); return false; },
+      observeMultiplier: async (key: `0x${string}`, nowSec: bigint) => { calls.push(`observe:${key}:${nowSec}`); return "current" as const; },
+    };
+    const scheduler = new FeedScheduler(makeConfig(stateFile), executor, () => now, undefined, reader);
+    await scheduler.init(); await scheduler.pollMultiplierChanges();
+    const sec = BigInt(start / 1000);
+    expect(calls).toEqual([`observe:${toBytes32String("NVDA")}:${sec}`, "read", `observe:${toBytes32String("AAPL")}:${sec}`, "read"]);
+    now += 60_000; calls.length = 0;
+    await scheduler.pollMultiplierChanges();
+    expect(calls.filter((c) => c.startsWith("observe:"))).toHaveLength(2);
+    // A pending change: observe first (it records the baseline), then the recordBaseline fallback.
+    reader.readMultiplierSchedule = async () => { calls.push("read"); return { uiMultiplier: 10n ** 18n, newUIMultiplier: 2n * 10n ** 18n, effectiveAt: BigInt(start / 1000) + 86_400n }; };
+    calls.length = 0;
+    await scheduler.pollMultiplierChanges();
+    expect(calls.slice(0, 3)).toEqual([`observe:${toBytes32String("NVDA")}:${sec + 60n}`, "read", "recordBaseline"]);
+    await rm(stateFile, { force: true });
+  });
+
+  it("an observe failure never blocks the poll, backs off per ticker (no retry every poll) and recovers", async () => {
+    const stateFile = `/tmp/feed-observe-backoff-${process.pid}.json`;
+    let now = start;
+    const attempts: Record<string, number> = {};
+    let failNvda = true;
+    const jobs: FeedJob[] = [];
+    const jobExecutor = { execute: async (job: FeedJob) => { jobs.push(job); return { queryId: ZERO32, txHash: ZERO32 }; } } as unknown as FeedQueryExecutor;
+    const reader = {
+      readMultiplierSchedule: async () => ({ uiMultiplier: 10n ** 18n, newUIMultiplier: 2n * 10n ** 18n, effectiveAt: BigInt(start / 1000) + 86_400n }),
+      observeMultiplier: async (key: `0x${string}`) => {
+        attempts[key] = (attempts[key] ?? 0) + 1;
+        if (key === toBytes32String("NVDA") && failNvda) throw new Error("execution reverted: SafeCastOverflowedUintDowncast(64, 1)\nlong viem detail");
+        return "observed" as const;
+      },
+    };
+    const scheduler = new FeedScheduler(makeConfig(stateFile), jobExecutor, () => now, undefined, reader);
+    await scheduler.init();
+    const nvda = toBytes32String("NVDA"), aapl = toBytes32String("AAPL");
+    const logs = await captureLogs(() => scheduler.pollMultiplierChanges());
+    expect(attempts).toEqual({ [nvda]: 1, [aapl]: 1 });
+    expect(jobs).toHaveLength(1); // NVDA's notice job still ran
+    const failed = logs.filter((l) => l.event === "multiplier_observe_failed");
+    expect(failed).toHaveLength(1);
+    expect(failed[0]).toMatchObject({ level: "warn", ticker: "NVDA", failures: 1, backoffMs: 5 * 60_000, error: "execution reverted: SafeCastOverflowedUintDowncast(64, 1)" });
+    // Within the backoff: the failing ticker is skipped, the healthy one is still observed every poll.
+    for (let i = 0; i < 4; i++) { now += 60_000; await scheduler.pollMultiplierChanges(); }
+    expect(attempts).toEqual({ [nvda]: 1, [aapl]: 5 });
+    // After 5 minutes it retries once, fails again and doubles the backoff to 10 minutes.
+    now += 60_000;
+    const second = await captureLogs(() => scheduler.pollMultiplierChanges());
+    expect(attempts[nvda]).toBe(2);
+    expect(second.find((l) => l.event === "multiplier_observe_failed")).toMatchObject({ failures: 2, backoffMs: 10 * 60_000 });
+    now += 9 * 60_000; await scheduler.pollMultiplierChanges();
+    expect(attempts[nvda]).toBe(2);
+    failNvda = false; now += 60_000;
+    const recovered = await captureLogs(() => scheduler.pollMultiplierChanges());
+    expect(attempts[nvda]).toBe(3);
+    expect(recovered.some((l) => l.event === "multiplier_observe_recovered" && l.ticker === "NVDA")).toBe(true);
+    now += 60_000; await scheduler.pollMultiplierChanges();
+    expect(attempts[nvda]).toBe(4); // back to every poll
+    await rm(stateFile, { force: true });
+  });
+
+  it("a ticker the crosscheck does not know backs off like a revert", async () => {
+    const stateFile = `/tmp/feed-observe-unregistered-${process.pid}.json`;
+    let now = start, attempts = 0;
+    const reader = {
+      readMultiplierSchedule: async () => ({ uiMultiplier: 1n, newUIMultiplier: 0n, effectiveAt: 0n }),
+      observeMultiplier: async (key: `0x${string}`) => { if (key === toBytes32String("AAPL")) { attempts++; return "unregistered" as const; } return "current" as const; },
+    };
+    const scheduler = new FeedScheduler(makeConfig(stateFile), executor, () => now, undefined, reader);
+    await scheduler.init();
+    const logs = await captureLogs(() => scheduler.pollMultiplierChanges());
+    expect(logs.find((l) => l.event === "multiplier_observe_failed")).toMatchObject({ ticker: "AAPL", error: "ticker has no token on StockTokenCrosscheck" });
+    now += 60_000; await scheduler.pollMultiplierChanges();
+    expect(attempts).toBe(1);
+    await rm(stateFile, { force: true });
+  });
+
+  it("reports the contract's custom error name for a reverted simulation", () => {
+    const data = encodeErrorResult({ abi: StockTokenCrosscheckAbi, errorName: "UnknownTicker", args: [toBytes32String("NVDA")] });
+    const reverted = new ContractFunctionRevertedError({ abi: StockTokenCrosscheckAbi, data, functionName: "observeMultiplier" });
+    const error = new ContractFunctionExecutionError(reverted, { abi: StockTokenCrosscheckAbi, functionName: "observeMultiplier", args: [toBytes32String("NVDA")], contractAddress: `0x${"07".repeat(20)}` });
+    expect(failureReason(error)).toBe("UnknownTicker");
+    expect(failureReason(new Error("rpc down\nstack"))).toBe("rpc down");
+  });
+
+  it("only re-observes when the on-chain observation is out of date", () => {
+    const m = 10n ** 18n;
+    const t = (uiMultiplier: bigint, effectiveAt: bigint) => ({ uiMultiplier, effectiveAt });
+    // Never observed.
+    expect(observationIsCurrent({ observedAt: 0n, scheduledAt: 0n, multiplier: 0n }, t(m, 0n), 1_000n)).toBe(false);
+    // Same multiplier and schedule, nothing pending when observed: a new observation would only move observedAt.
+    expect(observationIsCurrent({ observedAt: 900n, scheduledAt: 500n, multiplier: m }, t(m, 500n), 1_000n)).toBe(true);
+    expect(observationIsCurrent({ observedAt: 900n, scheduledAt: 0n, multiplier: m }, t(m, 0n), 1_000n)).toBe(true);
+    // The multiplier moved (an immediate change, or a pending one took effect) or a new change was scheduled.
+    expect(observationIsCurrent({ observedAt: 900n, scheduledAt: 500n, multiplier: m }, t(2n * m, 950n), 1_000n)).toBe(false);
+    expect(observationIsCurrent({ observedAt: 900n, scheduledAt: 500n, multiplier: m }, t(m, 2_000n), 1_000n)).toBe(false);
+    // Observed while a change was pending: still current while it is pending, refreshed once it has taken effect.
+    expect(observationIsCurrent({ observedAt: 900n, scheduledAt: 2_000n, multiplier: m }, t(m, 2_000n), 1_999n)).toBe(true);
+    expect(observationIsCurrent({ observedAt: 900n, scheduledAt: 2_000n, multiplier: m }, t(m, 2_000n), 2_000n)).toBe(false);
+  });
+});
+
 describe("EDGAR discovery", () => {
   it("defaults poll intervals to 60 seconds and rejects values under the 10 second floor", () => {
-    const env = { ADMIN_TOKEN: "admin", FEED_RUNNER_ADDRESS: `0x${"31".repeat(20)}`, FEED_RUNNER_KEY: `0x${"33".repeat(32)}` };
+    const env = { ADMIN_TOKEN: "admin", FEED_RUNNER_ADDRESS: `0x${"31".repeat(20)}`, FEED_RUNNER_KEY: `0x${"33".repeat(32)}`, QUOTE_VERIFIER: "dcap" };
     expect(ServiceEnvSchema.parse(env).MULTIPLIER_POLL_MS).toBe(60_000);
     expect(ServiceEnvSchema.parse(env).EDGAR_POLL_MS).toBe(60_000);
     expect(ServiceEnvSchema.safeParse({ ...env, EDGAR_POLL_MS: "9999" }).success).toBe(false);
+  });
+  it("requires an explicit QUOTE_VERIFIER: no configuration defaults to mock quote verification", () => {
+    const env = { ADMIN_TOKEN: "admin", FEED_RUNNER_ADDRESS: `0x${"31".repeat(20)}`, FEED_RUNNER_KEY: `0x${"33".repeat(32)}` };
+    for (const QUOTE_VERIFIER of [undefined, "", "MOCK", "nras"]) {
+      const parsed = ServiceEnvSchema.safeParse({ ...env, QUOTE_VERIFIER });
+      expect(parsed.success).toBe(false);
+      expect(parsed.error?.issues[0]?.message).toContain("QUOTE_VERIFIER must be set explicitly");
+    }
+    expect(ServiceEnvSchema.parse({ ...env, QUOTE_VERIFIER: "dcap" }).QUOTE_VERIFIER).toBe("dcap");
+    expect(ServiceEnvSchema.parse({ ...env, QUOTE_VERIFIER: "mock" }).QUOTE_VERIFIER).toBe("mock");
   });
   const atomPromise = readFile(new URL("./fixtures/edgar-atom.xml", import.meta.url), "utf8");
   const indexPromise = readFile(new URL("./fixtures/edgar-index.htm", import.meta.url), "utf8");
