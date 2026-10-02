@@ -319,3 +319,6 @@ main .mochi-code { white-space: pre-wrap; overflow-wrap: anywhere; max-width: 10
   .workspace .workspace-tabs { flex-wrap: wrap; gap: 0 2rem; }
   .workspace .workspace-tabs button { white-space: normal; }
 }
+
+/* In-page anchor targets receive programmatic focus for screen readers; don't draw a ring around the whole section. */
+main [tabindex="-1"]:focus { outline: none; }
