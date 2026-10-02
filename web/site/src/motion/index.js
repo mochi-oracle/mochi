@@ -36,6 +36,45 @@ function bootSmoothScroll() {
   return lenis;
 }
 
+function setupAnchors(lenis) {
+  const wrapper = document.querySelector('[data-scroll-wrapper]');
+  if (!wrapper) return;
+  const navigate = hash => {
+    let id;
+    try { id = decodeURIComponent(hash.slice(1)); } catch { return; }
+    const target = document.getElementById(id);
+    if (!target || !wrapper.contains(target)) return;
+    const offset = -parseFloat(getComputedStyle(target).scrollMarginTop || '0');
+    // Native focus or scrollIntoView can move the wrapper before Lenis updates its cached position.
+    const top = wrapper.scrollTop + target.getBoundingClientRect().top - wrapper.getBoundingClientRect().top + offset;
+    if (lenis) lenis.scrollTo(top, { immediate: true, force: true });
+    else wrapper.scrollTo({ top, behavior: 'instant' });
+    target.setAttribute('tabindex', '-1');
+    target.focus({ preventScroll: true });
+  };
+  document.addEventListener('click', event => {
+    const link = event.target.closest('a[href]');
+    if (!link || event.defaultPrevented || event.button !== 0 || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey || link.hasAttribute('download') || link.target) return;
+    const url = new URL(link.href);
+    if (url.origin !== location.origin || url.pathname !== location.pathname || url.search !== location.search || !url.hash) return;
+    event.preventDefault();
+    history.pushState(null, '', url.hash);
+    navigate(url.hash);
+  });
+  window.addEventListener('popstate', () => navigate(location.hash));
+  window.addEventListener('hashchange', () => navigate(location.hash));
+  // The loader's clip path can temporarily alter element geometry; align deep links after it clears.
+  const initial = () => {
+    if (root.classList.contains('preloader-complete')) {
+      document.fonts.ready.then(() => navigate(location.hash));
+      observer.disconnect();
+    }
+  };
+  const observer = new MutationObserver(initial);
+  observer.observe(root, { attributes: true, attributeFilter: ['class'] });
+  initial();
+}
+
 function setupLazyImages() {
   const images = elements('img[data-component^="lazyload"][data-src]');
   const load = image => {
@@ -87,17 +126,14 @@ function completeLoader() {
     playVisibleReveals();
   }});
   timeline
-    .fromTo(layers[0], { xPercent: -100 }, { xPercent: 0, duration: 1.2 }, 0)
-    .fromTo(layers[1], { xPercent: -100 }, { xPercent: 0, duration: 1.2 }, .1)
-    .fromTo(layers[2], { xPercent: -100 }, { xPercent: 0, duration: 1.2 }, .2)
-    .call(() => root.classList.remove('is-loading'), [], 1.2)
-    .fromTo('main', { visibility: 'hidden', clipPath: 'inset(50% 50% 0 50%)' }, { visibility: 'visible', clipPath: 'inset(0)', duration: 1.5, ease: 'power3.inOut', clearProps: 'clipPath' }, 1.2)
-    .to(words, { opacity: 1, duration: .45, stagger: .1 }, .25)
-    .fromTo('[data-page-overlay]', { clipPath: 'inset(0 100% 0 0)' }, { clipPath: 'inset(0 0% 0 0)', duration: .9 }, '+=.2')
-    // Under the full overlay, the full-size colour fills go away. What stays of the layers is their
-    // :before/:after bars: the permanent lavender/orange frame with the M and O labels.
+    .fromTo(layers[0], { xPercent: -100 }, { xPercent: 0, duration: .25 }, 0)
+    .fromTo(layers[1], { xPercent: -100 }, { xPercent: 0, duration: .25 }, .04)
+    .fromTo(layers[2], { xPercent: -100 }, { xPercent: 0, duration: .25 }, .08)
+    .call(() => root.classList.remove('is-loading'), [], .25)
+    .fromTo('main', { visibility: 'hidden', clipPath: 'inset(50% 50% 0 50%)' }, { visibility: 'visible', clipPath: 'inset(0)', duration: .35, clearProps: 'clipPath' }, .25)
+    .fromTo('[data-page-overlay]', { clipPath: 'inset(0 100% 0 0)' }, { clipPath: 'inset(0)', duration: .2 }, .55)
     .set(insets, { display: 'none' })
-    .to('[data-page-overlay]', { clipPath: 'inset(0 0 0 100%)', duration: .9, ease }, '+=.1')
+    .to('[data-page-overlay]', { clipPath: 'inset(0 0 0 100%)', duration: .25 })
     .add(() => gsap.set('[data-page-overlay]', { clearProps: 'clipPath' }));
 }
 
@@ -519,7 +555,8 @@ function setupCursor() {
 
 function init() {
   if (!document.querySelector('#home, #about-mochi')) root.classList.add('inner-page');
-  bootSmoothScroll();
+  const lenis = bootSmoothScroll();
+  setupAnchors(lenis);
   setupLazyImages();
   setupLoadMore();
   document.fonts.ready.then(() => { setupReveals(); ScrollTrigger.refresh(); });

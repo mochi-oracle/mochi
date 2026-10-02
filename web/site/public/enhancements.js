@@ -45,10 +45,6 @@ if(document.documentElement.classList.contains('dashboard-document')){
 }else{
  const update=()=>reflectMenu(document.documentElement.classList.contains('menu--opened'));
  new MutationObserver(update).observe(document.documentElement,{attributes:true,attributeFilter:['class']});
- window.addEventListener('load',()=>{if(location.hash)setTimeout(()=>{
-  const target=document.getElementById(decodeURIComponent(location.hash.slice(1)));
-  if(target)target.scrollIntoView({behavior:'instant',block:'start'});
- },1800)},{once:true});
 }
 document.addEventListener('keydown',e=>{
  if(e.key!=='Tab'||menuButton?.getAttribute('aria-expanded')!=='true')return;

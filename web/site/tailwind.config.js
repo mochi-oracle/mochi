@@ -2,7 +2,7 @@ const spacing = Object.fromEntries(Array.from({ length: 321 }, (_, value) => [va
 
 /** @type {import('tailwindcss').Config} */
 export default {
-  content: ['./index.html', './{about,how-it-works,case-study,roadmap,docs,dashboard}/index.html', './src/**/*.{js,jsx,ts,tsx}'],
+  content: ['./index.html', './*/index.html', './src/**/*.{js,jsx,ts,tsx}'],
   theme: {
     screens: { md: '768px', lg: '1024px', laptop: '1280px', xl: '1280px', '2xl': '1440px' },
     spacing: { ...spacing, px: '1px', auto: 'auto', full: '100%', screen: '100vw' },
