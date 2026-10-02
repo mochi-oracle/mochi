@@ -145,9 +145,17 @@ async function main() {
       const tx = await wallet(accountAt(jurorIndexes[i]! + 1)).writeContract({ address: contracts.jurorRegistry!, abi: A.JurorRegistryAbi, functionName: "enrollJuror", args: [seat.address, seat.measurement, seat.class, 0n, proof], chain: null });
       assert((await publicClient.waitForTransactionReceipt({ hash: tx })).status === "success", "zero-bond enrollment failed");
     }
+    // A juror joins its class's selection pool at its first attestation refresh, not at enrollment.
+    const poolSizes = async () => Promise.all([0, 1, 2, 3, 4].map(async (cls) => (await publicClient.readContract({ address: contracts.jurorRegistry!, abi: A.JurorRegistryAbi, functionName: "jurorsOfClass", args: [cls] }) as readonly Address[]).length));
+    assert((await poolSizes()).every((n) => n === 0), "enrolled jurors must not join a selection pool before the attestor refreshes them");
+    const enrolledGate = await collect(start("bun", ["scripts/phala-batch.ts", deploymentPath, identitiesPath, "schedule", "activate"], { cwd: ROOT, env }));
+    assert(enrolledGate.code !== 0, "activation CLI must refuse enrolled jurors before their attestation");
     const until = (await publicClient.getBlock()).timestamp + 14n * delay;
     const refresh = await wallet(accountAt(18)).writeContract({ address: contracts.jurorRegistry!, abi: A.JurorRegistryAbi, functionName: "refreshAttestation", args: [[input.intake.address, input.consensus.address, ...input.jurors.map(j => j.address)], until], chain: null });
     assert((await publicClient.waitForTransactionReceipt({ hash: refresh })).status === "success", "fixture attestation failed");
+    assert(JSON.stringify(await poolSizes()) === JSON.stringify([2, 2, 2, 1, 2]), "the attestor's refresh must put the nine jurors in their pools (2/2/2/1/2)");
+    const inPoolAbi = parseAbi(["function inPool(address key) view returns (bool)"]);
+    for (const juror of input.jurors) assert(await publicClient.readContract({ address: contracts.jurorRegistry!, abi: inPoolAbi, functionName: "inPool", args: [juror.address] }), `juror ${juror.address} is not in its pool after attestation`);
     const readyGate = await collect(start("bun", ["scripts/phala-batch.ts", deploymentPath, identitiesPath, "schedule", "activate"], { cwd: ROOT, env }));
     assert(readyGate.code === 0, "activation CLI must accept approved zero-bond jurors after attestation");
     let directUnpauseRefused = false;
@@ -186,7 +194,7 @@ async function main() {
       usdg: "MockUSDG", initialPaused: true, configure: { callCount: configureSchedule.callCount, earlyExecutionReverted: true, earlyRevert: "TimelockUnexpectedOperationState", executedAfterSeconds: "60", pausedAfterConfigure: true, attestorRoleAssigned: true, feedRunnerRoleAssigned: true },
       activation: { callCount: activation.callCount, earlyExecutionReverted: true, earlyRevert: "TimelockUnexpectedOperationState", executedAfterSeconds: "60", unpausedAfterExecution: true, guardianPauseAfterActivation: true },
       panelEscalation: { deployedOff: true, switchOnCallCount: panelOnSchedule.callCount, earlyExecutionReverted: true, onAfterDelay: true },
-      jurorFixture: "nine locally approved and attested zero-bond jurors; activation CLI refused before enrollment and passed afterward; no payment or real service health claimed",
+      jurorFixture: "nine locally approved and attested zero-bond jurors; activation CLI refused before enrollment and before attestation, and passed afterward; pools empty after enrollment and 2/2/2/1/2 after the attestor's refresh; no payment or real service health claimed",
       limitation: "this local run deploys the test token; the external-token path is exercised by a testnet dress rehearsal (chain 46630, --mochi-token stand-in) and on mainnet",
     }, null, 2));
   } finally {

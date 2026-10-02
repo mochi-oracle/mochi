@@ -2,8 +2,8 @@ import { decodeAbiParameters, encodeAbiParameters, keccak256, recoverMessageAddr
 import type { Quote } from "./provider.ts";
 import { hexToBytes } from "viem";
 import { dstackConfigMeasurement, parseTdxReportData, tdxMeasurement } from "./tdx-common.ts";
-import { verifyTdxQuote, verifyTdxQuoteEvidence, type TdxQuoteEvidence, type TdxVerification } from "./dcap/verify.ts";
-import { staleCollateralGraceSec, type CollateralSource } from "./dcap/collateral.ts";
+import { DcapError, isCollateralIntegrityFailure, verifyTdxQuote, verifyTdxQuoteEvidence, type TdxQuoteEvidence, type TdxVerification } from "./dcap/verify.ts";
+import { staleCollateralGraceSec, type CollateralSource, type TdxCollateral } from "./dcap/collateral.ts";
 export type TcbStatus = string;
 
 export interface QuoteVerifier {
@@ -95,17 +95,12 @@ export class DcapQuoteVerifier implements QuoteVerifier {
       return { ok: false as const, reason: `dcap: ${dcapCode(error)}` };
     }
 
-    let collateral;
-    try {
-      collateral = await this.options.collateral.get(evidence.fmspc, evidence.ca, expected.signal);
-    } catch {
-      return { ok: false as const, reason: "dcap: collateral unavailable" };
-    }
-
     let result: TdxVerification;
     try {
-      result = this.verifyDcap(raw, collateral, now, { collateralGraceSec: staleCollateralGraceSec(collateral) });
+      result = await verifyWithCollateral(this.options.collateral, evidence, (collateral) =>
+        this.verifyDcap(raw, collateral, now, { collateralGraceSec: staleCollateralGraceSec(collateral) }), expected.signal);
     } catch (error) {
+      if (error instanceof CollateralUnavailableError) return { ok: false as const, reason: "dcap: collateral unavailable" };
       return { ok: false as const, reason: `dcap: ${dcapCode(error)}` };
     }
 
@@ -165,6 +160,50 @@ export class DcapQuoteVerifier implements QuoteVerifier {
       tcbStatus: result.status,
       advisoryIds: result.advisoryIds,
     };
+  }
+}
+
+/** The collateral source could not supply collateral (PCS unreachable, backoff, nothing cached). */
+export class CollateralUnavailableError extends Error {
+  constructor(cause: unknown) {
+    super("collateral unavailable", { cause });
+    this.name = "CollateralUnavailableError";
+  }
+}
+
+/**
+ * Get collateral for an Intel-signed FMSPC/CA (from verifyTdxQuoteEvidence) and run `verify` with it. Collateral that
+ * fails its own checks (signatures, issuer chains, schema, validity: isCollateralIntegrityFailure) is dropped from the
+ * source with invalidate() and fetched and verified once more, so a bad cached copy is not served until it expires.
+ * A failed fetch throws CollateralUnavailableError; `verify`'s errors propagate.
+ */
+export async function verifyWithCollateral<T>(
+  source: CollateralSource,
+  target: { fmspc: string; ca: "platform" | "processor" },
+  verify: (collateral: TdxCollateral) => T,
+  signal?: AbortSignal,
+): Promise<T> {
+  const fetchCollateral = async () => {
+    try {
+      return await source.get(target.fmspc, target.ca, signal);
+    } catch (error) {
+      throw new CollateralUnavailableError(error);
+    }
+  };
+  const blamesCollateral = (error: unknown) => error instanceof DcapError && isCollateralIntegrityFailure(error.code);
+  const first = await fetchCollateral();
+  try {
+    return verify(first);
+  } catch (error) {
+    if (!source.invalidate || !blamesCollateral(error)) throw error;
+    source.invalidate(target.fmspc, target.ca, first);
+  }
+  const fresh = await fetchCollateral();
+  try {
+    return verify(fresh);
+  } catch (error) {
+    if (blamesCollateral(error)) source.invalidate!(target.fmspc, target.ca, fresh);
+    throw error;
   }
 }
 

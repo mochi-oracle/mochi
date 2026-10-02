@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
-pragma solidity ^0.8.28;
+pragma solidity 0.8.28;
 
 /// @title IStockTokenMultiplier
 /// @notice View surface of a Robinhood Chain Stock Token's UI-multiplier schedule. VERIFIED 2026-09-26 against the

@@ -8,7 +8,8 @@ import { DcapQuoteVerifier } from "../src/verifier.ts";
 import { tdxMeasurement, tdxReportData } from "../src/tdx-common.ts";
 import type { Quote } from "../src/provider.ts";
 import {
-  FIXTURE_NOW, bogusFmspcQuote, buildQuote, keyPair, pem, readFixture, readFixtureJson, resignCert, selfSignedChainQuote,
+  FIXTURE_NOW, bogusFmspcQuote, buildQuote, indexOfBytes, keyPair, pem, readFixture, readFixtureJson, resignCert, selfSignedChainQuote,
+  tamperCert,
 } from "./forge-quote.ts";
 
 const binding = `0x${"ab".repeat(32)}` as Hex;
@@ -29,6 +30,15 @@ function countingCollateral(collateral?: TdxCollateral): CollateralSource & { ca
 function quoteOf(raw: Uint8Array): Quote {
   const { td } = parseTdxQuote(raw);
   return { kind: "tdx", raw: bytesToHex(raw), measurement: tdxMeasurement({ mrtd: td.mrTd, rtmr: td.rtmr }), reportData: binding, issuedAt };
+}
+
+/** Replace every occurrence of an ASCII string inside DER bytes with another of the same length. */
+function replaceAscii(bytes: Uint8Array, from: string, to: string): void {
+  const needle = new TextEncoder().encode(from), replacement = new TextEncoder().encode(to);
+  if (needle.length !== replacement.length) throw new Error("length must not change");
+  let found = false;
+  for (let at = indexOfBytes(bytes, needle); at >= 0; at = indexOfBytes(bytes, needle)) { bytes.set(replacement, at); found = true; }
+  if (!found) throw new Error(`${from} not found`);
 }
 
 const codeOf = (fn: () => unknown) => {
@@ -105,6 +115,54 @@ describe("PCK chain is validated against the pinned Intel root before collateral
     const collateral = countingCollateral();
     expect((await new DcapQuoteVerifier({ collateral, now: () => FIXTURE_NOW }).verify(quoteOf(body))).reason).toBe("dcap: quote signature");
     expect(collateral.calls).toEqual([]);
+  });
+
+  test("a [TCB Signing, Root, Root] chain passes every chain check, and its forger is stopped at the QE report signature", async () => {
+    const raw = await readFixture("tdx_quote");
+    const collateral = await readFixtureJson("tdx_quote_collateral.json") as TdxCollateral;
+    const [tcbSigning, root] = pemChain(collateral.tcb_info_issuer_chain) as [Cert, Cert];
+    expect(tcbSigning.subjectCN).toBe("Intel SGX TCB Signing");
+    expect(tcbSigning.sgx).toBeUndefined();
+    // Intel's own TCB Signing certificate is a non-CA leaf signed by the root, and the self-signed root can stand in as
+    // the intermediate, so this chain satisfies the shape, CA flags, issuer linkage and every certificate signature.
+    // The forger does not hold the TCB Signing key, so the QE report (checked before the extension) cannot verify.
+    const forged = buildQuote(raw, { pckPem: pem([tcbSigning.der, root.der, root.der]), pckSigner: keyPair().secret });
+    expect(codeOf(() => verifyTdxQuoteEvidence(forged, FIXTURE_NOW))).toBe("QE report signature");
+    const verifier = new DcapQuoteVerifier({ collateral: countingCollateral(collateral), now: () => FIXTURE_NOW });
+    expect((await verifier.verify(quoteOf(forged))).reason).toBe("dcap: QE report signature");
+  });
+
+  test("the SGX extension and CA name are checked only after the signatures by the leaf key", async () => {
+    // A private test root stands in for an Intel-signed chain whose leaf key signed the QE report: only Intel can build
+    // such a chain under the real root.
+    const raw = await readFixture("tdx_quote");
+    const collateral = await readFixtureJson("tdx_quote_collateral.json") as TdxCollateral;
+    const [tcbSigning] = pemChain(collateral.tcb_info_issuer_chain) as [Cert, Cert];
+    const [leaf, intermediate, root] = pemChain(parseTdxQuote(raw).pckPem) as [Cert, Cert, Cert];
+    const testRoot = keyPair(), caKey = keyPair(), leafKey = keyPair();
+    const rootDer = resignCert(root, testRoot.secret, { publicKey: testRoot.publicKey });
+
+    // A leaf without the SGX extension: "PCK extension".
+    const noExtension = buildQuote(raw, {
+      pckPem: pem([resignCert(tcbSigning, testRoot.secret, { publicKey: leafKey.publicKey }), rootDer, rootDer]),
+      pckSigner: leafKey.secret,
+    });
+    expect(codeOf(() => verifyTdxQuoteEvidence(noExtension, FIXTURE_NOW, { trustedRootDer: rootDer }))).toBe("PCK extension");
+
+    // A CA with a name this code does not know (a future Intel CA): "PCK CA", which is not forgery.
+    const rename = (tbs: Uint8Array) => replaceAscii(tbs, "Intel SGX PCK Platform CA", "Intel SGX PCK Newfound CA");
+    const renamedChain = pem([
+      resignCert(leaf, caKey.secret, { publicKey: leafKey.publicKey, editTbs: rename }),
+      resignCert(intermediate, testRoot.secret, { publicKey: caKey.publicKey, editTbs: rename }),
+      rootDer,
+    ]);
+    const renamed = buildQuote(raw, { pckPem: renamedChain, pckSigner: leafKey.secret });
+    expect(pemChain(renamedChain)[1]!.subjectCN).toBe("Intel SGX PCK Newfound CA");
+    expect(codeOf(() => verifyTdxQuoteEvidence(renamed, FIXTURE_NOW, { trustedRootDer: rootDer }))).toBe("PCK CA");
+
+    // Under the real Intel root nobody but Intel can rename the CA: the edited certificate no longer verifies.
+    const tampered = buildQuote(raw, { pckPem: pem([tamperCert(leaf, rename), tamperCert(intermediate, rename), root.der]) });
+    expect(codeOf(() => verifyTdxQuoteEvidence(tampered, FIXTURE_NOW))).toBe("PCK certificate signature");
   });
 
   test("full verification still passes for the genuine quote and keeps collateral failures distinct", async () => {

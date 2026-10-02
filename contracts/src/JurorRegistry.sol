@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
-pragma solidity ^0.8.28;
+pragma solidity 0.8.28;
 
 import {AccessControl} from "@openzeppelin/contracts/access/AccessControl.sol";
 import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
@@ -22,16 +22,22 @@ contract JurorRegistry is IJurorRegistry, AccessControl, ReentrancyGuard {
     bytes32 public constant ATTESTOR_ROLE = MochiRoles.ATTESTOR_ROLE;
     uint64 private constant TIMEOUT_SLASH_INTERVAL = 1 days;
     uint256 private constant BPS = 10_000;
-    /// @dev Rehash draws per seat before the exact (enumerating) fallback.
-    uint256 private constant MAX_DRAWS = 16;
+    /// @dev Rehash draws per seat. There is no enumerating fallback: when every draw misses, selection reverts.
+    uint256 private constant MAX_DRAWS = 128;
     uint256 private constant SNAPSHOT_TAKEN = 1 << 255;
+    /// @notice prunePool drops a pooled key whose attestation lapsed more than this long ago (it rejoins at its next
+    ///         attestation refresh that leaves it active).
+    uint64 public constant ATTESTATION_GRACE = 1 days;
 
     mapping(address => Juror) public jurors;
     mapping(bytes32 => mapping(MochiTypes.Role => bool)) public allowedMeasurement;
-    /// @dev Selection pools: class => generation => keys, in enrollment order. Enrollment appends to the current
-    ///      generation; prunePool copies the keys that can still serve into the next one. A generation is never
+    /// @dev Selection pools: class => generation => keys, in joining order. A JUROR key joins the current generation
+    ///      when an attestation refresh first leaves it active (not at enrollment, so keys the attestor never vouched for
+    ///      never enter a pool); prunePool copies the keys that can still serve into the next one. A generation is never
     ///      reordered or shortened, so a (generation, length) snapshot keeps naming exactly the same keys.
     mapping(MochiTypes.JurorClass => mapping(uint256 => address[])) private _pools;
+    /// @inheritdoc IJurorRegistry
+    mapping(address => bool) public override inPool;
     /// @dev Current pool of every class, 48 bits per class at bit 48 * class: generation (low 24) | length (high 24).
     uint256 private _poolState;
     /// @dev owner (the escrow) => queryId => _poolState as of the owner's openSelection call, | SNAPSHOT_TAKEN.
@@ -88,13 +94,6 @@ contract JurorRegistry is IJurorRegistry, AccessControl, ReentrancyGuard {
         if (minJurorBond == 0 && unbondedJurorOperator[key] != msg.sender) revert UnbondedJurorNotApproved(key, msg.sender);
         if (bond != 0) mochi.safeTransferFrom(msg.sender, address(this), bond);
         jurors[key] = Juror(msg.sender, measurement, MochiTypes.Role.JUROR, jurorClass, bond, 0, 0, false, 0, 0, 0);
-        uint256 shift = uint256(uint8(jurorClass)) * 48;
-        uint256 state = _poolState;
-        address[] storage pool = _pools[jurorClass][uint24(state >> shift)];
-        pool.push(key);
-        uint256 len = pool.length;
-        if (len > type(uint24).max) revert PoolFull(jurorClass);
-        _poolState = (state & ~(uint256(type(uint24).max) << (shift + 24))) | (len << (shift + 24));
         emit Enrolled(key, msg.sender, MochiTypes.Role.JUROR, jurorClass, measurement, bond);
     }
 
@@ -130,13 +129,33 @@ contract JurorRegistry is IJurorRegistry, AccessControl, ReentrancyGuard {
     /// @inheritdoc IJurorRegistry
     function refreshAttestation(address[] calldata keys, uint64 until) external override onlyRole(MochiRoles.ATTESTOR_ROLE) {
         for (uint256 i; i < keys.length; ++i) {
-            Juror storage j = jurors[keys[i]];
-            if (j.operator == address(0)) revert NotEnrolled(keys[i]);
-            if (j.delisted) revert NotEnrolled(keys[i]);
+            address key = keys[i];
+            Juror storage j = jurors[key];
+            if (j.operator == address(0)) revert NotEnrolled(key);
+            // Delisting is permanent. Skip rather than revert, so a delisted key whose enclave still answers the
+            // attestor cannot block the refresh of every other key in the batch.
+            if (j.delisted) continue;
             if (!allowedMeasurement[j.measurement][j.role]) revert MeasurementNotAllowed(j.measurement, j.role);
             j.attestedUntil = until;
-            emit AttestationRefreshed(keys[i], until);
+            emit AttestationRefreshed(key, until);
+            if (j.role == MochiTypes.Role.JUROR && !inPool[key] && isActive(key, MochiTypes.Role.JUROR)) {
+                _joinPool(key, j.jurorClass);
+            }
         }
+    }
+
+    /// @dev Appends `key` to the current generation of its class's pool.
+    function _joinPool(address key, MochiTypes.JurorClass jurorClass) private {
+        uint256 shift = uint256(uint8(jurorClass)) * 48;
+        uint256 state = _poolState;
+        uint256 gen = uint24(state >> shift);
+        address[] storage pool = _pools[jurorClass][gen];
+        pool.push(key);
+        uint256 len = pool.length;
+        if (len > type(uint24).max) revert PoolFull(jurorClass);
+        _poolState = (state & ~(uint256(type(uint24).max) << (shift + 24))) | (len << (shift + 24));
+        inPool[key] = true;
+        emit PoolJoined(key, jurorClass, gen);
     }
 
     /// @inheritdoc IJurorRegistry
@@ -218,7 +237,13 @@ contract JurorRegistry is IJurorRegistry, AccessControl, ReentrancyGuard {
         uint256 timestamp = block.timestamp;
         return j.operator != address(0) && j.role == role && !j.delisted && j.exitRequestedAt == 0
             && j.attestedUntil >= timestamp && allowedMeasurement[j.measurement][role]
-            && (role != MochiTypes.Role.JUROR || (minJurorBond == 0 ? unbondedJurorOperator[key] == j.operator : j.bond > 0));
+            && (role != MochiTypes.Role.JUROR || _admitted(key, j));
+    }
+
+    /// @dev The bond-mode condition of a JUROR key: zero-bond mode needs the governor's approval of its exact operator,
+    ///      bonded mode a nonzero bond.
+    function _admitted(address key, Juror storage j) private view returns (bool) {
+        return minJurorBond == 0 ? unbondedJurorOperator[key] == j.operator : j.bond > 0;
     }
 
     /// @inheritdoc IJurorRegistry
@@ -264,8 +289,12 @@ contract JurorRegistry is IJurorRegistry, AccessControl, ReentrancyGuard {
     }
 
     /// @dev Rejection sampling over the snapshot: draw an index, and if that key cannot take the seat draw a fresh index
-    ///      (never probe forward, which would hand every dead entry's share to the next live key). After MAX_DRAWS misses,
-    ///      pick uniformly among all eligible keys of the snapshot. Either way each eligible key is equally likely.
+    ///      (never probe forward, which would hand every dead entry's share to the next live key). The draw sequence is
+    ///      fixed by the seed and the seat, and the seat goes to its first eligible draw, so each eligible key is equally
+    ///      likely, and a key that drops out after the seed is known (exit, attestation lapse, revocation) only hands its
+    ///      own seat to the next eligible draw: it never reshuffles which key the other draws name. After MAX_DRAWS
+    ///      misses the seat reverts NoEligibleJuror; there is no count-based fallback, because a pick among the eligible
+    ///      keys by index moves whenever any key's eligibility changes, which an operator can steer by exiting its keys.
     function _draw(
         address[] storage pool,
         uint256 len,
@@ -278,32 +307,13 @@ contract JurorRegistry is IJurorRegistry, AccessControl, ReentrancyGuard {
         if (len != 0) {
             for (uint256 attempt; attempt < MAX_DRAWS; ++attempt) {
                 address candidate = pool[uint256(keccak256(abi.encode(seed_, seat, attempt))) % len];
-                if (_eligible(candidate, exclude, chosen)) return candidate;
-            }
-            uint256 count;
-            for (uint256 i; i < len; ++i) {
-                if (_eligible(pool[i], exclude, chosen)) ++count;
-            }
-            if (count != 0) {
-                uint256 pick = uint256(keccak256(abi.encode(seed_, seat, MAX_DRAWS))) % count;
-                for (uint256 i; i < len; ++i) {
-                    address candidate = pool[i];
-                    if (!_eligible(candidate, exclude, chosen)) continue;
-                    if (pick == 0) return candidate;
-                    --pick;
-                }
+                if (
+                    !_containsMemory(chosen, candidate) && !_contains(exclude, candidate)
+                        && isActive(candidate, MochiTypes.Role.JUROR)
+                ) return candidate;
             }
         }
         revert NoEligibleJuror(class_);
-    }
-
-    function _eligible(address candidate, address[] calldata exclude, address[] memory chosen)
-        private
-        view
-        returns (bool)
-    {
-        return isActive(candidate, MochiTypes.Role.JUROR) && !_contains(exclude, candidate)
-            && !_containsMemory(chosen, candidate);
     }
 
     /// @inheritdoc IJurorRegistry
@@ -317,9 +327,10 @@ contract JurorRegistry is IJurorRegistry, AccessControl, ReentrancyGuard {
         uint256 len = pool.length;
         for (uint256 i; i < len; ++i) {
             address key = pool[i];
-            Juror storage j = jurors[key];
-            // Exit and delisting are permanent; attestation lapses and measurement or approval changes are not.
-            if (j.delisted || j.exitRequestedAt != 0) continue;
+            if (_prunable(key)) {
+                inPool[key] = false; // a refresh that leaves it active again re-adds it
+                continue;
+            }
             next.push(key);
         }
         kept = next.length;
@@ -327,6 +338,14 @@ contract JurorRegistry is IJurorRegistry, AccessControl, ReentrancyGuard {
         if (removed == 0) revert NothingToPrune(jurorClass);
         _poolState = (state & ~(uint256(type(uint48).max) << shift)) | ((gen + 1) | (kept << 24)) << shift;
         emit PoolPruned(jurorClass, gen + 1, kept, removed);
+    }
+
+    /// @dev Exit and delisting are permanent. A lapse longer than ATTESTATION_GRACE, a disallowed measurement, a revoked
+    ///      zero-bond approval or (bonded mode) a zero bond are not, which is why a dropped key can rejoin.
+    function _prunable(address key) private view returns (bool) {
+        Juror storage j = jurors[key];
+        return j.delisted || j.exitRequestedAt != 0 || uint256(j.attestedUntil) + ATTESTATION_GRACE < block.timestamp
+            || !allowedMeasurement[j.measurement][MochiTypes.Role.JUROR] || !_admitted(key, j);
     }
 
     /// @inheritdoc IJurorRegistry
@@ -357,16 +376,30 @@ contract JurorRegistry is IJurorRegistry, AccessControl, ReentrancyGuard {
         return configured.seatClass(seat);
     }
 
-    /// @notice Approves an exact team-operated seat when the minimum bond is zero.
+    /// @notice Approves an exact team-operated seat when the minimum bond is zero. A zero operator revokes the approval:
+    ///         the key stops being active at once, and prunePool can drop it from its pool (re-approval plus the next
+    ///         attestation refresh brings it back).
     function setUnbondedJuror(address key, address operator) external onlyRole(MochiRoles.GOVERNOR_ROLE) {
         if (key == address(0)) revert NotEnrolled(key);
-        unbondedJurorOperator[key] = operator; // zero operator revokes approval and active eligibility
+        unbondedJurorOperator[key] = operator;
         emit UnbondedJurorSet(key, operator);
     }
 
     /// @notice Sets the minimum bond; zero selects team-approved admission and eligibility.
+    /// @dev Switching between zero and a positive minimum flips the admission rule of every JUROR key at once: zero-bond
+    ///      keys stop being active the moment the minimum turns positive, and bonded keys need approvals when it returns
+    ///      to zero. Their seated answers are then rejected by MochiVerdicts.post (InactiveJuror) and new seats revert
+    ///      NoEligibleJuror. Switch only while QueryEscrow is paused and has no OPEN or SEALED query.
     // aderyn-ignore-next-line(state-change-without-event) governor-only; the timelock's CallScheduled logs it
     function setMinJurorBond(uint256 value) external onlyRole(MochiRoles.GOVERNOR_ROLE) { minJurorBond = value; }
+
+    /// @inheritdoc IJurorRegistry
+    function delist(address key) external override onlyRole(MochiRoles.GOVERNOR_ROLE) {
+        Juror storage j = jurors[key];
+        if (j.operator == address(0)) revert NotEnrolled(key);
+        j.delisted = true;
+        emit Delisted(key, keccak256("GOVERNANCE"));
+    }
 
     /// @notice Sets the recipient of future slashes.
     // aderyn-ignore-next-line(state-change-without-event) governor-only; the timelock's CallScheduled logs it

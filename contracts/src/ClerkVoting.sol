@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
-pragma solidity ^0.8.28;
+pragma solidity 0.8.28;
 
 import {AccessControl} from "@openzeppelin/contracts/access/AccessControl.sol";
 // Unused. Removing them renumbers AST ids, which changes the via-IR bytecode of other contracts (PanelEscalation grows

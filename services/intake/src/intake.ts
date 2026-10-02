@@ -44,6 +44,8 @@ const hex32 = (h: unknown): h is Hex => typeof h === "string" && /^0x[0-9a-f]{64
 const sameUpload = (a: StoredIntake, b: StoredIntake) =>
   a.docB64 === b.docB64 && a.contentType === b.contentType && eq(a.salt, b.salt) && canonicalJson(a.params) === canonicalJson(b.params);
 const grantExists = () => new IntakeError("GRANT_EXISTS", "Another request already holds the grant for this open binding", 409);
+/** IPanelEscalation.CaseStatus values in which a seated panel votes (contracts/src/interfaces/IPanelEscalation.sol). */
+const PANEL_COMMIT = 2, PANEL_REVEAL = 3;
 type IntakeDocument = { bytes: Uint8Array; contentType: string; fetched?: Awaited<ReturnType<typeof fetchDocument>> };
 
 /**
@@ -299,8 +301,10 @@ export class IntakeEnclave {
 
   /**
    * Human-panel escalation (§3.4): re-encrypt the document to the drawn evaluators. Allowed only when the query is
-   * ESCALATED, is public or the payer consented at open (allowPanelDisclosure), and every evaluator is on the current
-   * panel on-chain and proves control of its x25519 key with a signature from its staked address.
+   * ESCALATED, its panel case is seated and voting (COMMIT or REVEAL), the query is public or the payer consented at
+   * open (allowPanelDisclosure), and every evaluator is on the current panel on-chain and proves control of its x25519
+   * key with a signature from its staked address. A record that is gone (expired from the sealed store) is refused
+   * with the permanent MATERIALS_UNAVAILABLE (410): the seat cannot evaluate the case and should abstain on chain.
    */
   async dispatchPanel(req: DispatchPanelReq) {
     const queryId = req.queryId as Hex;
@@ -310,9 +314,19 @@ export class IntakeEnclave {
     if (q.status !== 5) throw new IntakeError("NOT_ESCALATED", "Query is not escalated to a panel", 409);
     if (!q.isPublic && !q.allowPanelDisclosure) throw new IntakeError("DISCLOSURE_NOT_ALLOWED", "Payer did not consent to panel disclosure", 403);
     const panelCase = await chain.getPanelCase(queryId);
+    // While DRAWING, panelOf can already show seats chosen by a draw that spans calls; resolved, FINAL and DRAW_EXPIRED
+    // cases have no panel voting.
+    if (panelCase.status !== PANEL_COMMIT && panelCase.status !== PANEL_REVEAL) {
+      throw new IntakeError("PANEL_CLOSED", "Panel case is not open for evaluation", 409);
+    }
     if (panelCase.panelIndex !== req.panelIndex) throw new IntakeError("WRONG_PANEL", "Not the current panel", 409);
     const members = (await chain.panelOf(queryId, req.panelIndex)).map((a) => a.toLowerCase());
-    const { key, record } = await this.recordFor(q);
+    const { key, record } = await this.recordFor(q).catch((error: unknown) => {
+      if (error instanceof IntakeError && error.code === "UNKNOWN_DOC") {
+        throw new IntakeError("MATERIALS_UNAVAILABLE", "The case document is no longer available; abstain on chain", 410);
+      }
+      throw error;
+    });
     if (!record.isPublic && !record.allowPanelDisclosure) throw new IntakeError("DISCLOSURE_NOT_ALLOWED", "Payer did not consent to panel disclosure", 403);
     const out: { address: Address; docEnvelope: Envelope }[] = [];
     for (const evaluator of req.evaluators) {

@@ -1,6 +1,13 @@
 /**
  * Reads a request body with a size cap and a deadline for the whole body, so a caller that sends slowly (one byte a
- * second) holds its connection for at most the deadline and never reaches whatever the caller admits it to next.
+ * second) holds the request handler and its buffered bytes for at most the deadline, and never reaches whatever the
+ * caller admits it to next.
+ *
+ * The connection is another matter: after an early response (408, 413, or 503 while the body is still arriving) Bun
+ * keeps the socket open until the server's idleTimeout, even while the caller keeps sending. Responses to an abandoned
+ * body therefore carry `Connection: close` (abandonedBodyResponse), and the server's fetch wrapper passes them through
+ * closeAbandonedConnection, which shortens that socket's idle timeout to the minimum (Bun closes it within about four
+ * seconds) instead of the server-wide one.
  */
 export const BODY_READ_DEADLINE_MS = 12_000;
 
@@ -45,4 +52,20 @@ export async function readBoundedBody(request: Request, options: BodyReadOptions
   let offset = 0;
   for (const chunk of chunks) { body.set(chunk, offset); offset += chunk.byteLength; }
   return body;
+}
+
+/** Marks a response to a request whose body was not read to the end, so its connection is not kept for reuse. */
+export function abandonedBodyResponse(response: Response): Response {
+  response.headers.set('connection', 'close');
+  return response;
+}
+
+/**
+ * For Bun.serve's fetch wrapper: when the response is marked by abandonedBodyResponse, give that request's socket the
+ * shortest idle timeout, so a caller still sending the abandoned body loses its connection within seconds rather than
+ * holding it for the server-wide idleTimeout.
+ */
+export function closeAbandonedConnection(server: { timeout(request: Request, seconds: number): void }, request: Request, response: Response): Response {
+  if (response.headers.get('connection') === 'close') server.timeout(request, 1);
+  return response;
 }

@@ -9,6 +9,14 @@ import { log } from "./log.ts";
 const materialsBody = z.object({ evaluator: z.string().regex(/^0x[0-9a-f]{40}$/), encryptionPubKey: z.string().regex(/^0x[0-9a-f]{64}$/), keySig: z.string().regex(/^0x([0-9a-f]{2})+$/) });
 const payloadBody = z.object({ evaluator: z.string().regex(/^0x[0-9a-f]{40}$/), panelIndex: z.union([z.literal(0), z.literal(1)]), payload: z.string().regex(/^0x([0-9a-f]{2})+$/), answerJson: z.string().min(1), sig: z.string().regex(/^0x([0-9a-f]{2})+$/) });
 const same = (a: string, b: string) => a.toLowerCase() === b.toLowerCase();
+/**
+ * Intake refusals an evaluator acts on, passed through by code with fixed messages (any other refusal is
+ * MATERIALS_REJECTED). MATERIALS_UNAVAILABLE is permanent: the document is gone, so the seat should abstain on chain.
+ */
+export const PASSED_INTAKE_ERRORS: Record<string, { status: 409 | 410; message: string }> = {
+  MATERIALS_UNAVAILABLE: { status: 410, message: "The case document is no longer available; abstain on chain before the commit deadline" },
+  PANEL_CLOSED: { status: 409, message: "Panel case is not open for evaluation" },
+};
 const asHex = (value: string) => value.toLowerCase() as Hex;
 
 export function createPanelDeskApp(deps: PanelDeps) {
@@ -56,8 +64,11 @@ export function createPanelDeskApp(deps: PanelDeps) {
       // date field), so every evaluator builds the same payload.
       return c.json({ caseId, queryId: item.queryId, panelIndex: item.panelIndex, evaluator, schemaId: query.schemaId, schemaVersion: query.schemaVersion, isPublic: query.isPublic, openedAt: query.openedAt.toString(), docEnvelope: envelope, jurorSummary });
     } catch (error) {
-      log("warn", "panel_materials_failed", { caseId, code: error instanceof Error && "code" in error ? String(error.code) : "UPSTREAM_ERROR" });
+      const code = error instanceof Error && "code" in error ? String(error.code) : undefined;
+      log("warn", "panel_materials_failed", { caseId, code: code ?? "UPSTREAM_ERROR" });
       const status = error instanceof Error && "status" in error && typeof error.status === "number" ? error.status : 502;
+      const passed = code ? PASSED_INTAKE_ERRORS[code] : undefined;
+      if (passed && passed.status === status) return c.json({ error: { code, message: passed.message } }, passed.status);
       return c.json({ error: { code: status < 500 ? "MATERIALS_REJECTED" : "INTAKE_UNAVAILABLE", message: status < 500 ? "Materials request was rejected" : "Could not dispatch evaluator materials" } }, status as 400);
     }
   });

@@ -31,6 +31,23 @@ jobs:
       - name: Test
         working-directory: contracts
         run: forge test
+
+  # Separate job so the long campaign neither delays nor times out the regular contract tests.
+  deep-invariants:
+    name: contracts (deep invariants)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: foundry-rs/foundry-toolchain@908c540300062bd5a7e473851cdb4282204cee09 # v1.9.1
+        with:
+          version: v1.7.1
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version-file: package.json
+      - run: bun install --frozen-lockfile --ignore-scripts
       - name: Deep invariants (1600 runs x depth 64)
         working-directory: contracts
         env:

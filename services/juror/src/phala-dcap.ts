@@ -2,15 +2,15 @@
 // Used by the juror (MODEL_PROVIDER=phala-aci), the claims pilot and scripts/prepare-production-launch.ts.
 import type { DcapResult } from "@mochi/aci";
 import {
-  collateralSourceFromEnv, staleCollateralGraceSec, tdxPolicyFromEnv, verifyTdxQuote, verifyTdxQuoteEvidence,
+  collateralSourceFromEnv, staleCollateralGraceSec, tdxPolicyFromEnv, verifyTdxQuote, verifyTdxQuoteEvidence, verifyWithCollateral,
   type CollateralSource, type Env, type TdReport,
 } from "@mochi/tee";
 
 /**
  * DCAP for ACI gateway quotes. The PCK chain, QE report and quote signatures are checked before any collateral is
  * fetched (so the FMSPC is Intel-signed), and collateral comes from the process-wide PCS cache that MOCHI's own quote
- * checks use: persisted beside SEALED_STORE_DIR, refreshed ahead of expiry, and served through a PCS outage only within
- * the bounded grace. Advisory and debug policy follow TDX_REJECT_ADVISORIES and TDX_ALLOW_DEBUG; the TCB status is
+ * checks use: persisted beside SEALED_STORE_DIR, refreshed ahead of expiry, served through a PCS outage only within the
+ * bounded grace, and dropped and fetched again if it fails its own signature or chain checks. Advisory and debug policy follow TDX_REJECT_ADVISORIES and TDX_ALLOW_DEBUG; the TCB status is
  * returned and enforced by the caller against TDX_ALLOWED_TCB_STATUSES.
  */
 export function createPhalaDcap(options: { env?: Env; collateral?: CollateralSource; now?: () => number } = {}) {
@@ -24,8 +24,9 @@ export function createPhalaDcap(options: { env?: Env; collateral?: CollateralSou
       return { ok: false, status: "Invalid", reportData: new Uint8Array() };
     }
     const policy = tdxPolicyFromEnv(env);
-    const collateral = await (options.collateral ?? collateralSourceFromEnv(env)).get(evidence.fmspc, evidence.ca, signal);
-    const verified = verifyTdxQuote(raw, collateral, now, { collateralGraceSec: staleCollateralGraceSec(collateral) });
+    // Collateral that fails its own signature or chain checks is dropped from the cache and fetched once more.
+    const verified = await verifyWithCollateral(options.collateral ?? collateralSourceFromEnv(env), evidence,
+      (collateral) => verifyTdxQuote(raw, collateral, now, { collateralGraceSec: staleCollateralGraceSec(collateral) }), signal);
     const debug = (verified.td.tdAttributes[0]! & 1) !== 0;
     return {
       ok: !verified.advisoryIds.some((id) => policy.rejectAdvisories.includes(id)) && (!debug || policy.allowDebug),

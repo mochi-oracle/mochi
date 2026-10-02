@@ -3,7 +3,7 @@ import { encodeAbiParameters, type Address, type Hex } from "viem";
 import { QueryStatus, VerdictStatus } from "@mochi/core";
 import type { DecisionRes, Peer } from "@mochi/protocol";
 import type { OrchestratorDeps, QueryLog } from "../src/ports.ts";
-import { Orchestrator, PANEL_OFF_BACKOFF_MS } from "../src/pipeline.ts";
+import { Orchestrator, PANEL_OFF_BACKOFF_MS, PANEL_RETRY_BACKOFF_MS, PANEL_RETRY_MAX_DOUBLINGS } from "../src/pipeline.ts";
 import { createOrchestratorApp } from "../src/app.ts";
 import type { DrandClient } from "@mochi/chain";
 
@@ -23,7 +23,7 @@ function fixture(opts: { private?: boolean; feed?: boolean; n?: number; status?:
   const jurors = Array.from({ length: 9 }, (_, i) => `0x${(i + 3).toString(16).padStart(40, "0")}` as Address);
   const calls = { seal: [] as unknown[], reseal: [] as unknown[], expand: [] as unknown[], escalate: [] as unknown[], approve: [] as unknown[], post: [] as unknown[], feed: [] as unknown[], dispatch: [] as unknown[], open: [] as unknown[], answer: [] as unknown[], insertedAnswers: [] as unknown[], verdicts: [] as unknown[], private: [] as unknown[], statuses: [] as unknown[], expired: [] as unknown[] };
   const state = { query: { ...query }, cursor: null as bigint | null, stored: false, closeCount: 0, blocks: 20n, lastVerdict: `0x${"00".repeat(32)}` as Hex, failInsertOnce: false, chainNowMs: 10_000,
-    clockMs: 10_000, escrowPanel: panel, allowance: 0n, panelReads: 0, allowanceReads: 0 };
+    clockMs: 10_000, escrowPanel: panel, allowance: 0n, panelReads: 0, allowanceReads: 0, panelCase: 8, panelCaseReads: 0, listOptions: [] as unknown[] };
   const decision = (): DecisionRes => ({ verdictId: h, verdictInput: { queryId: id, round: state.query.round, status: VerdictStatus.VERDICT, agreementBps: 10000, dissentMask: 0, timeoutMask: 0, answerHash: h, payloadHash: h, evidenceRoot: h }, votes: jurors.slice(0, state.query.n).map((j, seat) => ({ juror: j, answerHash: h, spansRoot: h, quoteHash: h, sig: "0x12" })), consensusSig: "0x12", public: { answerJson: "{}", payload, fields: [], disagreement: [] }, ...(opts.private ? { privateResult: envelope } : {}) });
   const deps: OrchestratorDeps = {
     chain: {
@@ -35,7 +35,7 @@ function fixture(opts: { private?: boolean; feed?: boolean; n?: number; status?:
       getVerdict: async () => ({ queryId: id, round: state.query.round, status: 1, isPublic: !opts.private, escalated: false, provenanceKind: 1, schemaId: 1, schemaVersion: 1, agreementBps: 10000, dissentMask: 0, timeoutMask: 0, ts: 1n, docCommit: h, modelSetHash: h, evidenceRoot: h, attestationRoot: h, answerHash: h, payloadHash: h, paramsHash: h, provenanceHash: h, originId: h, payerCommit: h }),
       seal: async () => { calls.seal.push(id); state.query.status = QueryStatus.SEALED; return h; }, reseal: async () => { calls.reseal.push(id); state.query.status = QueryStatus.SEALED; return h; }, expire: async () => { calls.expired.push(id); state.query.status = QueryStatus.EXPIRED; return h; },
       expand: async (_id, newN) => { calls.expand.push(newN); state.query.n = newN; state.query.round++; state.query.status = QueryStatus.OPEN; state.query.sealBlock = 0n; return h; }, escalate: async () => { calls.escalate.push(id); return h; }, panelFee: async () => 50n, usdgApprove: async (spender, amount) => { calls.approve.push(amount); expect(spender).toBe(panel); state.allowance = amount; return h; },
-      escrowPanel: async () => { state.panelReads++; return state.escrowPanel; }, usdgAllowance: async (spender) => { state.allowanceReads++; expect(spender).toBe(panel); return state.allowance; },
+      escrowPanel: async () => { state.panelReads++; return state.escrowPanel; }, panelCaseStatus: async () => { state.panelCaseReads++; return state.panelCase; }, usdgAllowance: async (spender) => { state.allowanceReads++; expect(spender).toBe(panel); return state.allowance; },
       latestVerdictOf: async () => state.lastVerdict, verdictTx: async () => h,
       post: async (...args) => { calls.post.push(args); state.lastVerdict = h; state.query.status = args[0].status === VerdictStatus.VERDICT ? QueryStatus.DECIDED : QueryStatus.HUNG; return h; }, feedsUpdate: async (...args) => { calls.feed.push(args); return h; },
     },
@@ -44,7 +44,7 @@ function fixture(opts: { private?: boolean; feed?: boolean; n?: number; status?:
     consensus: { attestation: async () => ({ role: "CONSENSUS", measurement: h, ...peer }), open: async (_url, req) => { calls.open.push(req); return { deadlineMs: 130000 }; }, close: async () => { state.closeCount++; if (opts.firstClose409 && state.closeCount === 1) throw Object.assign(new Error("open"), { status: 409 }); return decision(); } },
     directory: { urlOf: async (address) => `http://juror.test/${address}` },
     store: {
-      insertQuery: async () => { state.stored = true; }, setCursor: async (_n, v) => { state.cursor = v; }, getCursor: async () => state.cursor, queryIds: async () => state.stored ? [id] : [],
+      insertQuery: async () => { state.stored = true; }, setCursor: async (_n, v) => { state.cursor = v; }, getCursor: async () => state.cursor, queryIds: async (...args) => { state.listOptions.push(args[0]); return state.stored ? [id] : []; },
       getFeedQuery: async () => opts.feed ? { feedId: h, key: h } : null, getPayerResultKey: async () => opts.private ? h : null,
       insertJurorAnswer: async (v) => { calls.insertedAnswers.push(v); }, insertVerdict: async (v, p) => { if (state.failInsertOnce) { state.failInsertOnce = false; throw new Error("crash after post"); } calls.verdicts.push([v, p]); },
       hasVerdict: async () => calls.verdicts.length > 0, storePrivateResult: async (v, b) => { calls.private.push([v, b]); }, updateQueryStatus: async (_id, s) => { calls.statuses.push(s); }, statusCounts: async () => ({ "1": 1 }),
@@ -185,4 +185,100 @@ test("all seats receive the same consensus absolute deadline and round", async (
   const f = fixture(); await f.orchestrator.tick(); await f.orchestrator.waitForIdle();
   expect(f.calls.answer).toHaveLength(3);
   for (const req of f.calls.answer) expect(req).toMatchObject({ deadlineMs: 130000, round: 0 });
+});
+
+// IPanelEscalation.CaseStatus: DRAWING 1, COMMIT 2, FINAL 7, DRAW_EXPIRED 8.
+describe("ESCALATED feed query whose panel case is DRAW_EXPIRED (draw expired, or void after abstentions)", () => {
+  test("is escalated again through escalateHung, then its case is read at most once per backoff", async () => {
+    const f = fixture({ feed: true, n: 9, status: QueryStatus.ESCALATED }); f.state.stored = true;
+    await f.orchestrator.advance(id);
+    expect(f.state.panelCaseReads).toBe(1);
+    expect(f.calls.approve).toEqual([50n]); expect(f.calls.escalate).toEqual([id]);
+    expect(f.calls.statuses).toEqual([QueryStatus.ESCALATED]);
+    // The escalation failed (or the case lapsed again): nothing is read or sent until the backoff has passed.
+    for (let i = 0; i < 5; i++) { f.state.clockMs += 60 * 60_000; await f.orchestrator.advance(id); }
+    expect(f.state.panelCaseReads).toBe(1); expect(f.calls.escalate).toEqual([id]);
+    f.state.clockMs = 10_000 + PANEL_RETRY_BACKOFF_MS;
+    await f.orchestrator.advance(id);
+    expect(f.state.panelCaseReads).toBe(2); expect(f.calls.escalate).toEqual([id, id]);
+    // Each further escalation of the same query doubles the wait (a document intake lost would be voided every time).
+    f.state.clockMs += PANEL_RETRY_BACKOFF_MS;
+    await f.orchestrator.advance(id);
+    expect(f.calls.escalate).toHaveLength(2);
+    f.state.clockMs += PANEL_RETRY_BACKOFF_MS;
+    await f.orchestrator.advance(id);
+    expect(f.calls.escalate).toHaveLength(3);
+    for (let n = 3; n < 10; n++) {
+      const wait = PANEL_RETRY_BACKOFF_MS * 2 ** Math.min(n - 1, PANEL_RETRY_MAX_DOUBLINGS);
+      f.state.clockMs += wait - 1;
+      await f.orchestrator.advance(id);
+      expect(f.calls.escalate).toHaveLength(n);
+      f.state.clockMs += 1;
+      await f.orchestrator.advance(id);
+      expect(f.calls.escalate).toHaveLength(n + 1);
+    }
+    expect(PANEL_RETRY_BACKOFF_MS * 2 ** PANEL_RETRY_MAX_DOUBLINGS).toBe(8 * 24 * 60 * 60_000);
+  });
+
+  test("an open case after an escalation again is read every 6 h (the doubling applies only to lapsed cases)", async () => {
+    const f = fixture({ feed: true, n: 9, status: QueryStatus.ESCALATED }); f.state.stored = true;
+    await f.orchestrator.advance(id);
+    expect(f.calls.escalate).toEqual([id]);
+    f.state.panelCase = 1; // the new draw is pending
+    f.state.clockMs += PANEL_RETRY_BACKOFF_MS;
+    await f.orchestrator.advance(id);
+    f.state.clockMs += PANEL_RETRY_BACKOFF_MS;
+    await f.orchestrator.advance(id);
+    expect(f.state.panelCaseReads).toBe(3); expect(f.calls.escalate).toEqual([id]);
+  });
+
+  test("an open case is left alone and re-read after the backoff; a FINAL case is never read again", async () => {
+    const f = fixture({ feed: true, n: 9, status: QueryStatus.ESCALATED }); f.state.stored = true;
+    for (const status of [1, 2]) {
+      f.state.panelCase = status;
+      await f.orchestrator.advance(id);
+      f.state.clockMs += PANEL_RETRY_BACKOFF_MS;
+    }
+    expect(f.state.panelCaseReads).toBe(2); expect(f.calls.escalate).toEqual([]); expect(f.calls.approve).toEqual([]);
+    f.state.panelCase = 7;
+    await f.orchestrator.advance(id);
+    f.state.clockMs += 100 * PANEL_RETRY_BACKOFF_MS;
+    await f.orchestrator.advance(id);
+    expect(f.state.panelCaseReads).toBe(3); expect(f.calls.escalate).toEqual([]);
+  });
+
+  test("an ESCALATED query that is not a feed query is not read", async () => {
+    const f = fixture({ feed: false, n: 9, status: QueryStatus.ESCALATED }); f.state.stored = true;
+    await f.orchestrator.advance(id);
+    expect(f.state.panelCaseReads).toBe(0); expect(f.calls.escalate).toEqual([]);
+    expect(f.calls.statuses).toEqual([QueryStatus.ESCALATED]);
+  });
+
+  test("the listing keeps ESCALATED feed queries with a panel configured, and backed-off queries cost no RPC", async () => {
+    const f = fixture({ feed: true, n: 9, status: QueryStatus.ESCALATED }); f.state.stored = true; f.state.panelCase = 2;
+    f.state.cursor = 1n; // already discovered: only advance reads the query
+    let reads = 0;
+    const getQuery = f.deps.chain.getQuery;
+    f.deps.chain.getQuery = async (queryId) => { reads++; return getQuery(queryId); };
+    await f.orchestrator.tick(); await f.orchestrator.waitForIdle();
+    expect(f.state.listOptions.at(-1)).toEqual({ escalatedFeed: true });
+    expect(reads).toBe(1); expect(f.state.panelCaseReads).toBe(1);
+    for (let i = 0; i < 3; i++) { await f.orchestrator.tick(); await f.orchestrator.waitForIdle(); }
+    expect(reads).toBe(1); expect(f.state.panelCaseReads).toBe(1);
+    f.state.clockMs += PANEL_RETRY_BACKOFF_MS;
+    await f.orchestrator.tick(); await f.orchestrator.waitForIdle();
+    expect(reads).toBe(2); expect(f.state.panelCaseReads).toBe(2);
+  });
+
+  test("panel OFF (no panel address): unchanged — plain listing, no case read, no escalation", async () => {
+    const f = fixture({ feed: true, n: 9, status: QueryStatus.ESCALATED }); f.state.stored = true;
+    f.deps.chain.dep.contracts.panel = zeroAddress;
+    await f.orchestrator.tick(); await f.orchestrator.waitForIdle();
+    expect(f.state.listOptions).toEqual([undefined]);
+    expect(f.state.panelCaseReads).toBe(0); expect(f.state.panelReads).toBe(0);
+    expect(f.calls.escalate).toEqual([]); expect(f.calls.approve).toEqual([]);
+    expect(f.calls.statuses).toEqual([QueryStatus.ESCALATED]);
+    await f.orchestrator.advance(id);
+    expect(f.state.panelCaseReads).toBe(0); expect(f.calls.escalate).toEqual([]);
+  });
 });

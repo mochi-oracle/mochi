@@ -12,6 +12,16 @@ const hasSeedWindowMissed = (e: unknown) => /SeedWindowMissed|0x76a607dd/.test(S
 const hasSeedNotReady = (e: unknown) => /SeedNotReady|0x484e3916/.test(String((e as Error)?.message ?? e));
 /** How long HUNG-at-N9 feed queries wait before QueryEscrow.panel() is read again after it showed escalation off. */
 export const PANEL_OFF_BACKOFF_MS = 15 * 60_000;
+/**
+ * How long an ESCALATED feed query waits between reads of its panel case. After it is escalated again (its case ended
+ * DRAW_EXPIRED: no panel drawn, or a panel voided by abstentions) the wait doubles with each further escalation of the
+ * same query, up to PANEL_RETRY_MAX_DOUBLINGS doublings (8 days): a case whose document intake can no longer serve is
+ * voided by every new panel, so escalating it again cannot help. Kept in memory: a restart starts over at 6 hours.
+ */
+export const PANEL_RETRY_BACKOFF_MS = 6 * 60 * 60_000;
+export const PANEL_RETRY_MAX_DOUBLINGS = 5;
+/** IPanelEscalation.CaseStatus values read here (contracts/src/interfaces/IPanelEscalation.sol). */
+const PANEL_CASE_FINAL = 7, PANEL_CASE_DRAW_EXPIRED = 8;
 export class Orchestrator {
   private cursor: bigint;
   private readonly locks = new Set<Hex>();
@@ -21,6 +31,10 @@ export class Orchestrator {
   private lastStarted: Hex | undefined;
   /** clock.now() before which escalation is not attempted: QueryEscrow.panel() was unset or another contract. */
   private panelOffUntil = 0;
+  /** ESCALATED feed queries: clock.now() before which their panel case is not read again (Infinity once FINAL). */
+  private readonly panelRetryAt = new Map<Hex, number>();
+  /** ESCALATED feed queries: escalations again sent by this process. */
+  private readonly panelEscalations = new Map<Hex, number>();
   constructor(private readonly deps: OrchestratorDeps) { this.cursor = BigInt(deps.chain.dep.startBlock); }
   get lastBlockProcessed() { return this.lastBlock.toString(); }
 
@@ -36,13 +50,15 @@ export class Orchestrator {
       this.cursor = head + 1n; this.lastBlock = head;
       await store.setCursor("orchestrator", this.cursor);
     }
-    const ids = await store.queryIds();
+    // With a panel configured, ESCALATED feed queries stay listed: their case may end DRAW_EXPIRED and need escalating
+    // again. Without one the listing is unchanged.
+    const ids = this.panelConfigured() ? await store.queryIds({ escalatedFeed: true }) : await store.queryIds();
     // Rotate admission: repeatedly failing or idle HUNG queries must not starve later ids.
     const start = this.lastStarted === undefined ? 0 : (ids.indexOf(this.lastStarted) + 1) % Math.max(1, ids.length);
     for (let offset = 0; offset < ids.length; offset++) {
       const id = ids[(start + offset) % ids.length]!;
       if (this.stopping || this.inFlight.size >= this.deps.config.maxParallelQueries) break;
-      if (this.inFlight.has(id) || this.locks.has(id)) continue;
+      if (this.inFlight.has(id) || this.locks.has(id) || this.panelBackoff(id)) continue;
       const work = this.advance(id)
         .catch((error: unknown) => log("error", "orchestrator.advance_failed", { queryId: id, error: String((error as Error)?.message ?? error).slice(0, 300) }))
         .finally(() => { this.inFlight.delete(id); });
@@ -86,6 +102,8 @@ export class Orchestrator {
     if (q.status === QueryStatus.DECIDED || q.status === QueryStatus.HUNG) await this.recoverPosted(id, q);
     if (q.status === QueryStatus.DECIDED || q.status === QueryStatus.EXPIRED || q.status === QueryStatus.ESCALATED) {
       await store.updateQueryStatus(id, q.status);
+      if (q.status === QueryStatus.ESCALATED && this.panelConfigured()) await this.escalateLapsedPanel(id);
+      else { this.panelRetryAt.delete(id); this.panelEscalations.delete(id); }
       return;
     }
     // Deadlines are on-chain time: compare with the latest block's timestamp, not this machine's clock.
@@ -171,6 +189,39 @@ export class Orchestrator {
     const fee = await chain.panelFee();
     if ((await chain.usdgAllowance(panel)) < fee) await chain.usdgApprove(panel, fee);
     await chain.escalate(id);
+  }
+
+  /** True when the deployment names a PanelEscalation (escalation itself may still be off: see escalateHung). */
+  private panelConfigured(): boolean {
+    const panel = this.deps.chain.dep.contracts?.panel;
+    return !!panel && !/^0x0{40}$/i.test(panel);
+  }
+
+  /** True while an ESCALATED feed query waits before its panel case is read again (no RPC is spent on it). */
+  private panelBackoff(id: Hex): boolean {
+    const retryAt = this.panelRetryAt.get(id);
+    return retryAt !== undefined && this.deps.clock.now() < retryAt;
+  }
+
+  /**
+   * An ESCALATED feed query whose first panel ended without a panel (its draw expired, or two seats abstained and the
+   * panel was void) has its case in DRAW_EXPIRED, with the fee refunded: escalate it again through escalateHung (same
+   * wiring check, approval and fee). The case is read at most once per PANEL_RETRY_BACKOFF_MS per query; after the
+   * n-th escalation again (sent, or failed) the next read waits PANEL_RETRY_BACKOFF_MS * 2^(n-1), at most 2^5 times as
+   * long. A FINAL case (a final HUNG) is never read again by this process.
+   */
+  private async escalateLapsedPanel(id: Hex): Promise<void> {
+    const { chain, store, clock } = this.deps;
+    if (this.panelBackoff(id) || !(await store.getFeedQuery(id))) return;
+    this.panelRetryAt.set(id, clock.now() + PANEL_RETRY_BACKOFF_MS);
+    const status = await chain.panelCaseStatus(id);
+    if (status === PANEL_CASE_FINAL) { this.panelRetryAt.set(id, Number.POSITIVE_INFINITY); return; }
+    if (status !== PANEL_CASE_DRAW_EXPIRED) return;
+    const sent = (this.panelEscalations.get(id) ?? 0) + 1;
+    this.panelEscalations.set(id, sent);
+    this.panelRetryAt.set(id, clock.now() + PANEL_RETRY_BACKOFF_MS * 2 ** Math.min(sent - 1, PANEL_RETRY_MAX_DOUBLINGS));
+    log("info", "orchestrator.panel_escalate_again", { queryId: id, attempt: sent });
+    await this.escalateHung(id);
   }
 
   private async recoverPosted(id: Hex, q: Awaited<ReturnType<OrchestratorDeps["chain"]["getQuery"]>>): Promise<void> {

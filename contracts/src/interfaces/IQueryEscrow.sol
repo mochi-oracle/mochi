@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
-pragma solidity ^0.8.28;
+pragma solidity 0.8.28;
 
 import {MochiTypes} from "../libraries/MochiTypes.sol";
 
@@ -122,13 +122,16 @@ interface IQueryEscrow {
     ///         A ticket that is not ready bubbles up the randomness source's SeedNotReady revert (callers retry).
     function seal(bytes32 queryId) external;
 
-    /// @notice Anyone, status OPEN, when the randomness ticket expired: assign a fresh ticket.
+    /// @notice Anyone, status OPEN, when the randomness ticket expired: assign a fresh ticket. Like open and expand, it
+    ///         re-snapshots the juror pools (JurorRegistry.openSelection) in the same transaction as the ticket draw,
+    ///         so the next seal can seat keys that joined since the last ticket.
     function reseal(bytes32 queryId) external;
 
     /// @notice Status HUNG, newN valid and > n, before deadline. Round++, prevN = n, n = newN, fees for seats
-    ///         [prevN, newN) snapshotted, deadline = now + queryTtl, status → OPEN, new randomness ticket.
-    ///         Payment: FEED path → FEED_RUNNER only, from feedBudget; SHIELDED → use expandShielded;
-    ///         ANONYMA → use expandWithVoucher; USDG → pulls from msg.sender (anyone may pay).
+    ///         [prevN, newN) snapshotted, deadline = now + queryTtl, status → OPEN, juror pools re-snapshotted, new
+    ///         randomness ticket. Payment: FEED path → FEED_RUNNER only, from feedBudget; SHIELDED → use
+    ///         expandShielded; ANONYMA → use expandWithVoucher; USDG → pulls from msg.sender (anyone may pay; refunds
+    ///         of the round still go to the query's refundTo).
     function expand(bytes32 queryId, uint8 newN) external;
 
     function expandShielded(bytes32 queryId, uint8 newN, bytes32 nullifier, bytes calldata proof) external;

@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
-pragma solidity ^0.8.28;
+pragma solidity 0.8.28;
 
 /// @title MochiTypes
 /// @notice Shared enums, structs, EIP-712 typehashes and jury math for every Mochi contract.

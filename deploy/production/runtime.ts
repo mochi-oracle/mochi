@@ -44,6 +44,21 @@ export type ProductionLaunchConfig = {
 };
 export const DEFAULT_TDX_ALLOWED_TCB_STATUSES = ["UpToDate"] as const;
 const TDX_TCB_STATUSES = ["UpToDate", "SWHardeningNeeded", "ConfigurationNeeded", "ConfigurationAndSWHardeningNeeded", "OutOfDate", "OutOfDateConfigurationNeeded"];
+const validTdxPolicy = (statuses: unknown): statuses is string[] => Array.isArray(statuses) && statuses.length > 0
+  && statuses.includes("UpToDate") && new Set(statuses).size === statuses.length && statuses.every((status) => TDX_TCB_STATUSES.includes(status));
+/**
+ * The Intel TCB policy of a launch configuration (MOCHI_PRODUCTION_CONFIG_JSON) for the checks the CVM's parent process
+ * makes itself: the research pilot's ACI gateway checks and /production/identities. The protocol services receive the
+ * same list as TDX_ALLOWED_TCB_STATUSES. Standby (no configuration) and anything startProductionRuntime would refuse
+ * get the strict default, so this never accepts more than the validated configuration does.
+ */
+export function launchTdxAllowedTcbStatuses(launchConfig: string | undefined): string[] {
+  try {
+    const statuses: unknown = launchConfig ? JSON.parse(launchConfig)?.tdxAllowedTcbStatuses : undefined;
+    if (validTdxPolicy(statuses)) return [...statuses];
+  } catch { /* the runtime refuses an unparseable configuration on its own */ }
+  return [...DEFAULT_TDX_ALLOWED_TCB_STATUSES];
+}
 export type RuntimeDeps = {
   keySource?: Pick<DstackKeySource, "derive">;
   spawn?: typeof spawn;
@@ -152,9 +167,7 @@ export function validateLaunchConfig(raw: unknown): ProductionLaunchConfig {
   }
   if (c.anonHmacSecretEnv !== undefined && !/^[A-Z][A-Z0-9_]{1,63}$/.test(c.anonHmacSecretEnv)) throw new Error("anonHmacSecretEnv must name an environment variable");
   for (const envName of [c.databaseUrlEnv, c.aciApiKeyEnv, c.attestorAdminTokenEnv]) if (!/^[A-Z][A-Z0-9_]{1,63}$/.test(envName)) throw new Error("secret env references must be environment variable names");
-  if (c.tdxAllowedTcbStatuses !== undefined && (!Array.isArray(c.tdxAllowedTcbStatuses) || c.tdxAllowedTcbStatuses.length === 0
-    || !c.tdxAllowedTcbStatuses.includes("UpToDate") || new Set(c.tdxAllowedTcbStatuses).size !== c.tdxAllowedTcbStatuses.length
-    || c.tdxAllowedTcbStatuses.some((status) => !TDX_TCB_STATUSES.includes(status)))) {
+  if (c.tdxAllowedTcbStatuses !== undefined && !validTdxPolicy(c.tdxAllowedTcbStatuses)) {
     throw new Error("tdxAllowedTcbStatuses must list distinct Intel TCB statuses including UpToDate (Revoked is never allowed)");
   }
   return c;

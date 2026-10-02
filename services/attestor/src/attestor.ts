@@ -1,7 +1,7 @@
 import { keyBinding } from "@mochi/tee";
 import type { Quote } from "@mochi/tee";
 import { Role } from "@mochi/core";
-import { recoverMessageAddress, type Address, type Hex } from "viem";
+import { ContractFunctionRevertedError, recoverMessageAddress, type Address, type Hex } from "viem";
 import { JurorAttestationDocSchema, passportHash } from "@mochi/protocol";
 import type { JurorAttestationDoc } from "@mochi/protocol";
 import { log } from "./log.ts";
@@ -30,10 +30,17 @@ type Checked = {
   passportDoc?: JurorAttestationDoc;
 };
 
+type RefreshFailure = { kind: "transient" } | { kind: "revert"; errorName?: string; args: readonly unknown[] };
+type RefreshOutcome = { reverted: Set<Address>; deferred: Address[] };
+
 export function createAttestor(deps: AttestorDeps) {
   const keys = new Set<Address>();
   const reportedFailures = new Set<Address>();
   const lastChecks = new Map<Address, CheckResult>();
+  /** On-chain attestedUntil (unix seconds) per key as of its last check. */
+  const attestedUntil = new Map<Address, number>();
+  /** Lineage of each LARGE_A juror that passed its last check. */
+  const largeALineages = new Map<Address, string>();
   const endpoints = new Map<string, { endpoint: Endpoint | null; readAt: number }>();
   const endpointCacheSec = deps.endpointCacheSec ?? DEFAULT_ENDPOINT_CACHE_SEC;
   // Enrolled keys are rebuilt from the registry's Enrolled logs at process start and then scanned incrementally. The
@@ -94,58 +101,67 @@ export function createAttestor(deps: AttestorDeps) {
     const failed = (reason: string, extra: Omit<Checked, "result" | "passed"> = {}): Checked => ({
       result: { address: key, ok: false, reason, checkedAt }, passed: false, ...extra,
     });
-    let endpoint: Endpoint | null;
-    try {
-      endpoint = await endpointFor(key);
-    } catch {
-      // A database outage is an availability problem of this service, never evidence about the enclave.
-      return failed("endpoint store unavailable");
-    }
-    if (!endpoint) return failed("endpoint not registered");
-
-    let doc;
-    try {
-      doc = await deps.http.fetchAttestation(endpoint.url);
-    } catch (error) {
-      // Network and HTTP transport failures are availability issues, never slashable verification failures.
-      if (error instanceof EndpointUnavailableError) return failed("endpoint unreachable");
-      return failed("invalid attestation document");
-    }
-
+    // The registry record comes first: its attestedUntil bounds this key's retry delay even when the endpoint is down.
     let juror: JurorRecord;
     try {
       juror = await deps.chain.getJuror(key);
     } catch {
       return failed("registry read failed");
     }
+    const withJuror = { role: juror.role, juror };
+
+    let endpoint: Endpoint | null;
+    try {
+      endpoint = await endpointFor(key);
+    } catch {
+      // A database outage is an availability problem of this service, never evidence about the enclave.
+      return failed("endpoint store unavailable", withJuror);
+    }
+    if (!endpoint) return failed("endpoint not registered", withJuror);
+
+    let doc;
+    try {
+      doc = await deps.http.fetchAttestation(endpoint.url);
+    } catch (error) {
+      // Network and HTTP transport failures are availability issues, never slashable verification failures.
+      if (error instanceof EndpointUnavailableError) return failed("endpoint unreachable", withJuror);
+      return failed("invalid attestation document", withJuror);
+    }
+
     let reason: string | undefined;
-    // The quote must prove the measurement the document claims. That is the key's enrolled measurement or, after an
-    // upgrade, another measurement governance allows for the same role: the registry keeps the measurement a key was
-    // enrolled with, while the same KMS-derived key now runs the new build. A measurement outside the role's allowlist
-    // is still a slashable mismatch.
-    let expectedMeasurement: Hex = juror.measurement;
     if (doc.address.toLowerCase() !== key.toLowerCase()) reason = "attestation address mismatch";
     else if (doc.role !== roleName(endpoint.role) || doc.role !== roleName(juror.role)) reason = "attestation role mismatch";
     else if (juror.role === Role.JUROR && doc.jurorClass !== juror.jurorClass) reason = "juror class mismatch";
-    else if (doc.measurement.toLowerCase() !== juror.measurement.toLowerCase()) {
-      try {
-        if (await allowed(doc.measurement as Hex, juror.role)) expectedMeasurement = doc.measurement as Hex;
-        else reason = "measurement mismatch";
-      } catch {
-        reason = "registry read failed";
-      }
-    }
+    // The measurement decision below uses only the measurement the verified quote proves, never the document's claim.
+    let measurement: Hex | undefined;
     if (!reason) {
       try {
         const verified = await deps.quoteVerifier.verify(doc.quote as Quote, {
-          measurement: expectedMeasurement,
           reportData: keyBinding(key, doc.encryptionPubKey as Hex),
           maxAgeSec: deps.maxQuoteAgeSec,
         });
         if (!verified.ok) reason = verified.reason ?? "quote verification failed";
+        else if (!verified.measurement) reason = "quote verification failed";
+        else measurement = verified.measurement;
       } catch {
         // A verifier crash (collateral service, parser bug) says nothing about the enclave.
         reason = "quote verifier unavailable";
+      }
+    }
+    // A document that claims a measurement its own genuine quote does not prove misrepresents the enclave.
+    if (!reason && doc.measurement.toLowerCase() !== measurement!.toLowerCase()) reason = "unexpected measurement";
+    if (!reason) {
+      // The verified measurement must be the key's enrolled one or, after an upgrade, another measurement governance
+      // allows for the same role: the registry keeps the measurement a key was enrolled with, while the same KMS-derived
+      // key now runs the new build. A genuine quote of any other build only lets the attestation lapse. It is never
+      // slashed, so deploying before the allowlist update, or governance removing a build that is still running,
+      // deactivates keys without costing their bonds.
+      if (measurement!.toLowerCase() !== juror.measurement.toLowerCase()) {
+        try {
+          if (!(await allowed(measurement!, juror.role))) reason = "measurement not allowed";
+        } catch {
+          reason = "registry read failed";
+        }
       }
     }
     let passportDoc: JurorAttestationDoc | undefined;
@@ -188,29 +204,73 @@ export function createAttestor(deps: AttestorDeps) {
   }
 
   /**
-   * Send refreshes for the keys that need one. A batch that reverts is split until the failing key is isolated, so
-   * one bad key cannot hold back the others. Returns the keys whose refresh failed.
+   * Send refreshes for the keys that need one. Only a simulated revert is evidence about the keys: the key it names
+   * (NotEnrolled, MeasurementNotAllowed) is dropped and the rest resent, and a revert that names no key splits the
+   * batch until the failing key is isolated. A timeout or RPC error says nothing about the keys and may even have
+   * been mined, so the whole batch, and every batch after it in this pass, is left for the next retry; that retry
+   * reads attestedUntil again and so never sends a duplicate for a refresh that did land.
    */
-  async function refresh(batch: Address[], until: bigint): Promise<Address[]> {
-    if (batch.length === 0) return [];
-    try {
-      await deps.chain.refreshAttestation(batch, until);
-      return [];
-    } catch (error) {
-      if (batch.length === 1) {
-        log("error", "attestation_refresh_failed", { address: batch[0], error: errorText(error) });
-        return batch;
+  async function refresh(batch: Address[], until: bigint, jurors: ReadonlyMap<Address, JurorRecord>): Promise<RefreshOutcome> {
+    const outcome: RefreshOutcome = { reverted: new Set(), deferred: [] };
+    let pending = batch;
+    while (pending.length > 0) {
+      let failure: RefreshFailure;
+      try {
+        await deps.chain.refreshAttestation(pending, until);
+        return outcome;
+      } catch (error) {
+        failure = classifyRefreshError(error);
+        if (failure.kind === "transient") {
+          log("warn", "attestation_refresh_deferred", { keys: pending.length, error: errorText(error) });
+          outcome.deferred.push(...pending);
+          return outcome;
+        }
+        if (failure.errorName === "AccessControlUnauthorizedAccount") {
+          // No subset of keys can succeed: the attestor key itself lacks the role.
+          log("error", "attestation_refresh_unauthorized", { error: errorText(error) });
+          outcome.deferred.push(...pending);
+          return outcome;
+        }
       }
-      const middle = Math.ceil(batch.length / 2);
-      return [...await refresh(batch.slice(0, middle), until), ...await refresh(batch.slice(middle), until)];
+      const culprits = new Set(culpritsOf(failure, pending, jurors));
+      if (culprits.size > 0) {
+        for (const key of culprits) {
+          log("error", "attestation_refresh_reverted", { address: key, error: failure.errorName });
+          outcome.reverted.add(key);
+        }
+        pending = pending.filter((key) => !culprits.has(key));
+        continue;
+      }
+      if (pending.length === 1) {
+        log("error", "attestation_refresh_reverted", { address: pending[0], error: failure.errorName ?? "unknown revert" });
+        outcome.reverted.add(pending[0]!);
+        return outcome;
+      }
+      const middle = Math.ceil(pending.length / 2);
+      const left = await refresh(pending.slice(0, middle), until, jurors);
+      for (const key of left.reverted) outcome.reverted.add(key);
+      if (left.deferred.length > 0) {
+        outcome.deferred.push(...left.deferred, ...pending.slice(middle));
+        return outcome;
+      }
+      const right = await refresh(pending.slice(middle), until, jurors);
+      for (const key of right.reverted) outcome.reverted.add(key);
+      outcome.deferred.push(...right.deferred);
+      return outcome;
     }
+    return outcome;
   }
 
-  async function checkAll(): Promise<CheckResult[]> {
+  /**
+   * Check the enrolled keys `isDue` selects (every key by default; a key never checked before is always included),
+   * report forged evidence, and refresh the keys that passed.
+   */
+  async function checkAll(isDue: (key: Address) => boolean = () => true): Promise<CheckResult[]> {
     await indexEnrollments();
     const allowed = allowlist();
     const checkedRows: Checked[] = [];
     for (const key of keys) {
+      if (lastChecks.has(key) && !isDue(key)) continue;
       try {
         checkedRows.push(await checkOne(key, allowed));
       } catch (error) {
@@ -219,11 +279,16 @@ export function createAttestor(deps: AttestorDeps) {
         checkedRows.push({ result: { address: key, ok: false, reason: "check failed", checkedAt: deps.clock.nowDate().toISOString() }, passed: false });
       }
     }
-    const largeALineages = new Set(checkedRows
-      .filter((row) => row.passed && row.juror?.jurorClass === 0 && row.passportDoc)
-      .map((row) => row.passportDoc!.passport.lineage.toLowerCase()));
+    // A DISSENTER's lineage must differ from every LARGE_A juror currently passing, including those not checked in
+    // this pass.
     for (const row of checkedRows) {
-      if (row.passed && row.juror?.jurorClass === 4 && row.passportDoc && largeALineages.has(row.passportDoc.passport.lineage.toLowerCase())) {
+      const key = row.result.address;
+      if (row.passed && row.juror?.jurorClass === 0 && row.passportDoc) largeALineages.set(key, row.passportDoc.passport.lineage.toLowerCase());
+      else largeALineages.delete(key);
+    }
+    const largeA = new Set(largeALineages.values());
+    for (const row of checkedRows) {
+      if (row.passed && row.juror?.jurorClass === 4 && row.passportDoc && largeA.has(row.passportDoc.passport.lineage.toLowerCase())) {
         row.passed = false;
         row.result = { ...row.result, ok: false, reason: "dissenter_lineage_not_distinct" };
       }
@@ -271,17 +336,31 @@ export function createAttestor(deps: AttestorDeps) {
       }
     }
     const until = BigInt(now + deps.validitySec);
-    const failedRefresh = new Set<Address>();
+    const jurors = new Map(checkedRows.flatMap((row) => row.juror ? [[row.result.address, row.juror] as const] : []));
+    const reverted = new Set<Address>();
+    const deferred = new Set<Address>();
     for (let i = 0; i < due.length; i += BATCH_SIZE) {
-      for (const key of await refresh(due.slice(i, i + BATCH_SIZE), until)) failedRefresh.add(key);
+      const batch = due.slice(i, i + BATCH_SIZE);
+      if (deferred.size > 0) {
+        // An RPC failure earlier in this pass: do not queue another send (and another timeout) behind it.
+        for (const key of batch) deferred.add(key);
+        continue;
+      }
+      const outcome = await refresh(batch, until, jurors);
+      for (const key of outcome.reverted) reverted.add(key);
+      for (const key of outcome.deferred) deferred.add(key);
     }
+    const sent = new Set(due);
     const results: CheckResult[] = [];
     for (const checked of checkedRows) {
-      const result = failedRefresh.has(checked.result.address)
-        ? { ...checked.result, ok: false, reason: "attestation refresh failed" }
-        : checked.result;
+      const key = checked.result.address;
+      let result = checked.result;
+      if (reverted.has(key)) result = { ...result, ok: false, reason: "attestation refresh reverted" };
+      else if (deferred.has(key)) result = { ...result, ok: false, reason: "attestation refresh failed" };
+      if (result.ok && sent.has(key)) attestedUntil.set(key, Number(until));
+      else if (checked.juror) attestedUntil.set(key, Number(checked.juror.attestedUntil));
       results.push(result);
-      lastChecks.set(result.address, result);
+      lastChecks.set(key, result);
     }
     return results;
   }
@@ -289,6 +368,8 @@ export function createAttestor(deps: AttestorDeps) {
   return {
     checkAll,
     listChecks: () => [...lastChecks.values()],
+    /** The key's on-chain attestedUntil (unix seconds) as of its last check, including a refresh sent in that pass. */
+    attestedUntil: (key: Address): number | undefined => attestedUntil.get(key.toLowerCase() as Address),
     registerEndpoint: async (address: Address, role: number, url: string) => {
       const doc = await deps.http.fetchAttestation(url);
       if (doc.address.toLowerCase() !== address.toLowerCase()) throw new Error("attestation address does not match");
@@ -308,36 +389,73 @@ function errorText(error: unknown): string {
 }
 
 /**
+ * A refresh failure is a revert only when the node returned revert data for the simulated call (viem's
+ * ContractFunctionRevertedError with raw data; JurorRegistry reverts only with custom errors). Everything else
+ * (timeouts, HTTP and RPC errors, a send or receipt that failed after simulation) is transient.
+ */
+export function classifyRefreshError(error: unknown): RefreshFailure {
+  for (let current: unknown = error, depth = 0; current && depth < 10; current = (current as { cause?: unknown }).cause, depth++) {
+    if (current instanceof ContractFunctionRevertedError) {
+      if (!current.raw || current.raw === "0x") return { kind: "transient" };
+      return { kind: "revert", errorName: current.data?.errorName, args: current.data?.args ?? [] };
+    }
+  }
+  return { kind: "transient" };
+}
+
+/** The keys in `batch` that a decoded refreshAttestation revert names. */
+function culpritsOf(failure: RefreshFailure, batch: readonly Address[], jurors: ReadonlyMap<Address, JurorRecord>): Address[] {
+  if (failure.kind !== "revert") return [];
+  if (failure.errorName === "NotEnrolled") {
+    const named = String(failure.args[0] ?? "").toLowerCase();
+    return batch.filter((key) => key.toLowerCase() === named);
+  }
+  if (failure.errorName === "MeasurementNotAllowed") {
+    const measurement = String(failure.args[0] ?? "").toLowerCase();
+    const role = Number(failure.args[1]);
+    return batch.filter((key) => {
+      const juror = jurors.get(key);
+      return juror !== undefined && juror.measurement.toLowerCase() === measurement && juror.role === role;
+    });
+  }
+  return [];
+}
+
+/**
  * Only failures that are positive evidence of a non-genuine or misrepresented enclave are reported (5% slash). This
  * is an allow-list: liveness, transport, registry, database and Intel PCS/collateral problems (unreachable endpoints,
  * malformed documents, stale quotes, collateral unavailable or expired, CRL or TCB-info errors, platform TCB status or
  * advisory policy, clock-dependent certificate validity, verifier crashes) and any reason not listed here just let the
  * attestation lapse. Otherwise an outage of Intel PCS, or anyone able to disturb an endpoint's network path, could get
- * every honest juror slashed.
+ * every honest juror slashed. A genuine quote of a build outside the role's allowlist ("measurement not allowed",
+ * "enrolled measurement no longer allowed") also only lapses: it is an upgrade-ordering or governance problem, not
+ * forgery.
  */
 const SLASHABLE = new Set([
-  // The enclave registered for this key claims a different identity, role, class, or a measurement outside the
-  // allowlist for its role.
+  // The enclave registered for this key claims a different identity, role or class, or its document claims a
+  // measurement that its own verified quote does not prove.
   "attestation address mismatch",
   "attestation role mismatch",
-  "measurement mismatch",
   "juror class mismatch",
+  "unexpected measurement",
   // Quote evidence that is forged, altered, debug-mode or bound to other keys or code. These checks need no Intel
   // collateral, or compare the quote with Intel-signed identities that a genuine TDX platform always matches.
   "wrong quote kind",
   "measurement field mismatch",
   "reportData field mismatch",
   "issuedAt field mismatch",
-  "unexpected measurement",
   "unexpected reportData",
   "reportData layout",
   "debug TD",
   "invalid quote tag",
   "invalid mock root signature",
   "malformed mock quote",
-  // The quote's PCK chain, checked against the pinned Intel root before any collateral is fetched. Only Intel can
-  // issue a chain that passes, so a self-made chain or an altered PCK certificate (for example a bogus FMSPC) is
-  // forgery. Certificate validity windows depend on the clock and are deliberately not listed.
+  // The quote's PCK chain, checked against the pinned Intel root before any collateral is fetched, then the QE report
+  // and quote signatures by the chain's leaf key. Only Intel can issue a chain that passes, so a self-made chain or an
+  // altered PCK certificate (for example a bogus FMSPC) is forgery. Certificate validity windows depend on the clock
+  // and are deliberately not listed. "dcap: PCK CA" (an intermediate under Intel's root with a name this code does not
+  // know) is not listed either: only an Intel-issued chain whose leaf key signed the QE report reaches it, so a new
+  // Intel CA name must lapse attestations, not slash every honest enclave.
   "dcap: PCK chain",
   "dcap: PCK untrusted root",
   "dcap: PCK certificate CA",
@@ -345,7 +463,6 @@ const SLASHABLE = new Set([
   "dcap: PCK certificate signature",
   "dcap: PCK root signature",
   "dcap: PCK extension",
-  "dcap: PCK CA",
   "dcap: QE report signature",
   "dcap: QE report data",
   "dcap: quote signature",

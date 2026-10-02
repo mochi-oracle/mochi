@@ -1,7 +1,8 @@
 import {test,expect} from 'bun:test';
 import {connect} from 'node:net';
-import {createProductionProxy,createEnrollmentEndpoint,publicProxySettings,DEFAULT_PUBLIC_QUOTAS} from './public-proxy.ts';
-import {visitorKey} from '../../services/claims/src/visitor-key.ts';
+import {createProductionProxy,createEnrollmentEndpoint,publicProxySettings,DEFAULT_PUBLIC_QUOTAS,PUBLIC_BODY_LIMITS} from './public-proxy.ts';
+import {keyCheckHeader,visitorKey} from '../../services/claims/src/visitor-key.ts';
+import {closeAbandonedConnection} from '../../services/claims/src/bounded-body.ts';
 test('standby and private administration never reach a protocol service',async()=>{
  let calls=0;const proxy=createProductionProxy({ready:()=>false,gatewayPort:8086,indexerPort:8087,fetcher:(async()=>{calls++;return Response.json({})}) as typeof fetch});
  expect((await proxy(new Request('https://public.example/v1/intake/attestation'))).status).toBe(503);
@@ -66,8 +67,23 @@ test('global upload byte budget bounds disk growth and IPv6 clients share their 
  expect((await proxy(post('/v1/intake/upload',doc,'198.51.100.8'))).status).toBe(200);
  expect((await proxy(post('/v1/intake/upload',doc,'198.51.100.9'))).status).toBe(429);
  expect(calls.n).toBe(4);
- expect((await proxy(post('/v1/intake/upload','x'.repeat(1_048_577),'198.51.100.10'))).status).toBe(413);
+ const tooLarge=await proxy(post('/v1/intake/upload','x'.repeat(1_048_577),'198.51.100.10'));
+ expect(tooLarge.status).toBe(413);expect(tooLarge.headers.get('connection')).toBe('close');
  expect(calls.n).toBe(4);
+});
+test('a query body is capped at the gateway\'s 64 KiB, an upload at 1 MiB',async()=>{
+ const calls={n:0};
+ const proxy=createProductionProxy({ready:()=>true,gatewayPort:8086,indexerPort:8087,trustForwardedFor:true,fetcher:upstream(calls),now:()=>0});
+ expect(PUBLIC_BODY_LIMITS).toEqual({'/v1/intake/upload':1_048_576,'/v1/query':65_536});
+ expect((await proxy(post('/v1/query','x'.repeat(65_537),'198.51.100.20'))).status).toBe(413);
+ // Without a declared length the read itself stops at the cap.
+ const streamed=new Request('https://public.example/v1/query',{method:'POST',headers:{'x-forwarded-for':'198.51.100.21'},body:new ReadableStream({start(c){c.enqueue(new Uint8Array(40_000));c.enqueue(new Uint8Array(40_000));c.close();}}),duplex:'half'} as RequestInit);
+ const refused=await proxy(streamed);
+ expect(refused.status).toBe(413);expect(refused.headers.get('connection')).toBe('close');
+ expect(calls.n).toBe(0);
+ expect((await proxy(post('/v1/query','x'.repeat(65_536),'198.51.100.22'))).status).toBe(200);
+ expect((await proxy(post('/v1/intake/upload','x'.repeat(200_000),'198.51.100.23'))).status).toBe(200);
+ expect(calls.n).toBe(2);
 });
 test('query writes are rate limited separately and uploads are bounded in flight',async()=>{
  const calls={n:0};
@@ -144,7 +160,7 @@ test('slow upload bodies hold no intake slot, even for callers who share one key
  const held=Array.from({length:10},slow);
  await Bun.sleep(20);
  expect((await proxy(new Request('https://public.example/v1/intake/upload',{method:'POST',body:'{}'}),'10.2.0.7')).status).toBe(200);
- for(const response of await Promise.all(held)) {expect(response.status).toBe(408);expect(response.headers.get('content-security-policy')).toContain("frame-ancestors 'none'");}
+ for(const response of await Promise.all(held)) {expect(response.status).toBe(408);expect(response.headers.get('content-security-policy')).toContain("frame-ancestors 'none'");expect(response.headers.get('connection')).toBe('close');}
  expect(calls.n).toBe(1);
  // Each slow body still cost its client one request: the per-client request quota bounds how many it can open.
  const limited=createProductionProxy({ready:()=>true,gatewayPort:8086,indexerPort:8087,bodyDeadlineMs:100,fetcher:upstream(calls),quotas:{upload:[{scope:'client',unit:'requests',limit:3,windowSec:3600}]}});
@@ -175,18 +191,20 @@ test('request bodies held in memory are bounded across all clients',async()=>{
  expect((await first).status).toBe(408);
  expect((await proxy(post('/v1/query','x'.repeat(1000),'198.51.100.3'))).status).toBe(200);
 });
-test('a real server on loopback: slow bodies (1 byte/s) neither block other uploads nor outlive the deadline',async()=>{
+test('a real server on loopback: slow bodies (1 byte/s) do not block other uploads, get a 408 at the read deadline, and lose their connection within seconds',async()=>{
  // Default keying: over loopback every connection has the same peer, so attacker and honest caller share one key.
  const proxy=createProductionProxy({ready:()=>true,gatewayPort:8086,indexerPort:8087,bodyDeadlineMs:1500,fetcher:upstream({n:0})});
- // Port 0: the OS picks a free ephemeral port.
- const server=Bun.serve({hostname:'127.0.0.1',port:0,idleTimeout:120,maxRequestBodySize:1_048_576,fetch:(request,bun)=>proxy(request,bun.requestIP(request)?.address)});
+ // Port 0: the OS picks a free ephemeral port. The fetch wrapper is the claims service's.
+ const server=Bun.serve({hostname:'127.0.0.1',port:0,idleTimeout:120,maxRequestBodySize:1_048_576,fetch:async(request,bun)=>closeAbandonedConnection(bun,request,await proxy(request,bun.requestIP(request)?.address))});
  expect(server.port).not.toBe(18545);
- const replies:string[]=[];const sockets=Array.from({length:8},(_,i)=>{
+ const started=Date.now();
+ const replies:string[]=[];const closedAt:number[]=[];const sockets=Array.from({length:8},(_,i)=>{
   const socket=connect(server.port!,'127.0.0.1');socket.on('error',()=>{});socket.on('data',data=>replies.push(String(data).split('\r\n')[0]!));
+  socket.on('close',()=>closedAt.push(Date.now()-started));
   socket.write(`POST /v1/intake/upload HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\nX-Forwarded-For: 198.51.100.${10+i}\r\nContent-Length: 100000\r\n\r\n{`);
   return socket;
  });
- const drip=setInterval(()=>sockets.forEach(socket=>socket.write(' ')),250);
+ const drip=setInterval(()=>sockets.forEach(socket=>{try{socket.write(' ')}catch{}}),250);
  try {
   await Bun.sleep(200);
   const upload=()=>fetch(`http://127.0.0.1:${server.port}/v1/intake/upload`,{method:'POST',body:'{}',headers:{'content-type':'application/json','x-forwarded-for':'192.0.2.1'}});
@@ -195,14 +213,20 @@ test('a real server on loopback: slow bodies (1 byte/s) neither block other uplo
   expect(replies).toHaveLength(8);
   expect(replies.every(line=>line.includes(' 408 '))).toBe(true);
   expect((await upload()).status).toBe(200);
+  // Bun would keep each socket for the server's idleTimeout (120 s) after the 408; the shortened timeout closes them
+  // within a few seconds although the callers keep sending.
+  for(let waited=0;closedAt.length<8&&waited<9000;waited+=250)await Bun.sleep(250);
+  expect(closedAt).toHaveLength(8);
+  expect(Math.max(...closedAt)).toBeLessThan(12_000);
  } finally {clearInterval(drip);sockets.forEach(socket=>socket.destroy());server.stop(true);}
-});
+},20_000);
 test('client diagnostics describe the keying without addresses or secrets',async()=>{
  const site=visitorKey(TOKEN)!;
  const proxy=createProductionProxy({ready:()=>true,gatewayPort:8086,indexerPort:8087,visitorSecret:TOKEN,fetcher:upstream({n:0})});
  const status=(headers:Record<string,string>,peer?:string)=>proxy.clientDiagnostics(new Request('https://public.example/production/status',{headers}),peer);
  const direct=status({'x-forwarded-for':'203.0.113.5','x-real-ip':'203.0.113.6'},'10.2.0.7');
- expect(direct).toMatchObject({keySource:'peer',trustForwardedFor:false,forwardedFor:{entries:1,last:'public'},realIpHeader:true,peer:'private',visitor:'absent',visitorKeyId:site.id});
+ expect(direct).toMatchObject({keySource:'peer',trustForwardedFor:false,forwardedFor:{entries:1,last:'public'},realIpHeader:true,peer:'private',visitor:'absent',visitorKeyCheck:'absent'});
+ expect((direct as Record<string,unknown>).visitorKeyId).toBeUndefined();
  expect(direct.keyTag).toMatch(/^[0-9a-f]{8}$/);
  // Same peer, different caller-chosen X-Forwarded-For: same key. Different peer: different key.
  const spoofed=status({'x-forwarded-for':'198.51.100.1'},'10.2.0.7');
@@ -218,7 +242,13 @@ test('client diagnostics describe the keying without addresses or secrets',async
  expect(status({'x-mochi-visitor':'v1.forged'})).toMatchObject({keySource:'none',visitor:'invalid',peer:'absent'});
  const text=JSON.stringify(direct);
  for(const secret of ['203.0.113','10.2.0.7',TOKEN])expect(text).not.toContain(secret);
- expect(createProductionProxy({ready:()=>true,gatewayPort:8086,indexerPort:8087}).clientDiagnostics(new Request('https://public.example/'))).toMatchObject({visitor:'unconfigured',visitorKeyId:null,keySource:'none'});
+ expect(createProductionProxy({ready:()=>true,gatewayPort:8086,indexerPort:8087}).clientDiagnostics(new Request('https://public.example/'))).toMatchObject({visitor:'unconfigured',visitorKeyCheck:'unconfigured',keySource:'none'});
+ // The operator's key check: "match" exactly when the proof was made with the CVM's visitor secret; no secret material.
+ expect(status({'x-mochi-key-check':keyCheckHeader(TOKEN)},'10.2.0.9').visitorKeyCheck).toBe('match');
+ expect(status({'x-mochi-key-check':keyCheckHeader('another-invitation-token-of-24-chars')},'10.2.0.9').visitorKeyCheck).toBe('mismatch');
+ expect(status({'x-mochi-key-check':'v1.short'},'10.2.0.9').visitorKeyCheck).toBe('invalid');
+ for(let i=0;i<8;i++)status({'x-mochi-key-check':keyCheckHeader(TOKEN)},'10.2.0.9');
+ expect(status({'x-mochi-key-check':keyCheckHeader(TOKEN)},'10.2.0.9').visitorKeyCheck).toBe('rate_limited');
 });
 test('only an explicit launch-config setting trusts X-Forwarded-For',()=>{
  expect(publicProxySettings(undefined)).toEqual({trustForwardedFor:false});
@@ -227,4 +257,13 @@ test('only an explicit launch-config setting trusts X-Forwarded-For',()=>{
  expect(publicProxySettings(JSON.stringify({mode:'active'}))).toEqual({trustForwardedFor:false});
  expect(publicProxySettings(JSON.stringify({publicProxy:{trustForwardedFor:'true'}}))).toEqual({trustForwardedFor:false});
  expect(publicProxySettings(JSON.stringify({publicProxy:{trustForwardedFor:true}}))).toEqual({trustForwardedFor:true});
+ // The CVM has no hop-count setting: a trusted ingress always means one appending hop (the right-most entry).
+ expect(publicProxySettings(JSON.stringify({publicProxy:{trustForwardedFor:true,forwardedForHops:2}}))).toEqual({trustForwardedFor:true});
+});
+test('the CVM proxy still keys a trusted X-Forwarded-For on its right-most entry',async()=>{
+ const seen:string[]=[];
+ const proxy=createProductionProxy({ready:()=>true,gatewayPort:8086,indexerPort:8087,...publicProxySettings(JSON.stringify({publicProxy:{trustForwardedFor:true,forwardedForHops:2}})),
+  fetcher:(async(_url:string,init?:RequestInit)=>{seen.push((init?.headers as Record<string,string>)['x-mochi-client']!);return Response.json({});}) as unknown as typeof fetch});
+ for(const xff of ['203.0.113.7, 10.1.0.3','192.0.2.1, 203.0.113.7, 10.1.0.4'])await proxy(new Request('https://public.example/v1/stats',{headers:{'x-forwarded-for':xff}}),'10.2.0.7');
+ expect(seen).toEqual(['10.1.0.3','10.1.0.4']);
 });

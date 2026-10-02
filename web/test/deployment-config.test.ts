@@ -34,6 +34,14 @@ test('enabled deployment requires all secure upstreams; disabled deployment need
   expect(loadWebDeployment({MOCHI_WEB_CONFIG_JSON:'{"enabled":false}'}).enabled).toBe(false);
 });
 
+test('the published config carries the Intel TCB policy for the browser, UpToDate only by default', () => {
+  expect(validateWebDeployment(config).tdxAllowedTcbStatuses).toEqual(['UpToDate']);
+  expect(validateWebDeployment({...config, tdxAllowedTcbStatuses: ['UpToDate', 'SWHardeningNeeded', 'OutOfDate']}).tdxAllowedTcbStatuses).toEqual(['UpToDate', 'SWHardeningNeeded', 'OutOfDate']);
+  for (const bad of [[], ['OutOfDate'], ['UpToDate', 'Revoked'], ['UpToDate', 'UpToDate'], ['UpToDate', 'Bogus'], 'UpToDate']) {
+    expect(() => validateWebDeployment({...config, tdxAllowedTcbStatuses: bad})).toThrow('TCB statuses');
+  }
+});
+
 test('testnet 46630 is accepted only with the explicit local rehearsal flag', () => {
   const rehearsal = {...config, chainId: 46630};
   expect(() => validateWebDeployment(rehearsal)).toThrow();

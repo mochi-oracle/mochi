@@ -1,11 +1,16 @@
 /**
  * Caller identity for per-client limits, shared by the website, the CVM public proxy and the protocol gateway. Each
- * server states which proxy it trusts: X-Forwarded-For only behind one that appends it, the transport peer otherwise.
+ * server states which proxies it trusts: X-Forwarded-For only behind proxies that write its last entries, and how many
+ * they write; the transport peer otherwise.
  */
 import { createHmac, randomBytes } from 'node:crypto';
 
 const MAX_ADDRESS = 64;
-const MAX_FORWARDED_TAIL = 256;
+/** Longest X-Forwarded-For entry read, whitespace included. No address is this long, so a longer entry keys as "invalid". */
+const MAX_FORWARDED_ENTRY = 256;
+/** Most trusted hops a policy may name, and most entries the diagnostics describe. */
+export const MAX_FORWARDED_HOPS = 4;
+const INVALID = 'invalid';
 const IPV4 = /^\d{1,3}(?:\.\d{1,3}){3}$/;
 
 type Parsed = { kind: 'v4'; value: string } | { kind: 'v6'; groups: string[] };
@@ -31,46 +36,108 @@ function parseAddress(address: string): Parsed | undefined {
   return { kind: 'v6', groups: groups.map(group => group.replace(/^0+(?=.)/, '')) };
 }
 
+/** IPv6 grouping for one limiter: /64 (one host can rotate addresses inside its prefix) or a site allocation. */
+export type Ipv6Grouping = 64 | 56 | 48;
+
 /**
- * Rate-limit key for one address: IPv4 as is, IPv6 grouped by /64 (a single host can rotate addresses inside its
- * prefix). IPv4-mapped IPv6 is treated as IPv4, and a port appended by a proxy is ignored so it cannot vary the key.
- * Anything else is "invalid", which all such callers share.
+ * Rate-limit key for one address: IPv4 as is, IPv6 grouped by its prefix (/64 by default; /56 or /48 for limiters where
+ * one site's allocation, not one host, should share a budget). IPv4-mapped IPv6 is treated as IPv4, and a port appended
+ * by a proxy is ignored so it cannot vary the key. Anything else is "invalid", which all such callers share.
  */
-export function clientPrefix(address: string): string {
+export function clientPrefix(address: string, ipv6Bits: Ipv6Grouping = 64): string {
   const parsed = parseAddress(address);
   if (!parsed) return 'invalid';
-  return parsed.kind === 'v4' ? parsed.value : `${parsed.groups.slice(0, 4).join(':')}::/64`;
+  if (parsed.kind === 'v4') return parsed.value;
+  const [a, b, c, d] = parsed.groups as [string, string, string, string];
+  if (ipv6Bits === 48) return `${a}:${b}:${c}::/48`;
+  if (ipv6Bits === 56) return `${a}:${b}:${c}:${(parseInt(d, 16) & 0xff00).toString(16)}::/56`;
+  return `${a}:${b}:${c}:${d}::/64`;
 }
 
-/** Proxy trust for one server. X-Forwarded-For is caller-settable unless a proxy that appends it fronts every request. */
+/** Proxy trust for one server. X-Forwarded-For is caller-settable except for the entries the trusted proxies write. */
 export type ForwardingPolicy = {
-  /** Only where a reverse proxy that always appends the caller's address fronts the server (Railway for the website). */
+  /**
+   * Only where reverse proxies that always write the caller's address front every request: Railway's edge for the
+   * website (with Railway's CDN off), or an ingress the CVM rehearsal has shown to append it.
+   */
   trustForwardedFor?: boolean;
+  /**
+   * How many X-Forwarded-For entries, counted from the right, those proxies write: an integer from 1 to
+   * MAX_FORWARDED_HOPS, default 1. The client is the entry at index `len - hops`, the right-most counting as 1; why that
+   * is safe, and what a wrong count does, is in forwardedAddress.
+   */
+  forwardedForHops?: number;
 };
 
-/**
- * The right-most X-Forwarded-For entry: the one the nearest proxy appended (entries to its left are caller-supplied).
- * Only the tail of the header is read, so a caller who pads the header cannot change which entry is used; an entry
- * longer than an address is returned as is and keys as "invalid".
- */
-export function lastForwardedEntry(header: string | null | undefined): string | undefined {
-  if (!header) return undefined;
-  const tail = header.slice(-MAX_FORWARDED_TAIL).replace(/[\s,]+$/, '');
-  if (!tail) return undefined;
-  const comma = tail.lastIndexOf(',');
-  if (comma < 0 && header.length > MAX_FORWARDED_TAIL) return tail;
-  return tail.slice(comma + 1).trim() || undefined;
+/** The policy's hop count (1 when unset). Anything but an integer from 1 to MAX_FORWARDED_HOPS is a configuration error. */
+export function forwardedHops(policy: ForwardingPolicy = {}): number {
+  const hops = policy.forwardedForHops ?? 1;
+  if (!Number.isInteger(hops) || hops < 1 || hops > MAX_FORWARDED_HOPS) throw new RangeError(`forwardedForHops must be an integer from 1 to ${MAX_FORWARDED_HOPS}.`);
+  return hops;
 }
 
 /**
- * The caller address: with `trustForwardedFor`, the right-most X-Forwarded-For entry, else the transport peer the
- * server passes. X-Real-IP, CF-Connecting-IP and other caller-settable headers are never used, and a header that is
- * present but malformed never falls back to another header.
+ * Up to `count` (1 to MAX_FORWARDED_HOPS) X-Forwarded-For entries, right-most first, trimmed; fewer when the header
+ * has fewer. Only the last `count * (MAX_FORWARDED_ENTRY + 1)` characters are read, so a caller who pads the header
+ * cannot change which entries these are, and the work is bounded. An entry longer than MAX_FORWARDED_ENTRY, or one
+ * that begins before the part read, is returned as "invalid" (never cut down to something that parses), and an empty
+ * entry as "". Separators at the very end of the header are ignored.
+ */
+export function forwardedEntries(header: string | null | undefined, count: number): string[] {
+  if (!Number.isInteger(count) || count < 1 || count > MAX_FORWARDED_HOPS) throw new RangeError(`count must be an integer from 1 to ${MAX_FORWARDED_HOPS}.`);
+  if (!header) return [];
+  const span = count * (MAX_FORWARDED_ENTRY + 1);
+  const tail = header.slice(-span);
+  // The left-most piece read is a whole entry only if the header starts there or a comma precedes it.
+  const cut = header.length > span && header[header.length - span - 1] !== ',';
+  let end = tail.length;
+  while (end > 0 && /[\s,]/.test(tail[end - 1]!)) end--;
+  if (end === 0) return [];
+  const pieces = tail.slice(0, end).split(',');
+  const entries: string[] = [];
+  for (let i = pieces.length - 1; i >= 0 && entries.length < count; i--) {
+    const piece = pieces[i]!;
+    entries.push((i === 0 && cut) || piece.length > MAX_FORWARDED_ENTRY ? INVALID : piece.trim());
+  }
+  return entries;
+}
+
+/** The right-most X-Forwarded-For entry (forwardedEntries with a count of 1), or undefined when there is none. */
+export function lastForwardedEntry(header: string | null | undefined): string | undefined {
+  return forwardedEntries(header, 1)[0];
+}
+
+/**
+ * The caller address: with `trustForwardedFor`, the X-Forwarded-For entry at index `len - hops` (hops is
+ * `forwardedForHops`, default 1; the right-most entry counts as 1), else the transport peer the server passes. A
+ * present header with fewer than `hops` entries, or whose selected entry is empty, over-long or not read whole, gives
+ * "invalid": never another entry, never X-Real-IP or another header, never the peer. X-Real-IP, CF-Connecting-IP and
+ * other caller-settable headers are never used.
+ *
+ * hops = 1: one proxy that appends the address it sees. Entries to the left of its entry are whatever the caller sent.
+ * Railway documents the left-most entry as the client, but behind an appending proxy a caller who sends
+ * `X-Forwarded-For: 192.0.2.1` arrives as `192.0.2.1, <caller>`, and keying on the left-most entry would let one caller
+ * choose a fresh key per request.
+ *
+ * hops = 2: Railway's edge in front of the website (measured 2026-10-02, CDN off). It writes `<visitor>, <edge node>`;
+ * the right-most entry names whichever of a few edge nodes handled the request, so keying on it put every visitor into
+ * one of a few shared buckets. Railway rewrites the header rather than appending to the caller's: a caller who sends
+ * `X-Forwarded-For: 192.0.2.1` still arrives with two entries. Position `len - 2` is the visitor either way. Rewriting,
+ * the header holds only Railway's two entries. Appending, should Railway switch, the caller's entries come first
+ * (`192.0.2.1, <visitor>, <edge node>`), so position `len - 2` is still the address Railway's first hop recorded. A
+ * caller can only add entries to the left of the ones the trusted proxies write, and so cannot move the entry at
+ * `len - hops`. The tail-only read keeps that true for a padded header.
+ *
+ * A wrong count: too few hops keys on a proxy's own address, so visitors behind it share a budget (coarse, never
+ * caller-chosen). Too many, behind proxies that rewrite, leaves too few entries and keys everyone as "invalid"; behind
+ * proxies that append, it would select an entry the caller wrote. The website's activation check
+ * (deploy/production/WEBSITE-ACTIVATION.md) rules out both: the key must not move when the caller sends its own header.
  */
 export function forwardedAddress(request: Request, peer?: string, policy: ForwardingPolicy = {}): string | undefined {
+  const hops = forwardedHops(policy);
   if (policy.trustForwardedFor) {
     const forwarded = request.headers.get('x-forwarded-for');
-    if (forwarded !== null) return lastForwardedEntry(forwarded) ?? 'invalid';
+    if (forwarded !== null) return forwardedEntries(forwarded, hops)[hops - 1] || INVALID;
   }
   return peer?.trim() || undefined;
 }
@@ -79,9 +146,9 @@ export function forwardedAddress(request: Request, peer?: string, policy: Forwar
  * Per-client rate-limit key: clientPrefix(forwardedAddress(...)), or "unknown" when the server knows no address.
  * Callers that cannot be told apart share one key, so global limits remain the actual bound.
  */
-export function forwardedClient(request: Request, peer?: string, policy: ForwardingPolicy = {}): string {
+export function forwardedClient(request: Request, peer?: string, policy: ForwardingPolicy = {}, ipv6Bits: Ipv6Grouping = 64): string {
   const address = forwardedAddress(request, peer, policy);
-  return address === undefined ? 'unknown' : clientPrefix(address);
+  return address === undefined ? 'unknown' : clientPrefix(address, ipv6Bits);
 }
 
 export type AddressClass = 'loopback' | 'private' | 'public' | 'invalid';
@@ -129,6 +196,27 @@ export function forwardingFacts(request: Request, peer?: string, tag?: (key: str
     realIpHeader: request.headers.has('x-real-ip'),
     peer: peer ? addressClass(peer) : 'absent',
     ...(tag ? { peerTag: peer ? tag(clientPrefix(peer)) : null } : {}),
+  } as const;
+}
+
+/**
+ * forwardingFacts plus what the website's activation check compares, still content-free: the policy's hop count, the
+ * class and salted tag of each of the last MAX_FORWARDED_HOPS X-Forwarded-For entries (right-most first, so entry
+ * `hops - 1` is the one keyed on), and the class and tag of X-Real-IP. X-Real-IP never keys anything; it is shown only
+ * so the operator can compare it with the key. Tags are of the /64 key, as the website's keyTag is.
+ */
+export function forwardingDiagnostics(request: Request, peer: string | undefined, policy: ForwardingPolicy, tag: (key: string) => string) {
+  const facts = forwardingFacts(request, peer, tag);
+  const header = request.headers.get('x-forwarded-for'), realIpHeader = request.headers.get('x-real-ip');
+  const realIp = realIpHeader === null ? undefined : realIpHeader.length > MAX_FORWARDED_ENTRY ? INVALID : realIpHeader;
+  return {
+    ...facts,
+    forwardedFor: {
+      ...facts.forwardedFor, hops: forwardedHops(policy),
+      fromRight: forwardedEntries(header, MAX_FORWARDED_HOPS).map(entry => ({ class: addressClass(entry), tag: tag(clientPrefix(entry)) })),
+    },
+    realIp: realIp === undefined ? 'absent' : addressClass(realIp),
+    realIpTag: realIp === undefined ? null : tag(clientPrefix(realIp)),
   } as const;
 }
 

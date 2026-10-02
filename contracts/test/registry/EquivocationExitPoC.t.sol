@@ -52,4 +52,52 @@ contract EquivocationExitPoCTest is Harness {
         assertEq(mochi.balanceOf(address(this)) - sinkBefore, BOND, "the exited juror escaped the equivocation slash");
         assertEq(registry.getJuror(juror).bond, 0);
     }
+
+    /// Review finding 4: MochiVerdicts.post has no deadline, so a round stays postable after its query deadline until
+    /// someone calls expire, and a late post stamps lastServedAt (and so the exit hold) at the post time.
+    function testLatePostMovesTheHoldToThePostTime() public {
+        bytes32 qid = _open(1, 3, keccak256("late-post-doc"), false);
+        _seal(qid);
+        address juror = escrow.jurorsOf(qid)[0];
+        address operator = registry.operatorOf(juror);
+        uint256 t0 = vm.getBlockTimestamp();
+        vm.prank(operator);
+        registry.requestExit(juror);
+        uint64 deadline = escrow.getQuery(qid).deadline;
+        vm.warp(uint256(deadline) + 3 hours); // nobody expired it
+        bytes32[9] memory answers;
+        answers[1] = keccak256("agreed");
+        answers[2] = keccak256("agreed");
+        _post(qid, 2, 6666, 1, 1, bytes32(0), _votes(qid, answers, 1));
+        assertEq(registry.lastServedAt(juror), uint256(deadline) + 3 hours);
+        vm.warp(t0 + 7 days + 1 hours); // past exit + delay, and past deadline + delay
+        vm.prank(operator);
+        vm.expectRevert(abi.encodeWithSignature("ExitDelayNotElapsed(uint64)", uint64(deadline + 3 hours + 7 days)));
+        registry.withdrawBond(juror);
+    }
+
+    /// The exiting operator caps its own hold: expire after the deadline records no service, and the late post fails.
+    function testExpireAfterTheDeadlineCapsTheHold() public {
+        bytes32 qid = _open(1, 3, keccak256("capped-hold-doc"), false);
+        _seal(qid);
+        address juror = escrow.jurorsOf(qid)[0];
+        address operator = registry.operatorOf(juror);
+        uint256 t0 = vm.getBlockTimestamp();
+        vm.prank(operator);
+        registry.requestExit(juror);
+        vm.warp(uint256(escrow.getQuery(qid).deadline) + 1);
+        vm.prank(operator);
+        escrow.expire(qid);
+        bytes32[9] memory answers;
+        (MochiTypes.VerdictInput memory v, bytes memory sig) =
+            _preparePost(qid, 2, 0, 7, 7, bytes32(0), _votes(qid, answers, 7));
+        MochiTypes.JurorVote[] memory votes = _votes(qid, answers, 7);
+        vm.expectRevert();
+        verdicts.post(v, votes, sig);
+        assertEq(registry.lastServedAt(juror), 0);
+        vm.warp(t0 + 7 days);
+        vm.prank(operator);
+        registry.withdrawBond(juror);
+        assertEq(registry.getJuror(juror).bond, 0);
+    }
 }

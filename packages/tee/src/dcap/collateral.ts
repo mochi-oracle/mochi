@@ -12,6 +12,11 @@ export interface TdxCollateral {
 
 export interface CollateralSource {
   get(fmspc: string, ca: "platform" | "processor", signal?: AbortSignal): Promise<TdxCollateral>;
+  /**
+   * Optional: `collateral` (as returned by get) failed signature or chain verification. A caching source drops it if it
+   * is still the cached copy, so the next get fetches it again instead of serving it until it expires.
+   */
+  invalidate?(fmspc: string, ca: "platform" | "processor", collateral: TdxCollateral): void;
 }
 
 const staleGrace = new WeakMap<TdxCollateral, number>();

@@ -263,6 +263,8 @@ export function prepareProductionLaunch(options: {
     receiptPublicKey,
     // Launch checkout offers the default N3 jury only; larger juries are a later governance/website decision.
     jurySizes: [3],
+    // The browser checks the intake's quote under the same Intel TCB policy as the runtime; change both together.
+    tdxAllowedTcbStatuses: [...runtime.tdxAllowedTcbStatuses!],
   };
   return { runtime, identities: identityInput, releaseInput, website, salt };
 }

@@ -48,6 +48,26 @@ export class QuotaLimiter {
     return { ok: true };
   }
 
+  /**
+   * Seconds until `amount` could be charged to `client` (0 if it could be now), without charging anything. For a
+   * request charged in parts (one unit before its body is read, the rest after), so its Retry-After covers the whole
+   * charge rather than only the refused part.
+   */
+  retryAfter(client: string, unit: QuotaUnit, amount: number): number {
+    const now = this.now();
+    const own = this.clients.get(client);
+    let wait = 0;
+    const check = (rule: QuotaRule, bucket: Bucket | undefined) => {
+      if (rule.unit !== unit) return;
+      const rate = rule.limit / rule.windowSec;
+      const tokens = bucket ? Math.min(rule.limit, bucket.tokens + Math.max(0, now - bucket.updated) * rate) : rule.limit;
+      if (tokens < amount) wait = Math.max(wait, amount > rule.limit ? rule.windowSec : (amount - tokens) / rate);
+    };
+    this.clientRules.forEach((rule, i) => check(rule, own?.[i]));
+    this.globalRules.forEach((rule, i) => check(rule, this.global[i]));
+    return wait > 0 ? Math.max(1, Math.ceil(wait)) : 0;
+  }
+
   private bucketsFor(client: string, now: number): Bucket[] {
     const existing = this.clients.get(client);
     if (existing) return existing;

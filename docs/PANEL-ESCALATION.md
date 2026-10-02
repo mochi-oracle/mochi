@@ -98,6 +98,44 @@ and then execute in the owner console. Until `record-on` runs, `inspect`, `verif
 preflight report a mismatch, because the file still records `off`. `record-on` first checks that the chain shows the
 panel on, then records `"panelEscalation": "on"` plus a `panelSwitchedOn` entry in the deployment file.
 
+### Switch-on checklist
+
+Before scheduling:
+
+- [ ] At least six evaluators are drawable (`inspect` shows them; `switch-on` refuses with fewer). A panel needs three,
+      and an appeal three more outside the first panel.
+- [ ] `inspect` shows no binding mismatch.
+- [ ] The owner has decided the commit, reveal, appeal and draw windows and the customer escalation policy
+      (`WAIT-WINDOWS.md`). Every historic HUNG query that is public or allowed panel disclosure becomes escalatable.
+- [ ] Every evaluator has the evaluator CLI and knows the abstain rule:
+  - materials are served only while the case is `COMMIT` or `REVEAL` (a draw that is still choosing seats gets
+    `CASE_CLOSED`, a case past voting `PANEL_CLOSED`);
+  - when the desk answers `MATERIALS_UNAVAILABLE` (HTTP 410: the intake no longer holds the document, which will not
+    come back), the CLI prints the command to run before the commit deadline, instead of committing:
+    `bun services/panel-desk/bin/evaluator.ts abstain --case-id <caseId>`;
+  - when two or three seats abstain, the panel is void: nobody is slashed and the fee goes back to the payer. A first
+    panel becomes `DRAW_EXPIRED` and may be escalated again. An appeal lapses, and the first panel's majority stands;
+  - a lone abstainer is slashed 10% like any seat that does not reveal, so abstaining alone does not avoid a hard case.
+- [ ] The panel desk keeper is running. It calls `resolve` as soon as two seats have abstained (a void needs no
+      deadline), so a void first panel is escalatable again at once.
+- [ ] The feed runner key holds USDG for panel fees. Each fee is refunded when its panel lapses or is void.
+
+After execute:
+
+- [ ] `record-on` has run, and `inspect`, `verify-ownership.ts` and the release preflight are green.
+- [ ] Orchestrator, escalating again (only when the deployment names a PanelEscalation; with no panel address its
+      behaviour is unchanged):
+  - it also lists ESCALATED feed queries, and escalates one again when its case is `DRAW_EXPIRED` (the draw expired,
+    or the panel was void);
+  - it reads each such case at most once every 6 hours (`PANEL_RETRY_BACKOFF_MS`), and the wait after an escalation
+    again doubles for each further escalation of the same query (12 h, 24 h, ... up to 8 days), because a case whose
+    document is gone is voided by every new panel;
+  - it never reads a `FINAL` case again;
+  - the backoff is kept in memory, so after a restart each such case is read once more, starting again at 6 hours;
+  - watch the `orchestrator.panel_escalate_again` log: the same query escalated again and again means intake has
+    lost its document (records are kept 14 days from the last juror or panel dispatch). Remove its `feed_queries` row
+    to stop the orchestrator escalating it.
+
 ## Evaluator pool and draw rules (panel audit and review fixes)
 
 These hold once the panel is on; nothing here changes the launch-off wiring above.
@@ -125,6 +163,14 @@ These hold once the panel is on; nothing here changes the launch-off wiring abov
   even with no seed (a drand beacon nobody posted). No panel is seated after the expiry. Ending a draw refunds the
   panel fee: a first panel becomes `DRAW_EXPIRED` and may be escalated again; an appeal lapses and the first panel's
   majority is finalized, releasing its stake.
+- A seated evaluator acts once before the commit deadline: `commit`, or `abstain` when it cannot evaluate the case
+  (the intake answers `MATERIALS_UNAVAILABLE`). An abstention can never be revealed. Once all three seats have acted,
+  the case is `REVEAL`, so an abstention is only possible while it is `COMMIT`.
+- If two or three seats abstain, `resolve` voids the panel and may be called at once. It slashes nobody, releases the
+  seats, refunds the fee to the payer and emits `PanelVoided`. A first panel becomes `DRAW_EXPIRED`, its seats and
+  votes are cleared, and a new escalation draws a fresh panel. An appeal lapses exactly as when its draw expires: the
+  first panel's majority is finalized and paid. A lone abstainer is a non-revealer and is slashed. Two colluding
+  seats can void a panel at no cost to themselves, but this only refunds the payer and leads to a new draw.
 - An appeal needs three drawable evaluators outside the first panel, so six in total (switch-on requires six).
 - Only a query's payer may escalate it; `FEED_RUNNER_ROLE` may escalate only FEED queries.
 - Without a final majority a case ends `FINAL` with zero outcome hashes (a final HUNG). QueryEscrow has no transition
@@ -141,6 +187,13 @@ These hold once the panel is on; nothing here changes the launch-off wiring abov
   date field).
 - `/payload` keeps a public payload only after the evaluator's on-chain reveal and only if it matches the revealed
   payload hash (`PanelEscalation.revealOf`). Private payloads are refused, and the evaluator CLI does not send them.
+- Intake `dispatch-panel` checks the case itself: it serves only a case in `COMMIT` or `REVEAL` and answers
+  `PANEL_CLOSED` (409) otherwise, including `DRAWING`, where a resumable draw can already show some seats.
+- A record that is gone from the intake store (expired, or never kept) is `MATERIALS_UNAVAILABLE` with HTTP 410
+  (Gone), because it is permanent. 409 stays for refusals that depend on the case's current state. The desk passes
+  `MATERIALS_UNAVAILABLE` and `PANEL_CLOSED` through with fixed messages; any other intake refusal is still
+  `MATERIALS_REJECTED`. The evaluator CLI turns `MATERIALS_UNAVAILABLE` into the abstain advice and command, and
+  `evaluator abstain --case-id <id>` sends `abstain`.
 
 ## Tests
 
@@ -158,6 +211,23 @@ These hold once the panel is on; nothing here changes the launch-off wiring abov
   positions fixed; seated panels eligible and equal to the panel its seed fixed; no dead position once no draw is
   pending, with sybil bursts, held draws and appeal front-runs in the handler), and a final HUNG against the real
   QueryEscrow (`PanelFinalHungQuery.t.sol`).
+- `contracts/test/panel/PanelAbstain.t.sol`:
+  - two abstentions void a first panel (refund, nobody slashed, `DRAW_EXPIRED`, escalatable again, and nothing on
+    the void panel carries over to a redrawn one) or lapse an appeal (appeal fee refunded, first majority paid);
+  - three abstentions void the panel too;
+  - a lone abstainer is slashed;
+  - abstaining after a commit, twice, after the commit deadline, while `DRAWING`, by a non-panelist or once all seats
+    have acted reverts;
+  - exact fee and slash splits, including remainders, after the payout helpers were merged into one.
+- The invariant handler abstains (one seat, or two). `invariant_voidPanelsSlashNobody` holds alongside the earlier
+  properties, and `test_handlerReachesAbstentionAndVoid` drives both shapes through the handler.
+- `services/orchestrator/test/pipeline.test.ts` covers escalating again: with a panel configured, a `DRAW_EXPIRED`
+  feed case is escalated again and the per-query wait (and its doubling) is respected. Open cases are left alone, a
+  `FINAL` case is never read again and non-feed queries are never read. With no panel address the listing, reads and
+  transactions are unchanged. `services/orchestrator/test/db-adapter.test.ts` pins the listing SQL.
+- `services/intake/test/panel.test.ts` checks the case status (`COMMIT` and `REVEAL` get 200; `FINAL`,
+  `DRAW_EXPIRED` and `DRAWING` get 409 `PANEL_CLOSED`) and that a missing record gets 410 `MATERIALS_UNAVAILABLE`.
+  `services/panel-desk/test/panel-desk.test.ts` checks the pass-through and the CLI's abstain advice.
 - Additions in `scripts/prepare-production-launch.test.ts` and `scripts/production-release.test.ts`.
 - `scripts/production-activation-rehearsal.ts` deploys with `--panel-escalation off` and asserts the wiring. After the
   timelocked configure and activate steps, it runs the generated switch-on batch through the deployed timelock: early

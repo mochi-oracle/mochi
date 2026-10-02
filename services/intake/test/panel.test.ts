@@ -7,6 +7,7 @@ import { aad, evaluatorKeyDigest, PanelDocPlainSchema, provenanceFromJson } from
 import { docCommit, provenanceHash, ZERO32 } from "@mochi/core";
 import { MemorySealedStore, MockQuoteVerifier, MockTeeProvider, open, seal } from "@mochi/tee";
 import { IntakeEnclave, IntakeError } from "../src/intake.ts";
+import { createIntakeApp } from "../src/app.ts";
 
 const root = privateKeyToAccount(`0x${"11".repeat(32)}`);
 const measurement = `0x${"22".repeat(32)}` as Hex;
@@ -14,7 +15,7 @@ const tee = new MockTeeProvider({ seed: `0x${"33".repeat(32)}`, measurement, moc
 const queryId = `0x${"ab".repeat(32)}` as Hex;
 const doc = new TextEncoder().encode("Reserve report: supply 100, reserves 99.");
 
-async function setup(opts: { status?: number; isPublic?: boolean; consent?: boolean; panelIndex?: number } = {}) {
+async function setup(opts: { status?: number; isPublic?: boolean; consent?: boolean; panelIndex?: number; caseStatus?: number } = {}) {
   const evaluators = [1, 2, 3].map((i) => privateKeyToAccount(`0x${String(i).repeat(64)}` as Hex));
   const isPublic = opts.isPublic ?? true;
   const salt = isPublic ? ZERO32 : `0x${"5a".repeat(32)}` as Hex;
@@ -26,7 +27,7 @@ async function setup(opts: { status?: number; isPublic?: boolean; consent?: bool
       isPublic, allowPanelDisclosure: opts.consent ?? false, provenanceHash: openedWith,
     }),
     jurorsOf: async () => [], isActive: async () => true, getJuror: async () => ({ measurement }),
-    getPanelCase: async () => ({ status: 2, panelIndex: opts.panelIndex ?? 0 }),
+    getPanelCase: async () => ({ status: opts.caseStatus ?? 2, panelIndex: opts.panelIndex ?? 0 }),
     panelOf: async () => evaluators.map((e) => e.address as Hex),
   };
   const store = new MemorySealedStore();
@@ -103,5 +104,42 @@ describe("dispatch-panel", () => {
     const req = await f.request();
     req.evaluators[0]!.address = outsider.address.toLowerCase();
     await expect(f.intake.dispatchPanel(req)).rejects.toBeInstanceOf(IntakeError);
+  });
+});
+
+describe("dispatch-panel case status and missing materials", () => {
+  const post = async (s: Awaited<ReturnType<typeof setup>>) => {
+    const response = await createIntakeApp(s.intake).app.request("/v1/dispatch-panel", {
+      method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(await s.request()),
+    });
+    return { status: response.status, body: await response.json() as { evaluators?: unknown[]; error?: { code: string; message: string } } };
+  };
+
+  // IPanelEscalation.CaseStatus: DRAWING 1, COMMIT 2, REVEAL 3, FINAL 7, DRAW_EXPIRED 8.
+  test("serves materials only while the seated panel votes (COMMIT or REVEAL)", async () => {
+    for (const caseStatus of [2, 3]) {
+      const res = await post(await setup({ caseStatus }));
+      expect(res.status).toBe(200);
+      expect(res.body.evaluators).toHaveLength(3);
+    }
+    // DRAWING: a resumable draw can already show some seats in panelOf; the panel is not seated yet.
+    for (const caseStatus of [7, 8, 1]) {
+      const retained: string[] = [];
+      const s = await setup({ caseStatus });
+      s.store.retain = async (key: string) => { retained.push(key); };
+      const res = await post(s);
+      expect(res.status).toBe(409);
+      expect(res.body.error).toEqual({ code: "PANEL_CLOSED", message: "Panel case is not open for evaluation" });
+      expect(retained).toEqual([]);
+    }
+  });
+
+  test("a record that is gone is the permanent MATERIALS_UNAVAILABLE (410), so the seat can abstain", async () => {
+    const s = await setup();
+    s.store.get = async () => undefined; // expired from the sealed store
+    const res = await post(s);
+    expect(res.status).toBe(410);
+    expect(res.body.error?.code).toBe("MATERIALS_UNAVAILABLE");
+    await expect(s.intake.dispatchPanel(await s.request())).rejects.toMatchObject({ code: "MATERIALS_UNAVAILABLE", status: 410 });
   });
 });

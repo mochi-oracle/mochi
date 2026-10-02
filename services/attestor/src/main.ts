@@ -28,14 +28,16 @@ const { app, attestor } = createAttestorApp({
 
 const server = Bun.serve({ hostname: process.env.HOST ?? "127.0.0.1", port: config.PORT, fetch: (request) => new URL(request.url).pathname === "/health" && request.method === "GET" ? Response.json({ ok: true }) : app.fetch(request) });
 log("info", "attestor_started", { port: server.port, intervalMs: config.INTERVAL_MS });
-const runCheck = async () => {
+// Each key is checked on its own schedule: every INTERVAL_MS while it passes, and after a failure with a backoff bounded
+// by its own remaining validity (see scheduler.ts), so one failing key never delays the others.
+const runCheck = async (isDue: (key: string) => boolean) => {
   try {
-    const results = await attestor.checkAll();
+    const results = await attestor.checkAll(isDue);
     log("info", "attestation_check_complete", { checked: results.length, passing: results.filter((row) => row.ok).length });
-    return results.length > 0 && results.every((row) => row.ok);
+    return results.map((row) => ({ key: row.address, ok: row.ok, attestedUntilSec: attestor.attestedUntil(row.address) }));
   } catch (error) {
     log("error", "attestation_check_failed", { error: error instanceof Error ? error.message : "unknown" });
-    return false;
+    throw error;
   }
 };
 startAttestationChecks(runCheck, config.INTERVAL_MS);

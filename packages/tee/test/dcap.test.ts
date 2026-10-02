@@ -4,7 +4,7 @@ import { bytesToHex, hexToBytes } from "viem";
 import { sha256 } from "@noble/hashes/sha2.js";
 import { p256 } from "@noble/curves/nist.js";
 import { INTEL_SGX_ROOT_CA_DER, parseCert, parseCrl, parseTdxQuote, pemChain, verifyTdxQuote } from "../src/dcap/index.ts";
-import { DcapError, assertSerialNotRevoked, convergeTcbStatus } from "../src/dcap/verify.ts";
+import { DcapError, assertSerialNotRevoked, convergeTcbStatus, convergeTcbStatuses } from "../src/dcap/verify.ts";
 import { children, integer, readTlv } from "../src/dcap/der.ts";
 
 const dir=new URL("./fixtures/intel-tdx/",import.meta.url);
@@ -26,5 +26,5 @@ describe("Intel TDX DCAP",()=>{
 
  test("issuer chain shapes and signer names are enforced",async()=>{const raw=await read("tdx_quote"),collateral=await json("tdx_quote_collateral.json");expect(()=>verifyTdxQuote(raw,{...collateral,tcb_info_issuer_chain:collateral.tcb_info_issuer_chain+collateral.tcb_info_issuer_chain.split("-----END CERTIFICATE-----")[0]+"-----END CERTIFICATE-----"},1752919234)).toThrow();expect(()=>verifyTdxQuote(raw,{...collateral,tcb_info_issuer_chain:collateral.pck_crl_issuer_chain},1752919234)).toThrow("TCB signer CN");});
 
- test("status convergence follows the complete Intel severity table",()=>{const statuses=["UpToDate","SWHardeningNeeded","ConfigurationNeeded","ConfigurationAndSWHardeningNeeded","OutOfDate","OutOfDateConfigurationNeeded","Revoked"],severity=new Map(statuses.map((status,index)=>[status,index]));for(const platform of statuses)for(const component of statuses){const expected=component==="OutOfDate"&&(platform==="ConfigurationNeeded"||platform==="ConfigurationAndSWHardeningNeeded")?"OutOfDateConfigurationNeeded":severity.get(platform)!>=severity.get(component)!?platform:component;expect(convergeTcbStatus(platform,component)).toBe(expected);}expect(()=>convergeTcbStatus("Unknown","UpToDate")).toThrow("unknown TCB status");});
+ test("status convergence follows Intel QVL convergeTcbStatuses: only OutOfDate and Revoked components change the platform status",()=>{const statuses=["UpToDate","SWHardeningNeeded","ConfigurationNeeded","ConfigurationAndSWHardeningNeeded","OutOfDate","OutOfDateConfigurationNeeded","Revoked"];const [U,S,C,CS,O,OC,R]=statuses as [string,string,string,string,string,string,string];const table:Record<string,string[]>={UpToDate:[U,U,U,U,O,U,R],SWHardeningNeeded:[S,S,S,S,O,S,R],ConfigurationNeeded:[C,C,C,C,OC,C,R],ConfigurationAndSWHardeningNeeded:[CS,CS,CS,CS,OC,CS,R],OutOfDate:[O,O,O,O,O,O,R],OutOfDateConfigurationNeeded:[OC,OC,OC,OC,OC,OC,R],Revoked:[R,R,R,R,R,R,R]};for(const platform of statuses)statuses.forEach((component,index)=>expect(convergeTcbStatus(platform,component)).toBe(table[platform]![index]!));expect(convergeTcbStatuses(U,[O,R])).toBe(R);expect(convergeTcbStatuses(C,[U,O])).toBe(OC);expect(convergeTcbStatuses(S,[])).toBe(S);expect(()=>convergeTcbStatus("Unknown","UpToDate")).toThrow("unknown TCB status");});
 });

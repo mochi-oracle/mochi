@@ -3,6 +3,8 @@ import { z } from 'zod';
 
 const address = z.string().regex(/^0x[0-9a-fA-F]{40}$/).refine(value => !/^0x0{40}$/i.test(value));
 const bytes32 = z.string().regex(/^0x[0-9a-fA-F]{64}$/).refine(value => !/^0x0{64}$/i.test(value));
+/** Intel TCB statuses a deployment may accept; "Revoked" is never one of them. */
+export const TDX_TCB_STATUSES = ['UpToDate', 'SWHardeningNeeded', 'ConfigurationNeeded', 'ConfigurationAndSWHardeningNeeded', 'OutOfDate', 'OutOfDateConfigurationNeeded'] as const;
 const enabledConfig = z.object({
   enabled: z.literal(true),
   chainId: z.union([z.literal(4663), z.literal(46630)]),
@@ -12,6 +14,12 @@ const enabledConfig = z.object({
   receiptPublicKey: bytes32,
   jurySizes: z.array(z.union([z.literal(3), z.literal(5), z.literal(7), z.literal(9)])).min(1)
     .refine(values => new Set(values).size === values.length),
+  /**
+   * The Intel TCB statuses the browser accepts for the intake's quote: the runtime config's tdxAllowedTcbStatuses,
+   * so the browser applies the same policy as the CVM. Default ["UpToDate"].
+   */
+  tdxAllowedTcbStatuses: z.array(z.enum(TDX_TCB_STATUSES)).min(1)
+    .refine(values => new Set(values).size === values.length && values.includes('UpToDate')).optional(),
 });
 
 /** Public values only. Invalid enabled configs fail startup without echoing their contents. Robinhood Chain testnet
@@ -19,8 +27,8 @@ const enabledConfig = z.object({
 export function validateWebDeployment(input: unknown, options: { allowRehearsal?: boolean } = {}) {
   if (input == null || (typeof input === 'object' && 'enabled' in input && input.enabled === false)) return {enabled: false as const};
   const result = enabledConfig.safeParse(input);
-  if (!result.success || (result.data.chainId === 46630 && options.allowRehearsal !== true)) throw new Error('Invalid paid-review configuration; check chain, contract addresses, intake identity, receipt key and jury sizes.');
-  return {...result.data, rpcUrl: '/rpc' as const};
+  if (!result.success || (result.data.chainId === 46630 && options.allowRehearsal !== true)) throw new Error('Invalid paid-review configuration; check chain, contract addresses, intake identity, receipt key, jury sizes and TCB statuses.');
+  return {...result.data, tdxAllowedTcbStatuses: result.data.tdxAllowedTcbStatuses ?? ['UpToDate' as const], rpcUrl: '/rpc' as const};
 }
 
 export function loadWebDeployment(env: Record<string, string | undefined>, read: (path: string) => string = path => readFileSync(path, 'utf8')) {

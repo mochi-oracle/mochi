@@ -1,7 +1,9 @@
 import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
+import { sha256 } from "@noble/hashes/sha2.js";
 import { markStaleCollateral, parseCollateralJson, type CollateralSource, type TdxCollateral } from "./collateral.ts";
 import { parseCrl } from "./crl.ts";
+import { DcapError, verifyCollateralComponent, verifyCollateralSignatures, type CollateralComponent } from "./verify.ts";
 
 export type PcsOptions = {
   baseUrl?: string;
@@ -65,7 +67,7 @@ const COMPONENT_FIELDS: Record<Component, readonly (keyof TdxCollateral)[]> = {
   pckCrl: ["pck_crl", "pck_crl_issuer_chain"],
   rootCrl: ["root_ca_crl"],
 };
-type Entry = { collateral: TdxCollateral; fetchedAt: number; nextUpdate: number };
+type Entry = { collateral: TdxCollateral; fetchedAt: number; nextUpdate: number; origin: "pcs" | "disk" };
 type KeyState = {
   entry?: Entry;
   diskChecked: boolean;
@@ -73,7 +75,10 @@ type KeyState = {
   failures: number;
   retryAt: number;
   lastFailure?: "outage" | "answered";
+  /** Fingerprints of collateral that failed verification here; the persisted cache never brings these back. */
+  rejected: string[];
 };
+const MAX_REJECTED = 8;
 
 /**
  * Intel PCS v4 collateral per FMSPC/CA pair, with:
@@ -84,6 +89,12 @@ type KeyState = {
  * - exponential backoff with jitter after failures.
  * Each component (TCB info, QE identity, PCK CRL, root CRL) is replaced as soon as PCS returns it, so a fresh CRL or TCB
  * info is never masked by a stale copy of it.
+ *
+ * Nothing is trusted because it is cached: every component PCS returns and every persisted entry is authenticated
+ * against the pinned Intel root (verifyCollateralComponent) before it is used, so its nextUpdate is Intel's; an answer
+ * or file that fails is refused. The TCB evaluation data never goes backwards: a TCB info or QE identity with a lower
+ * tcbEvaluationDataNumber (or, at the same number, an earlier issueDate), or a CRL with an earlier thisUpdate, never
+ * replaces the cached one. A copy that later fails verification is dropped through invalidate() and fetched again.
  */
 export class PcsCollateralSource implements CollateralSource {
   private readonly states = new Map<string, KeyState>();
@@ -135,6 +146,24 @@ export class PcsCollateralSource implements CollateralSource {
     await Promise.all([...this.states.values()].map((state) => state.inflight?.catch(() => undefined)));
   }
 
+  /**
+   * `collateral` failed signature or chain verification. If it is still the cached copy, drop it (and never adopt it
+   * from the persisted cache again) so the next get fetches a new one. A copy PCS itself served within the last
+   * MIN_REFRESH_INTERVAL_SEC is not requested again at once: that refetch backs off like a failed request.
+   */
+  invalidate(fmspc: string, ca: "platform" | "processor", collateral: TdxCollateral): void {
+    const state = this.states.get(`${fmspc.toUpperCase()}:${ca}`);
+    const entry = state?.entry;
+    if (!state || !entry) return;
+    const print = fingerprint(collateral);
+    if (fingerprint(entry.collateral) !== print) return;
+    const now = this.now();
+    state.entry = undefined;
+    this.reject(state, print);
+    if (entry.origin === "pcs" && now - entry.fetchedAt < MIN_REFRESH_INTERVAL_SEC) this.recordFailure(state, "answered", now);
+    else state.retryAt = 0;
+  }
+
   private now(): number {
     return this.options.now?.() ?? Date.now() / 1000;
   }
@@ -143,10 +172,11 @@ export class PcsCollateralSource implements CollateralSource {
     const key = `${fmspc}:${ca}`;
     let state = this.states.get(key);
     if (!state) {
-      state = { diskChecked: false, failures: 0, retryAt: 0 };
+      state = { diskChecked: false, failures: 0, retryAt: 0, rejected: [] };
       this.states.set(key, state);
     }
-    if (!state.diskChecked) await this.adoptDiskEntry(state, fmspc, ca);
+    const firstLook = !state.diskChecked;
+    if (firstLook) await this.adoptDiskEntry(state, fmspc, ca);
     const now = this.now();
     const cached = state.entry;
     if (cached && now <= cached.nextUpdate) {
@@ -156,8 +186,9 @@ export class PcsCollateralSource implements CollateralSource {
       return cached.collateral;
     }
 
-    // Missing or past nextUpdate: another process may have refreshed the shared cache directory.
-    if (cached && await this.adoptDiskEntry(state, fmspc, ca) && now <= state.entry!.nextUpdate) return state.entry!.collateral;
+    // Missing (never cached, or dropped by invalidate) or past nextUpdate: another process may have refreshed the shared
+    // cache directory.
+    if (!firstLook && await this.adoptDiskEntry(state, fmspc, ca) && now <= state.entry!.nextUpdate) return state.entry!.collateral;
     let failure: unknown = new PcsFetchError("PCS backoff after a failed request", state.lastFailure === "outage");
     if (now >= state.retryAt || state.inflight) {
       try {
@@ -255,7 +286,18 @@ export class PcsCollateralSource implements CollateralSource {
       },
     };
 
-    const results = await Promise.allSettled(COMPONENTS.map((component) => fetchers[component]()));
+    const accept = async (component: Component): Promise<Partial<TdxCollateral>> => {
+      const part = await fetchers[component]();
+      try {
+        verifyCollateralComponent(component, part, { fmspc, ca });
+      } catch (error) {
+        throw new PcsFetchError(`PCS ${component} rejected: ${error instanceof DcapError ? error.code : "invalid"}`, false);
+      }
+      const cached = state.entry?.collateral;
+      if (cached && isOlderCollateral(component, part, cached)) throw new PcsFetchError(`PCS ${component} older than cached`, false);
+      return part;
+    };
+    const results = await Promise.allSettled(COMPONENTS.map(accept));
     const now = this.now();
     const fresh: Partial<TdxCollateral> = {};
     const errors: unknown[] = [];
@@ -266,7 +308,7 @@ export class PcsCollateralSource implements CollateralSource {
 
     if (errors.length === 0) {
       const collateral = parseCollateralJson(fresh);
-      const entry = { collateral, fetchedAt: now, nextUpdate: collateralNextUpdate(collateral) };
+      const entry: Entry = { collateral, fetchedAt: now, nextUpdate: collateralNextUpdate(collateral), origin: "pcs" };
       state.entry = entry;
       if (entry.nextUpdate < now) this.recordFailure(state, "answered", now);
       else { state.failures = 0; state.retryAt = 0; state.lastFailure = undefined; }
@@ -277,12 +319,16 @@ export class PcsCollateralSource implements CollateralSource {
     // Keep every component PCS did return: a fresh CRL or TCB info must never be masked by a cached copy.
     if (state.entry && Object.keys(fresh).length > 0) {
       const collateral = { ...state.entry.collateral, ...fresh };
-      state.entry = { collateral, fetchedAt: state.entry.fetchedAt, nextUpdate: collateralNextUpdate(collateral) };
+      state.entry = { collateral, fetchedAt: state.entry.fetchedAt, nextUpdate: collateralNextUpdate(collateral), origin: state.entry.origin };
       await this.persist(fmspc, ca, state.entry);
     }
     const outage = errors.every((error) => error instanceof PcsFetchError && error.outage);
     this.recordFailure(state, outage ? "outage" : "answered", now);
     throw errors.find((error) => !(error instanceof PcsFetchError && error.outage)) ?? errors[0];
+  }
+
+  private reject(state: KeyState, print: string): void {
+    if (!state.rejected.includes(print)) state.rejected = [...state.rejected.slice(1 - MAX_REJECTED), print];
   }
 
   private recordFailure(state: KeyState, kind: "outage" | "answered", now: number): void {
@@ -298,7 +344,12 @@ export class PcsCollateralSource implements CollateralSource {
     return this.cacheDir ? join(this.cacheDir, `${fmspc}-${ca}.json`) : undefined;
   }
 
-  /** Adopt a persisted entry when it is newer than the in-memory one. Unreadable or malformed files are ignored. */
+  /**
+   * Adopt a persisted entry when it is authentic and newer than the in-memory one. The file is written by this or
+   * another process but read back as untrusted: unreadable, malformed or unsigned files, collateral for another
+   * FMSPC/CA, anything rejected here before and anything older than the in-memory copy are ignored (and overwritten
+   * by the next fetch).
+   */
   private async adoptDiskEntry(state: KeyState, fmspc: string, ca: "platform" | "processor"): Promise<boolean> {
     state.diskChecked = true;
     const file = this.fileFor(fmspc, ca);
@@ -307,10 +358,22 @@ export class PcsCollateralSource implements CollateralSource {
       const stored = JSON.parse(await readFile(file, "utf8")) as { v?: unknown; fmspc?: unknown; ca?: unknown; fetchedAt?: unknown; collateral?: unknown };
       if (stored.v !== 1 || stored.fmspc !== fmspc || stored.ca !== ca) return false;
       const collateral = parseCollateralJson(stored.collateral);
+      const print = fingerprint(collateral);
+      if (state.rejected.includes(print)) return false;
+      try {
+        verifyCollateralSignatures(collateral, { fmspc, ca });
+      } catch {
+        this.reject(state, print);
+        return false;
+      }
       const nextUpdate = collateralNextUpdate(collateral);
       const fetchedAt = typeof stored.fetchedAt === "number" && Number.isFinite(stored.fetchedAt) ? Math.min(stored.fetchedAt, this.now()) : 0;
-      if (state.entry && nextUpdate <= state.entry.nextUpdate && fetchedAt <= state.entry.fetchedAt) return false;
-      state.entry = { collateral, fetchedAt, nextUpdate };
+      const current = state.entry;
+      if (current) {
+        if (COMPONENTS.some((component) => isOlderCollateral(component, collateral, current.collateral))) return false;
+        if (nextUpdate <= current.nextUpdate && fetchedAt <= current.fetchedAt) return false;
+      }
+      state.entry = { collateral, fetchedAt, nextUpdate, origin: "disk" };
       return true;
     } catch {
       return false;
@@ -362,6 +425,42 @@ export function collateralNextUpdate(collateral: TdxCollateral): number {
   ];
   if (values.some((value) => !Number.isFinite(value))) throw new Error("collateral nextUpdate");
   return Math.min(...values);
+}
+
+/** Version of one component, for the never-go-backwards rule: TCB evaluation number, then issue time. */
+function componentVersion(component: CollateralComponent, collateral: Partial<TdxCollateral>): { evaluation?: number; issued: number } {
+  if (component === "pckCrl" || component === "rootCrl") {
+    return { issued: parseCrl(fromHex(component === "pckCrl" ? collateral.pck_crl! : collateral.root_ca_crl!)).thisUpdate };
+  }
+  const body = JSON.parse(component === "tcb" ? collateral.tcb_info! : collateral.qe_identity!) as { tcbEvaluationDataNumber?: unknown; issueDate?: unknown };
+  const evaluation = Number.isSafeInteger(body.tcbEvaluationDataNumber) ? body.tcbEvaluationDataNumber as number : undefined;
+  const issued = Date.parse(String(body.issueDate)) / 1000;
+  if (!Number.isFinite(issued)) throw new Error("collateral issueDate");
+  return { evaluation, issued };
+}
+
+/**
+ * True when `candidate`'s component is older than `current`'s and must not replace it: a TCB info or QE identity with a
+ * lower tcbEvaluationDataNumber (or none where the current one has one), or the same number and an earlier issueDate;
+ * a CRL with an earlier thisUpdate.
+ */
+export function isOlderCollateral(component: CollateralComponent, candidate: Partial<TdxCollateral>, current: TdxCollateral): boolean {
+  const next = componentVersion(component, candidate);
+  const now = componentVersion(component, current);
+  if (now.evaluation !== undefined) {
+    if (next.evaluation === undefined || next.evaluation < now.evaluation) return true;
+    if (next.evaluation > now.evaluation) return false;
+  }
+  return next.issued < now.issued;
+}
+
+function fingerprint(collateral: TdxCollateral): string {
+  const canonical = JSON.stringify([
+    collateral.pck_crl_issuer_chain, collateral.root_ca_crl, collateral.pck_crl, collateral.tcb_info_issuer_chain,
+    collateral.tcb_info, collateral.tcb_info_signature, collateral.qe_identity_issuer_chain, collateral.qe_identity,
+    collateral.qe_identity_signature,
+  ]);
+  return toHex(sha256(new TextEncoder().encode(canonical)));
 }
 
 function signedNextUpdate(body: string): number {

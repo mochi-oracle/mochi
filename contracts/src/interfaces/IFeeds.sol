@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
-pragma solidity ^0.8.28;
+pragma solidity 0.8.28;
 
 /// @title IFeeds
 /// @notice Named feeds → latest typed payload per key. Fail-closed: only public, FETCHED, allow-listed-origin VERDICTs

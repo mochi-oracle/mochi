@@ -53,14 +53,24 @@ The public `/production/status` endpoint distinguishes standby from a configured
 With a reviewed external-token deployment and verified identity report, the launch configuration uses three explicit stages:
 
 1. `prepare`: escrow must be paused. Starts the intake, consensus, nine jurors and gateway, with durable sealed storage. Public paid routes remain closed. GET `/production/enrollment` returns the nine fixed, operator-bound enrollment proofs; caller-selected signing data is never accepted.
-2. `enroll`: escrow remains paused; registrations, operator identities, model classes, configured bonds (or team approval for zero-bond mode) and required service roles must match. Starts the attestor so registered identities can become active before unpausing. Paid routes remain closed.
+2. `enroll`: escrow remains paused; registrations, operator identities, model classes, configured bonds (or team approval for zero-bond mode) and required service roles must match. Starts the attestor so registered identities can become active before unpausing. Paid routes remain closed. A juror key joins its class's selection pool (`JurorRegistry.inPool`, event `PoolJoined`) at the attestor's first refresh that leaves it active, not at enrollment, so the order is: configure batch (approvals) → enrollment → attestor refresh in enroll mode → every juror `isActive` and `inPool` → activation batch. The activation CLI (`scripts/phala-batch.ts … activate`) refuses to schedule until all nine jurors are in their pools.
 3. `active`: requires unpaused escrow, matching enrolled identities and required roles. An inactive identity is accepted only when its attestation has expired and every other registry eligibility condition still passes. Starts indexing, orchestration, shielded relay and the privacy postman. The public protocol proxy opens only while all required children are healthy. The website has its separate, explicit activation switch.
 
 ### Public write limits and client keys
 
-The public protocol proxy (`public-proxy.ts`) limits uploads and queries per client and in total; each per-client limit is 5–6.25% of the matching global one (numbers in `DEFAULT_PUBLIC_QUOTAS`). An upload body must arrive whole within 12 s before it takes one of 8 intake slots (at most 2 per client). A client is, in order: a website visitor named by the website's signed `X-Mochi-Visitor` header (an HMAC under a key derived from `MOCHI_CLAIMS_ACCESS_TOKEN`, which Railway and the CVM both hold); the right-most `X-Forwarded-For` entry, only if the launch config sets `"publicProxy": {"trustForwardedFor": true}`; otherwise the transport peer. The proxy passes that key to the gateway on its loopback hop as `X-Mochi-Client`, which the gateway honours only from loopback. Callers whose addresses the CVM ingress hides share one client key and one client share of the budget. Anyone holding the invitation token can mint visitor keys, so the global limits remain the bound.
+The public protocol proxy (`public-proxy.ts`) limits uploads and queries per client and in total; each per-client limit is 5–6.25% of the matching global one (numbers in `DEFAULT_PUBLIC_QUOTAS`). It reads at most 1 MiB for an upload and 64 KiB for a query (the gateway's own query cap). An upload body must arrive whole within 12 s before it takes one of 8 intake slots (at most 2 per client). A refused body (408, 413, or 503 while it is still arriving) is answered with `Connection: close`, and the server then gives that socket the shortest idle timeout: Bun would otherwise keep it open for the server's 120 s `idleTimeout` while the caller keeps sending, so it now closes within about 4 s.
 
-`GET /production/status` carries a content-free `client` object for the rehearsal: `keySource` (`visitor`, `forwarded`, `peer` or `none`), `keyTag` (a per-process tag: equal for two callers exactly when they share limits), `forwardedFor.entries`, `forwardedFor.last` (the class of the last entry: `absent`, `public`, `private`, `loopback` or `invalid`) and `forwardedFor.lastTag`, `realIpHeader`, `peer` (the class of the transport peer) and `peerTag`, `visitor` (`absent`, `valid`, `invalid`, `expired` or `unconfigured`) and `visitorKeyId` (a fingerprint of the derived visitor key, which must equal the website's `/health` `client.visitorKeyId`). It never shows an address, header value or secret. Set `trustForwardedFor` only if the rehearsal shows that the ingress appends the caller's public address to every request.
+A client is, in order: a website visitor named by the website's signed `X-Mochi-Visitor` header; the right-most `X-Forwarded-For` entry, only if the launch config sets `"publicProxy": {"trustForwardedFor": true}`; otherwise the transport peer. The CVM has no hop-count setting: a trusted ingress must append exactly one entry. (The website on Railway keys on the second entry from the right instead; see [WEBSITE-ACTIVATION.md](./WEBSITE-ACTIVATION.md).) The `X-Mochi-Visitor` header is a MAC under a key derived from the visitor secret, which `visitorSecretFromEnv` in `services/claims/src/visitor-key.ts` names (today `MOCHI_CLAIMS_ACCESS_TOKEN`, which Railway and the CVM both hold). The visitor in it is a pseudonym under a random key each website process keeps to itself, so the CVM, which holds the secret, still cannot recover a visitor's address by trying all IPv4 addresses. The CVM does see which requests come from one visitor, until the website restarts. The proxy passes that key to the gateway on its loopback hop as `X-Mochi-Client`, which the gateway honours only from loopback. Callers whose addresses the CVM ingress hides share one client key and one client share of the budget. Anyone holding the secret can mint visitor keys, so the global limits remain the bound.
+
+`GET /production/status` carries a content-free `client` object for the rehearsal: `keySource` (`visitor`, `forwarded`, `peer` or `none`), `keyTag` (a per-process tag: equal for two callers exactly when they share limits), `forwardedFor.entries`, `forwardedFor.last` (the class of the last entry: `absent`, `public`, `private`, `loopback` or `invalid`) and `forwardedFor.lastTag`, `realIpHeader`, `peer` (the class of the transport peer) and `peerTag`, `visitor` (`absent`, `valid`, `invalid`, `expired` or `unconfigured`) and `visitorKeyCheck`. It never shows an address, header value, secret, or anything derived from the secret: an earlier `visitorKeyId` fingerprint let anyone test token guesses offline and is gone. Set `trustForwardedFor` only if the rehearsal shows that the ingress appends the caller's public address to every request.
+
+To confirm that the website and the CVM hold the same visitor secret, run on a trusted machine, with the secret in a protected file:
+
+```sh
+bun scripts/visitor-key-check.ts https://<website>/health https://<cvm-host>/production/status < <protected secret file>
+```
+
+The script sends each server a fresh `X-Mochi-Key-Check` proof (a MAC of a random nonce under the derived key). Each server answers `client.visitorKeyCheck`: `match` or `mismatch` (`absent`, `invalid`, `unconfigured`, or `rate_limited` after 10 checks per address or 60 in total per hour). The script exits 0 only when both answer `match`. A caller without the secret learns only that one guess was wrong.
 
 A provider workload pin identifies the ACI workload, not a model name. Obtain and verify its current attestation before preparing the launch configuration. The configured model families are GPT-OSS, DeepSeek, Gemma, Kimi and Qwen (one per juror class; see `docs/JURY-MODEL-SELECTION.md`); unavailable provider weight hashes remain explicitly unknown, and the passports make no ZDR claim. Empty fetch-origin configuration permits pasted/uploaded material while URL fetching remains closed until reviewed origins are supplied.
 
@@ -82,7 +92,7 @@ After starting prepare mode, save GET `/production/enrollment` and generate the 
 bun scripts/prepare-production-enrollment.ts --deployment <mainnet.json> --identities <production-identities.json> --operator <approved-public-operator> --proofs <enrollment-response.json> --out <new-transactions.json>
 ```
 
-Each possession proof must match the configured key, class, measurement, operator, chain and registry, with a valid juror signature. For zero-bond mode, output contains nine enrollment calls and no token approval. For a positive bond it also contains one approval for exactly nine times the deployment's `minJurorBond`. Review and execute these from the approved operator wallet after the configure timelock has executed. Repeated execution is not a recovery mechanism; check on-chain enrollment and allowance before signing. Then select enroll mode, verify active attestations, and continue the separate activation phase described above.
+Each possession proof must match the configured key, class, measurement, operator, chain and registry, with a valid juror signature. For zero-bond mode, output contains nine enrollment calls and no token approval. For a positive bond it also contains one approval for exactly nine times the deployment's `minJurorBond`. Review and execute these from the approved operator wallet after the configure timelock has executed. Repeated execution is not a recovery mechanism; check on-chain enrollment and allowance before signing. Then select enroll mode, verify active attestations and pool membership (`inPool`), and continue the separate activation phase described above.
 
 ## Re-pinning the Phala ACI gateway after a provider change
 
@@ -117,17 +127,34 @@ but no juror answers and queries time out or refund.
 
 ## Intel TCB recoveries
 
-All DCAP checks share one Intel TCB policy, `tdxAllowedTcbStatuses` in the runtime config (passed to every service as
-`TDX_ALLOWED_TCB_STATUSES`). It defaults to `["UpToDate"]`, and `prepare-production-launch.ts` writes that value
-explicitly. When Intel publishes a TCB recovery, platforms that have not yet been patched are rated `OutOfDate` or
-`SWHardeningNeeded`. Every attestor check then reports `tcb status OutOfDate`, which is not slashable, so the
-attestations lapse within 1200 s. Jurors refuse the gateway with `tcb_status`. The collateral cache picks up new TCB
-info within a day.
+All DCAP checks share one Intel TCB policy, `tdxAllowedTcbStatuses` in the runtime config. The protocol services
+receive it as `TDX_ALLOWED_TCB_STATUSES`. The claims service applies the same list to the checks it makes itself: the
+research pilot's ACI gateway checks and `/production/identities` (`launchTdxAllowedTcbStatuses` in `runtime.ts`). The
+website publishes its own copy as `tdxAllowedTcbStatuses` in `/mochi-config.json`, and the browser checks the intake's
+quote against it. The policy defaults to `["UpToDate"]`, and `prepare-production-launch.ts` writes that value explicitly
+into both `production-runtime.json` and `website-config.json`. When Intel publishes a TCB recovery, platforms that have
+not yet been patched are rated `OutOfDate` or `SWHardeningNeeded`. Every attestor check then reports
+`tcb status OutOfDate`, which is not slashable, so the attestations lapse within 1200 s. Jurors refuse the gateway with
+`tcb_status`, the research pilot's jurors fail with `ACI_TCB_STATUS`, `/production/identities` answers 503, and the
+browser refuses the intake ("Intake attestation failed. No document was uploaded."). The collateral cache picks up new
+TCB info within a day.
 
 The strict default accepts that outage until Phala patches. The alternative is an owner decision recorded in the launch
-evidence: temporarily set the list to, for example, `["UpToDate", "SWHardeningNeeded", "OutOfDate"]` and apply it as in
-step 5 above. That accepts platforms with a published, unpatched vulnerability for the duration. Revert it once
-`UpToDate` returns. `Revoked` is never accepted.
+evidence, applied to both copies of the list:
+
+1. **Decide [OWNER].** Record the Intel advisory, the statuses to accept and the expected patch date. `Revoked` is
+   never accepted, and `UpToDate` must stay in the list.
+2. **CVM.** Set `tdxAllowedTcbStatuses` in the reviewed runtime config to, for example,
+   `["UpToDate", "SWHardeningNeeded", "OutOfDate"]`, and apply it as in step 5 above. Config values are not part of
+   the measurement, so identities and registry state are unchanged.
+3. **Website.** Set the same list as `tdxAllowedTcbStatuses` in Railway's `MOCHI_WEB_CONFIG_JSON`. Updating the
+   variable restarts the website; it submits no transaction.
+4. **Verify.** `/mochi-config.json` shows the list, `/production/identities` answers 200, the attestor's checks pass
+   again, and a canary query is answered.
+5. **Revert** both copies to `["UpToDate"]` once Phala has patched and PCS rates the platform `UpToDate` again.
+
+While the lists differ, the stricter one decides: a CVM that accepts `OutOfDate` while the website does not still
+blocks checkout.
 
 ## Environment names are part of the measurement
 
@@ -154,6 +181,6 @@ Use the owner's address for guardian too (deploy-local defaults guardian to owne
 
 The initial jury uses zero deposits and explicit on-chain approval of each key/operator. This is a permissioned team-operated service, not token-backed insurance or a decentralized operator network. Refunds follow the existing payment contracts; removing deposits creates no new refund or compensation promise. MOCHI's CA is still required by the rest of the configured protocol, and developer fees remain separate.
 
-`setUnbondedJuror(key, operator)` is governor-only; a zero operator revokes that seat's approval. Approval alone never replaces valid attestation, software measurement or enrollment signature checks. Setting a positive minimum disables zero-bond seats; changing to zero requires approvals for any existing seats that should remain eligible. Existing deployed registry bytecode does not gain this feature automatically: a new deployment and matching runtime are required. Do not use a zero-bond config against an older registry.
+`setUnbondedJuror(key, operator)` is governor-only; a zero operator revokes that seat's approval, and `prunePool` can then drop the key from its pool (re-approval plus the attestor's next refresh brings it back). `delist(key)` is governor-only and permanent; it slashes nothing (a juror's operator withdraws any bond through the normal exit), and the attestor's refresh batches skip the key. Approval alone never replaces valid attestation, software measurement or enrollment signature checks. Setting a positive minimum disables zero-bond seats; changing to zero requires approvals for any existing seats that should remain eligible. Either switch deactivates every juror of the other mode at once, so in-flight rounds could no longer post their answers or seat new jurors: switch modes only while QueryEscrow is paused and has no OPEN or SEALED query (drained). Existing deployed registry bytecode does not gain this feature automatically: a new deployment and matching runtime are required. Do not use a zero-bond config against an older registry.
 
-Active restarts after an attestation-only outage do not require pause → enroll → unpause. The attestor checks immediately at startup, retries failed checks with exponential backoff and jitter (from about 15 seconds up to the interval, including endpoints still starting), and resumes the normal 600-second refresh interval once checks pass; attestations last 1200 seconds. It re-sends a refresh only for keys whose attestation was not extended in the last 5 minutes. Refresh still requires valid quotes and successful chain transactions, so recovery time depends on endpoint and chain availability. Changed operators, roles, classes or measurements, revoked measurement/team approval, exits, delisting and insufficient bonds still abort startup. Prepare and enroll still require a paused escrow. These settings govern new deployments; existing timelock contracts are not changed by a software release. See [WAIT-WINDOWS.md](../../docs/WAIT-WINDOWS.md) for unchanged protocol windows.
+Active restarts after an attestation-only outage do not require pause → enroll → unpause. The attestor checks immediately at startup, retries failed checks with exponential backoff and jitter (from about 15 seconds up to the interval, including endpoints still starting), and resumes the normal 600-second refresh interval once checks pass; attestations last 1200 seconds. It re-sends a refresh only for keys whose attestation was not extended in the last 5 minutes. If the outage outlasted the registry's `ATTESTATION_GRACE` (one day), anyone may have pruned the lapsed juror keys from their pools; the attestor's first successful refresh adds them back, with no governance step. Refresh still requires valid quotes and successful chain transactions, so recovery time depends on endpoint and chain availability. Changed operators, roles, classes or measurements, revoked measurement/team approval, exits, delisting and insufficient bonds still abort startup. Prepare and enroll still require a paused escrow. These settings govern new deployments; existing timelock contracts are not changed by a software release. See [WAIT-WINDOWS.md](../../docs/WAIT-WINDOWS.md) for unchanged protocol windows.

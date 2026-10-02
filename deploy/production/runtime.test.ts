@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { EventEmitter } from "node:events";
-import { endpointRows, PRODUCTION_PORTS, startProductionRuntime, startupFailureReason, validateEnrollmentReadiness, validateLaunchConfig, watchChildLifecycle } from "./runtime.ts";
+import { endpointRows, launchTdxAllowedTcbStatuses, PRODUCTION_PORTS, startProductionRuntime, startupFailureReason, validateEnrollmentReadiness, validateLaunchConfig, watchChildLifecycle } from "./runtime.ts";
 
 const a = (n: number) => `0x${n.toString(16).padStart(40, "0")}` as `0x${string}`;
 const h = (n: number) => `0x${n.toString(16).padStart(64, "0")}` as `0x${string}`;
@@ -102,6 +102,17 @@ describe("production runtime config", () => {
       const c = config(); (c as any).tdxAllowedTcbStatuses = bad;
       expect(() => validateLaunchConfig(c)).toThrow("tdxAllowedTcbStatuses");
     }
+  });
+
+  test("the CVM's own checks (pilot, identities) read the same TCB policy, strict for standby or anything the runtime refuses", () => {
+    expect(launchTdxAllowedTcbStatuses(undefined)).toEqual(["UpToDate"]);
+    expect(launchTdxAllowedTcbStatuses(JSON.stringify(config()))).toEqual(["UpToDate"]);
+    const relaxed = config(); (relaxed as any).tdxAllowedTcbStatuses = ["UpToDate", "SWHardeningNeeded", "OutOfDate"];
+    expect(launchTdxAllowedTcbStatuses(JSON.stringify(relaxed))).toEqual(["UpToDate", "SWHardeningNeeded", "OutOfDate"]);
+    for (const bad of [[], ["OutOfDate"], ["UpToDate", "Revoked"], ["UpToDate", "UpToDate"], "UpToDate"]) {
+      expect(launchTdxAllowedTcbStatuses(JSON.stringify({ ...config(), tdxAllowedTcbStatuses: bad }))).toEqual(["UpToDate"]);
+    }
+    expect(launchTdxAllowedTcbStatuses("not json")).toEqual(["UpToDate"]);
   });
 
   test("startup failure reasons keep our message but drop credentials and key-like values", () => {

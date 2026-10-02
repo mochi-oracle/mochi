@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
-pragma solidity ^0.8.28;
+pragma solidity 0.8.28;
 
 /// @title IShieldedPayments
 /// @notice Adapter over a shielded payment pool (Privacy Pools + relayer). Implemented in src/privacy; a mock lives in src/mocks.

@@ -90,6 +90,12 @@ export async function createProductionIdentityReadiness(options: {
   providerFactory?: (spec: typeof PRODUCTION_IDENTITY_SPECS[number]) => Promise<TeeProvider>;
   now?: () => number;
   maxQuoteAgeSec?: number;
+  /**
+   * Intel TCB statuses the quote check accepts: the runtime config's tdxAllowedTcbStatuses (launchTdxAllowedTcbStatuses),
+   * the same list the protocol services receive. It replaces any TDX_ALLOWED_TCB_STATUSES in `env`, which on the CVM is
+   * the parent process's environment and does not carry the runtime config.
+   */
+  allowedTcbStatuses?: readonly string[];
 }): Promise<{ read: () => Promise<ProductionIdentityReadiness> }> {
   const { env } = options;
   if (env.TEE_MODE !== "dstack" || env.TEE_KEYS !== "kms") {
@@ -99,7 +105,8 @@ export async function createProductionIdentityReadiness(options: {
     throw new Error("production identities require QUOTE_VERIFIER=dcap");
   }
 
-  const verifier = options.quoteVerifier ?? quoteVerifierFromEnv(env);
+  const verifier = options.quoteVerifier
+    ?? quoteVerifierFromEnv(options.allowedTcbStatuses ? { ...env, TDX_ALLOWED_TCB_STATUSES: options.allowedTcbStatuses.join(",") } : env);
   const keySource = options.keySource ?? new DstackKeySource({ socketPath: env.DSTACK_SOCKET });
   const providers = await Promise.all(PRODUCTION_IDENTITY_SPECS.map(async (spec) => {
     const provider = options.providerFactory

@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
-pragma solidity ^0.8.28;
+pragma solidity 0.8.28;
 
 import {IMochiVerdicts} from "@mochi/interfaces/IMochiVerdicts.sol";
 import {IQueryEscrow} from "@mochi/interfaces/IQueryEscrow.sol";

@@ -1,132 +1,15 @@
 import { describe, expect, test } from "bun:test";
-import { encodeAbiParameters, keccak256, toHex, type Address, type Hex } from "viem";
-import { privateKeyToAccount } from "viem/accounts";
-import { JurorAttestationDocSchema, passportHash } from "@mochi/protocol";
-import type { AttestationDoc, JurorAttestationDoc } from "@mochi/protocol";
-import { DcapQuoteVerifier, MockQuoteVerifier, MockTeeProvider, PcsCollateralSource, keyBinding, tdxQuoteMeasurement, tdxReportData } from "@mochi/tee";
+import { ContractFunctionExecutionError, ContractFunctionRevertedError, createPublicClient, custom, encodeErrorResult, getAddress, type Address, type Hex } from "viem";
+import type { JurorAttestationDoc } from "@mochi/protocol";
+import { DcapQuoteVerifier, PcsCollateralSource, keyBinding, tdxQuoteMeasurement, tdxReportData } from "@mochi/tee";
+import { JurorRegistryAbi } from "@mochi/chain";
 import { FIXTURE_NOW, bogusFmspcQuote, readFixtureJson, selfSignedChainQuote } from "../../../packages/tee/test/forge-quote.ts";
 import { readFile } from "node:fs/promises";
 import { bytesToHex } from "viem";
 import { Role } from "@mochi/core";
 import { createAttestorApp } from "../src/app.ts";
-import { createAttestor, isSlashable } from "../src/attestor.ts";
-import type { AttestorDeps, ChainPort, Endpoint, Store } from "../src/ports.ts";
-
-const root = privateKeyToAccount(`0x${"11".repeat(32)}`);
-const measurement = `0x${"22".repeat(32)}` as Hex;
-const zero = `0x${"00".repeat(32)}` as Hex;
-
-function provider(seedNum: number, m = measurement) {
-  return new MockTeeProvider({ seed: toHex(new Uint8Array([seedNum])), measurement: m, mockRoot: root });
-}
-
-async function docFor(tee: MockTeeProvider, overrides: Partial<JurorAttestationDoc> = {}, jurorClass = 2, passportOverrides: Record<string, unknown> = {}): Promise<JurorAttestationDoc> {
-  const base = {
-    role: "JUROR",
-    address: tee.signer().address.toLowerCase() as Address,
-    encryptionPubKey: tee.encryptionPublicKey(),
-    measurement: tee.measurement(),
-    jurorClass,
-    quote: await tee.quote(),
-    ...overrides,
-  } as const;
-  const passport = {
-    v: 1,
-    juror: base.address,
-    jurorClass,
-    modelId: "test/model",
-    lineage: "mistral",
-    weightsSha256: `0x${"ab".repeat(32)}`,
-    openWeights: true,
-    provider: "test-provider",
-    zdr: true,
-    tee: base.quote.kind,
-    ...passportOverrides,
-  };
-  const passportSig = await tee.signer().signMessage({ message: { raw: passportHash(passport as never) } });
-  return JurorAttestationDocSchema.parse({ ...base, passport, passportSig });
-}
-
-class FakeStore implements Store {
-  cursor: bigint | null = null;
-  endpoints = new Map<string, Endpoint>();
-  jurors: Parameters<Store["upsertJuror"]>[0][] = [];
-  passports: { key: string; passport: unknown; passportSig: string }[] = [];
-  async getCursor() { return this.cursor; }
-  async setCursor(_name: string, block: bigint) { this.cursor = block; }
-  async getEndpoint(address: string) { return this.endpoints.get(address.toLowerCase()) ?? null; }
-  async upsertEndpoint(address: string, role: number, url: string) {
-    this.endpoints.set(address.toLowerCase(), { address, role, url });
-  }
-  async upsertJuror(row: Parameters<Store["upsertJuror"]>[0]) { this.jurors.push(row); }
-  async setJurorPassport(key: string, passport: JurorAttestationDoc["passport"], passportSig: string) { this.passports.push({ key, passport, passportSig }); }
-}
-
-async function fixture(options: { count?: number; docs?: Map<string, JurorAttestationDoc | AttestationDoc>; unavailable?: Set<string>; block?: bigint; classes?: number[] } = {}) {
-  const store = new FakeStore();
-  const docs = options.docs ?? new Map<string, AttestationDoc>();
-  const unavailable = options.unavailable ?? new Set<string>();
-  const tees: MockTeeProvider[] = [];
-  const keys: Address[] = [];
-  const refreshes: { keys: Address[]; until: bigint }[] = [];
-  const reported: Address[] = [];
-  const fakeJurors = new Map<Address, Awaited<ReturnType<ChainPort["getJuror"]>>>();
-  for (let i = 1; i <= (options.count ?? 1); i++) {
-    const tee = provider(i);
-    const key = tee.signer().address.toLowerCase() as Address;
-    tees.push(tee); keys.push(key);
-    fakeJurors.set(key, {
-      operator: root.address,
-      measurement,
-      role: Role.JUROR,
-      jurorClass: options.classes?.[i - 1] ?? 2,
-      bond: 25_000n,
-      attestedUntil: 0n,
-      delisted: false,
-      served: 9,
-      timeouts: 1,
-    });
-    if (!docs.has(key)) docs.set(key, await docFor(tee, {}, options.classes?.[i - 1] ?? 2));
-    store.endpoints.set(key, { address: key, role: Role.JUROR, url: `http://node-${i}.test` });
-  }
-  const chain: ChainPort = {
-    blockNumber: async () => options.block ?? 100n,
-    getEnrolled: async () => keys.map((key) => ({ key })),
-    getJuror: async (key) => {
-      const juror = fakeJurors.get(key);
-      if (!juror) throw new Error("missing juror");
-      return juror;
-    },
-    isActive: async () => true,
-    measurementAllowed: async (m) => m.toLowerCase() === measurement.toLowerCase(),
-    refreshAttestation: async (batch, until) => {
-      refreshes.push({ keys: [...batch], until });
-      for (const key of batch) { const juror = fakeJurors.get(key); if (juror) fakeJurors.set(key, { ...juror, attestedUntil: until }); }
-      return zero;
-    },
-    reportAttestationFailure: async (key) => { reported.push(key); return zero; },
-  };
-  const http = {
-    fetchAttestation: async (url: string) => {
-      const key = keys[Number(url.split("-").at(-1)?.split(".")[0]) - 1];
-      if (!key) throw new Error("unknown fake endpoint");
-      if (key && unavailable.has(key)) throw new Error("offline");
-      const value = docs.get(key);
-      if (!value) throw new Error("missing doc");
-      return value;
-    },
-  };
-  const deps: AttestorDeps = {
-    chain, http, store, quoteVerifier: new MockQuoteVerifier({ mockRootAddress: root.address }),
-    clock: { nowSeconds: () => 1_700_000_000, nowDate: () => new Date("2023-11-14T22:13:20.000Z") },
-    startBlock: 10n, validitySec: 1_200, maxQuoteAgeSec: 900, adminToken: "secret", dissenterExcludedLineages: ["llama", "qwen"],
-  };
-  return { deps, store, docs, tees, keys, refreshes, reported, fakeJurors };
-}
-
-async function readyFixture(opts: Parameters<typeof fixture>[0] = {}) {
-  return fixture(opts);
-}
+import { classifyRefreshError, createAttestor, isSlashable } from "../src/attestor.ts";
+import { docFor, measurement, provider, readyFixture, root, signedQuote, teeRoot } from "./fixture.ts";
 
 describe("attestor", () => {
   test("refreshes passing keys and writes current juror chain fields", async () => {
@@ -214,16 +97,20 @@ describe("attestor", () => {
     f.docs.set(stale, { ...staleDoc, quote: old });
     f.docs.set(role, { ...f.docs.get(role)!, role: "INTAKE" });
     f.docs.set(klass, { ...f.docs.get(klass)!, jurorClass: 1 });
-    // Only the mismatching key's enrolled measurement is on the allowlist, so its document's 0x22… is not an upgrade.
+    // Only the mismatching key's enrolled measurement is on the allowlist, so its genuine 0x22… quote is not an upgrade.
     f.deps.chain.measurementAllowed = async (m) => m === `0x${"33".repeat(32)}`;
     const attestor = createAttestor(f.deps);
     const first = await attestor.checkAll();
     expect(first.every((r) => !r.ok)).toBe(true);
+    expect(first.map((row) => row.reason)).toEqual([
+      "measurement not allowed", "unexpected reportData", "quote expired or issued in the future", "attestation role mismatch", "juror class mismatch",
+    ]);
     expect(f.refreshes).toHaveLength(0);
-    // A stale quote is a liveness problem: not refreshed, but never reported for slashing.
-    expect(f.reported).toEqual(f.keys.filter((k) => k !== stale));
+    // A stale quote is a liveness problem and a genuine quote of a build outside the allowlist an upgrade-ordering
+    // problem: neither is refreshed, and neither is reported for slashing.
+    expect(f.reported).toEqual(f.keys.filter((k) => k !== stale && k !== mismatch));
     await attestor.checkAll();
-    expect(f.reported).toHaveLength(4);
+    expect(f.reported).toHaveLength(3);
     f.docs.set(mismatch, await docFor(f.tees[0]!));
     f.deps.chain.measurementAllowed = async (m) => m === measurement;
     const getJuror = f.deps.chain.getJuror;
@@ -261,27 +148,16 @@ describe("attestor", () => {
   });
 });
 
-function teeRoot() { return root; }
-
-async function signedQuote(mockRoot: typeof root, m: Hex, reportData: Hex, issuedAt: number) {
-  const signedHash = keccak256(encodeAbiParameters(
-    [{ type: "string" }, { type: "bytes32" }, { type: "bytes32" }, { type: "uint64" }],
-    ["MOCHI_MOCK_QUOTE_V1", m, reportData, BigInt(issuedAt)],
-  ));
-  const rootSig = await mockRoot.signMessage({ message: { raw: signedHash } });
-  const raw = encodeAbiParameters(
-    [{ type: "string" }, { type: "bytes32" }, { type: "bytes32" }, { type: "uint64" }, { type: "bytes" }],
-    ["MOCHI_MOCK_QUOTE_V1", m, reportData, BigInt(issuedAt), rootSig],
-  );
-  return { kind: "mock" as const, measurement: m, reportData, raw, issuedAt };
-}
-
 test("liveness failures are never slashable; verification failures are", () => {
   expect(isSlashable("endpoint unreachable")).toBe(false);
   expect(isSlashable("invalid attestation document")).toBe(false);
   expect(isSlashable("quote expired or issued in the future")).toBe(false);
-  expect(isSlashable("measurement mismatch")).toBe(true);
+  expect(isSlashable("measurement not allowed")).toBe(false);
+  expect(isSlashable("enrolled measurement no longer allowed")).toBe(false);
+  expect(isSlashable("unexpected measurement")).toBe(true);
   expect(isSlashable("invalid mock root signature")).toBe(true);
+  expect(isSlashable("attestation refresh failed")).toBe(false);
+  expect(isSlashable("attestation refresh reverted")).toBe(false);
   expect(isSlashable(null)).toBe(false);
 });
 
@@ -376,6 +252,16 @@ describe("forged PCK chains are slashed before any collateral is fetched", () =>
       expect(isSlashable(reason)).toBe(true);
     }
   });
+
+  test("an Intel CA name the verifier does not know lapses instead of slashing; a missing PCK extension is still slashed", async () => {
+    expect(isSlashable("dcap: PCK CA")).toBe(false);
+    expect(isSlashable("dcap: PCK extension")).toBe(true);
+    const f = await readyFixture({ count: 1 });
+    f.deps.quoteVerifier = { verify: async () => ({ ok: false, reason: "dcap: PCK CA" }) };
+    const [result] = await createAttestor(f.deps).checkAll();
+    expect(result?.reason).toBe("dcap: PCK CA");
+    expect(f.reported).toEqual([]);
+  });
 });
 
 describe("database outages are isolated", () => {
@@ -429,12 +315,12 @@ describe("database outages are isolated", () => {
   });
 });
 
-describe("upgrades: allowlisted measurements re-attest instead of slashing", () => {
+describe("upgrades: allowlisted measurements re-attest; any other genuine build lapses, never slashes", () => {
   const upgraded = `0x${"44".repeat(32)}` as Hex;
   const rogue = `0x${"55".repeat(32)}` as Hex;
   const intakeOnly = `0x${"66".repeat(32)}` as Hex;
 
-  test("a genuine quote at a measurement the registry allows for the role is refreshed, not slashed", async () => {
+  test("a genuine quote at a measurement the registry allows for the role is refreshed; any other build only lapses", async () => {
     const f = await readyFixture({ count: 4 });
     const [upgradedKey, rogueKey, wrongRoleKey, retiredKey] = f.keys as [Address, Address, Address, Address];
     // The registry still records the enrollment measurement (0x22…). Governance allowed the new build for jurors
@@ -450,9 +336,63 @@ describe("upgrades: allowlisted measurements re-attest instead of slashing", () 
     f.docs.set(wrongRoleKey, await docFor(provider(3, intakeOnly)));
     f.docs.set(retiredKey, await docFor(provider(4, retired)));
     const results = await createAttestor(f.deps).checkAll();
-    expect(results.map((row) => row.reason)).toEqual([null, "measurement mismatch", "measurement mismatch", "enrolled measurement no longer allowed"]);
+    expect(results.map((row) => row.reason)).toEqual([null, "measurement not allowed", "measurement not allowed", "enrolled measurement no longer allowed"]);
     expect(f.refreshes.flatMap((batch) => batch.keys)).toEqual([upgradedKey]);
-    expect(f.reported).toEqual([rogueKey, wrongRoleKey]);
+    expect(f.reported).toEqual([]);
+  });
+
+  test("governance removing M_NEW lapses every key running it, whatever measurement it was enrolled with", async () => {
+    const f = await readyFixture({ count: 2 });
+    const [enrolledOld, enrolledNew] = f.keys as [Address, Address];
+    const getJuror = f.deps.chain.getJuror;
+    f.deps.chain.getJuror = async (key) => ({ ...await getJuror(key), measurement: key === enrolledNew ? upgraded : measurement });
+    // Both keys run M_NEW (0x44…); one was enrolled at M_OLD (0x22…) and one at M_NEW.
+    f.docs.set(enrolledOld, await docFor(provider(1, upgraded)));
+    f.docs.set(enrolledNew, await docFor(provider(2, upgraded)));
+    const allowed = new Set([measurement, upgraded]);
+    f.deps.chain.measurementAllowed = async (m) => allowed.has(m.toLowerCase() as Hex);
+    const attestor = createAttestor(f.deps);
+    expect((await attestor.checkAll()).map((row) => row.reason)).toEqual([null, null]);
+    expect(f.refreshes.flatMap((batch) => batch.keys)).toEqual([enrolledOld, enrolledNew]);
+
+    allowed.delete(upgraded);
+    const removed = await attestor.checkAll();
+    expect(removed.map((row) => row.reason)).toEqual(["measurement not allowed", "enrolled measurement no longer allowed"]);
+    expect(removed.every((row) => !isSlashable(row.reason))).toBe(true);
+    expect(f.reported).toEqual([]);
+    expect(f.refreshes).toHaveLength(1);
+  });
+
+  test("deploying M_NEW before it is allowlisted lapses every key without a report, and the allowlist update recovers them", async () => {
+    const f = await readyFixture({ count: 3 });
+    for (const [index, key] of f.keys.entries()) f.docs.set(key, await docFor(provider(index + 1, upgraded)));
+    const allowed = new Set([measurement]);
+    f.deps.chain.measurementAllowed = async (m) => allowed.has(m.toLowerCase() as Hex);
+    const attestor = createAttestor(f.deps);
+    expect((await attestor.checkAll()).map((row) => row.reason)).toEqual(Array(3).fill("measurement not allowed"));
+    expect(f.reported).toEqual([]);
+    expect(f.refreshes).toHaveLength(0);
+    allowed.add(upgraded);
+    expect((await attestor.checkAll()).every((row) => row.ok)).toBe(true);
+    expect(f.refreshes.flatMap((batch) => batch.keys)).toEqual(f.keys);
+  });
+
+  test("the allowlist is consulted with the verified quote's measurement, never the document's unverified claim", async () => {
+    const f = await readyFixture({ count: 2 });
+    const [claimsRogue, staleQuote] = f.keys as [Address, Address];
+    const consulted: Hex[] = [];
+    f.deps.chain.measurementAllowed = async (m) => { consulted.push(m.toLowerCase() as Hex); return m.toLowerCase() === measurement; };
+    // The document names a build outside the allowlist, but its quote cannot be verified (stale): before any
+    // verification nothing is known about the enclave, so this lapses and is not reported.
+    const doc = f.docs.get(staleQuote)! as JurorAttestationDoc;
+    const old = await signedQuote(teeRoot(), rogue, keyBinding(staleQuote, doc.encryptionPubKey as Hex), 1_600_000_000);
+    f.docs.set(staleQuote, { ...doc, measurement: rogue, quote: old });
+    // A verified quote at the enrolled build whose document claims another build misrepresents the enclave.
+    f.docs.set(claimsRogue, { ...(f.docs.get(claimsRogue) as JurorAttestationDoc), measurement: rogue });
+    const results = await createAttestor(f.deps).checkAll();
+    expect(results.map((row) => row.reason)).toEqual(["unexpected measurement", "quote expired or issued in the future"]);
+    expect(consulted).not.toContain(rogue);
+    expect(f.reported).toEqual([claimsRogue]);
   });
 
   test("the quote must still prove the upgraded measurement it claims", async () => {
@@ -490,17 +430,106 @@ describe("refresh transactions are batched, spaced and isolated", () => {
     expect(f.refreshes[1]!.until).toBe(BigInt(now + 1_200));
   });
 
-  test("a reverting batch is split so one key cannot block the others", async () => {
+  test("a NotEnrolled revert drops the key it names and resends the rest at once", async () => {
+    const f = await readyFixture({ count: 5 });
+    const bad = f.keys[3]!;
+    const refresh = f.deps.chain.refreshAttestation;
+    const attempts: Address[][] = [];
+    f.deps.chain.refreshAttestation = async (batch, until) => {
+      attempts.push([...batch]);
+      if (batch.includes(bad)) throw simulatedRevert("NotEnrolled", [bad]);
+      return refresh(batch, until);
+    };
+    const results = await createAttestor(f.deps).checkAll();
+    expect(results.map((row) => row.reason)).toEqual([null, null, null, "attestation refresh reverted", null]);
+    expect(attempts).toEqual([f.keys, f.keys.filter((key) => key !== bad)]);
+    expect(f.reported).toEqual([]);
+  });
+
+  test("a MeasurementNotAllowed revert drops the keys enrolled at that measurement", async () => {
+    const f = await readyFixture({ count: 4 });
+    const removed = `0x${"88".repeat(32)}` as Hex;
+    const [, second, , fourth] = f.keys as [Address, Address, Address, Address];
+    const getJuror = f.deps.chain.getJuror;
+    f.deps.chain.getJuror = async (key) => ({ ...await getJuror(key), measurement: key === second || key === fourth ? removed : measurement });
+    // The allowlist read raced with the removal: the pass saw the measurement as allowed, the simulation does not.
+    f.deps.chain.measurementAllowed = async () => true;
+    for (const key of [second, fourth]) {
+      const doc = f.docs.get(key)! as JurorAttestationDoc;
+      f.docs.set(key, await docFor(provider(f.keys.indexOf(key) + 1, removed), {}, doc.jurorClass));
+    }
+    const refresh = f.deps.chain.refreshAttestation;
+    let attempts = 0;
+    f.deps.chain.refreshAttestation = async (batch, until) => {
+      attempts++;
+      if (batch.includes(second) || batch.includes(fourth)) throw simulatedRevert("MeasurementNotAllowed", [removed, Role.JUROR]);
+      return refresh(batch, until);
+    };
+    const results = await createAttestor(f.deps).checkAll();
+    expect(results.map((row) => row.reason)).toEqual([null, "attestation refresh reverted", null, "attestation refresh reverted"]);
+    expect(attempts).toBe(2);
+  });
+
+  test("a revert that names no key still splits the batch until the failing key is isolated", async () => {
     const f = await readyFixture({ count: 5 });
     const bad = f.keys[3]!;
     const refresh = f.deps.chain.refreshAttestation;
     f.deps.chain.refreshAttestation = async (batch, until) => {
-      if (batch.includes(bad)) throw new Error("execution reverted: NotEnrolled");
+      if (batch.includes(bad)) throw simulatedRevert("BondTooLow", [1n, 2n]);
       return refresh(batch, until);
     };
     const results = await createAttestor(f.deps).checkAll();
-    expect(results.map((row) => row.reason)).toEqual([null, null, null, "attestation refresh failed", null]);
+    expect(results.map((row) => row.reason)).toEqual([null, null, null, "attestation refresh reverted", null]);
     expect(f.refreshes.flatMap((batch) => batch.keys).sort()).toEqual(f.keys.filter((key) => key !== bad).sort());
-    expect(isSlashable("attestation refresh failed")).toBe(false);
+  });
+
+  test("an RPC timeout is retried as a whole batch later: no split, no further sends, no duplicate once it landed", async () => {
+    const f = await readyFixture({ count: 60 });
+    let now = 1_700_000_000;
+    f.deps.clock = { nowSeconds: () => now, nowDate: () => new Date(now * 1_000) };
+    const refresh = f.deps.chain.refreshAttestation;
+    const attempts: number[] = [];
+    let stalled = true;
+    f.deps.chain.refreshAttestation = async (batch, until) => {
+      attempts.push(batch.length);
+      if (stalled) {
+        // The transaction was broadcast and mined, but the receipt wait timed out.
+        await refresh(batch, until);
+        throw new Error("Timed out while waiting for transaction with hash 0xabc to be confirmed.");
+      }
+      return refresh(batch, until);
+    };
+    const attestor = createAttestor(f.deps);
+    const first = await attestor.checkAll();
+    // One send for the first batch of 50; the second batch waits for the next pass instead of queueing another timeout.
+    expect(attempts).toEqual([50]);
+    expect(first.filter((row) => row.reason === "attestation refresh failed")).toHaveLength(60);
+    expect(f.reported).toEqual([]);
+    stalled = false;
+    now += 15;
+    const retry = await attestor.checkAll();
+    // The first 50 already landed, so the retry reads their new attestedUntil and sends only the other 10.
+    expect(attempts).toEqual([50, 10]);
+    expect(retry.every((row) => row.ok)).toBe(true);
+  });
+
+  test("viem errors are classified: a simulated custom-error revert is a revert, transport failures are transient", async () => {
+    const key = `0x${"ab".repeat(20)}` as Address;
+    const revertData = encodeErrorResult({ abi: JurorRegistryAbi, errorName: "NotEnrolled", args: [key] });
+    const simulate = (request: () => Promise<unknown>) => createPublicClient({ transport: custom({ request }, { retryCount: 0 }) }).simulateContract({
+      account: key, address: key, abi: JurorRegistryAbi, functionName: "refreshAttestation", args: [[key], 1n],
+    });
+    const caught = async (request: () => Promise<unknown>) => { try { await simulate(request); } catch (error) { return error; } throw new Error("no error"); };
+    const reverted = classifyRefreshError(await caught(async () => { throw Object.assign(new Error("execution reverted"), { code: 3, data: revertData }); }));
+    expect(reverted).toEqual({ kind: "revert", errorName: "NotEnrolled", args: [getAddress(key)] });
+    expect(classifyRefreshError(await caught(async () => { throw new Error("fetch failed"); }))).toEqual({ kind: "transient" });
+    expect(classifyRefreshError(await caught(async () => { throw Object.assign(new Error("header not found"), { code: -32603 }); }))).toEqual({ kind: "transient" });
+    expect(classifyRefreshError(new Error("refreshAttestation reverted: 0xabc"))).toEqual({ kind: "transient" });
   });
 });
+
+function simulatedRevert(errorName: "NotEnrolled" | "MeasurementNotAllowed" | "BondTooLow", args: readonly unknown[]) {
+  const data = encodeErrorResult({ abi: JurorRegistryAbi, errorName, args } as never);
+  const reverted = new ContractFunctionRevertedError({ abi: JurorRegistryAbi, data, functionName: "refreshAttestation" });
+  return new ContractFunctionExecutionError(reverted, { abi: JurorRegistryAbi, functionName: "refreshAttestation", args: [] });
+}

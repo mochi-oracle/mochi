@@ -12,7 +12,7 @@ import {MochiRoles} from "@mochi/libraries/MochiRoles.sol";
 import {FreezableUSDG, MockEscrow, MockVerdicts, MockRandomness} from "./mocks/PanelMocks.sol";
 
 /// Drives PanelEscalation through random stake / unstake / withdraw / kick / prune / escalate / draw / reseal /
-/// commit / reveal / resolve / appeal / finalize / expireDraw / claim sequences with time and block warps, frozen
+/// commit / abstain / reveal / resolve / appeal / finalize / expireDraw / claim sequences with time and block warps, frozen
 /// recipients, reserve inflows and withdrawals, and minStake changes. It also models the review's attack shapes:
 /// sybil bursts that stake and leave (dead positions), pending draws that nobody draws for a while (held cases keep
 /// their seals frozen), top-ups that try to re-activate a kept position, and a look at each draw's panel once its seed
@@ -60,6 +60,8 @@ contract PanelHandler is Test {
     /// handler call would only revert that call.
     uint256 public ineligibleSeats;
     uint256 public panelMismatches;
+    /// Void panels (two or more abstentions) whose resolve changed any stake.
+    uint256 public voidSlashes;
 
     constructor(PanelEscalation panel_, FreezableUSDG token_, bytes32[] memory queries_) {
         panel = panel_;
@@ -430,11 +432,44 @@ contract PanelHandler is Test {
         for (uint256 i; i < 3; ++i) _reveal(q, c.panelIndex, seats[i]);
     }
 
-    function resolve(uint256 querySeed) external {
-        (bytes32 q,, bool found) = _case(querySeed, VOTING);
+    function _abstain(bytes32 q, address seat) internal {
+        vm.prank(seat);
+        try panel.abstain(q) {
+            ++calls["abstain"];
+        } catch {}
+    }
+
+    /// One seat abstains (if it is still allowed to): alone it is slashed as a non-revealer at resolve.
+    function abstain(uint256 querySeed, uint256 seatSeed) external {
+        (bytes32 q, IPanelEscalation.Case memory c, bool found) = _case(querySeed, VOTING);
         if (!found) return;
+        _abstain(q, panel.panelOf(q, c.panelIndex)[seatSeed % 3]);
+    }
+
+    /// Two seats abstain (materials could not be served to them), which voids the panel at resolve.
+    function abstainTwo(uint256 querySeed, uint256 seatSeed) external {
+        (bytes32 q, IPanelEscalation.Case memory c, bool found) = _case(querySeed, VOTING);
+        if (!found) return;
+        address[3] memory seats = panel.panelOf(q, c.panelIndex);
+        _abstain(q, seats[seatSeed % 3]);
+        _abstain(q, seats[(seatSeed % 3 + 1) % 3]);
+    }
+
+    function resolve(uint256 querySeed) external {
+        (bytes32 q, IPanelEscalation.Case memory c, bool found) = _case(querySeed, VOTING);
+        if (!found) return;
+        uint256 stakedBefore = panel.totalStaked();
         try panel.resolve(q) {
             ++calls["resolve"];
+            // Only a void panel ends in resolve: a first panel as DRAW_EXPIRED, an appeal as FINAL on panel 0.
+            IPanelEscalation.CaseStatus s = panel.getCase(q).status;
+            if (
+                s == IPanelEscalation.CaseStatus.DRAW_EXPIRED
+                    || (c.panelIndex == 1 && s == IPanelEscalation.CaseStatus.FINAL)
+            ) {
+                ++calls["void"];
+                if (panel.totalStaked() != stakedBefore) ++voidSlashes;
+            }
         } catch {}
     }
 
@@ -474,6 +509,7 @@ contract PanelHandler is Test {
 ///   state in a bounded number of steps, after which every evaluator can withdraw and every owed payout can be claimed.
 /// - Every pending draw that can seat a panel still has exactly the eligible positions it counted at its seal, and a
 ///   panel seated after its seed was public is the one that seed fixed.
+/// - A panel voided by two or more abstentions slashes nobody.
 contract PanelEscalationInvariantTest is Test {
     uint256 internal constant DRAW_GAS_BOUND = 1_500_000;
     FreezableUSDG token;
@@ -589,6 +625,11 @@ contract PanelEscalationInvariantTest is Test {
         assertEq(handler.panelMismatches(), 0, "seated panel differs from the one its seed fixed");
     }
 
+    /// Two or more abstentions void a panel without slashing anyone.
+    function invariant_voidPanelsSlashNobody() public view {
+        assertEq(handler.voidSlashes(), 0, "a void panel slashed a stake");
+    }
+
     function invariant_drawCostIsBounded() public view {
         assertLe(handler.maxDrawGas(), DRAW_GAS_BOUND);
     }
@@ -625,6 +666,35 @@ contract PanelEscalationInvariantTest is Test {
         IPanelEscalation.Member memory m = panel.memberOf(e);
         return m.position != 0 && m.joinSeal < d.sealNonce && (m.exitSeal == 0 || m.exitSeal > d.sealNonce)
             && uint256(m.joinTicket) + d.warmup <= c.sealBlock;
+    }
+
+    /// The handler's abstain actions are reachable: a lone abstention is slashed, two void the panel, and the case can
+    /// then be escalated again (all through the handler, as the fuzzer drives it).
+    function test_handlerReachesAbstentionAndVoid() public {
+        handler.escalate(0);
+        bytes32 q = handler.queryAt(0);
+        handler.draw(0);
+        assertEq(uint8(panel.getCase(q).status), uint8(IPanelEscalation.CaseStatus.COMMIT));
+        handler.abstainTwo(0, 0);
+        assertEq(handler.calls("abstain"), 2);
+        handler.resolve(0);
+        assertEq(handler.calls("void"), 1);
+        assertEq(uint8(panel.getCase(q).status), uint8(IPanelEscalation.CaseStatus.DRAW_EXPIRED));
+        handler.escalate(0);
+        handler.draw(0);
+        address[3] memory seats = panel.panelOf(q, 0);
+        handler.abstain(0, 1);
+        handler.commit(0, 0, 1);
+        handler.commit(0, 2, 1);
+        handler.reveal(0, 0);
+        handler.reveal(0, 2);
+        handler.warp(4, 0); // a long step: past the reveal deadline
+        handler.resolve(0);
+        assertEq(handler.calls("void"), 1);
+        assertEq(uint8(panel.getCase(q).status), uint8(IPanelEscalation.CaseStatus.RESOLVED_MAJORITY));
+        assertLt(panel.stakeOf(seats[1]), 100e6, "the lone abstainer is slashed");
+        assertEq(panel.stakeOf(seats[0]), 100e6);
+        assertEq(handler.voidSlashes(), 0);
     }
 
     /// After every sequence: drive each case to a terminal state with permissionless calls only, then show that all

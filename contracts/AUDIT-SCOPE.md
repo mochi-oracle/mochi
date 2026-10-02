@@ -17,10 +17,10 @@ lines (imports and declarations included). These sizes are for this build config
 
 | Contract | nSLOC | Runtime bytes | EIP-170 margin |
 |---|---:|---:|---:|
-| QueryEscrow | 520 | 24,316 | 260 |
+| QueryEscrow | 523 | 24,274 | 302 |
 | MochiVerdicts | 247 | 12,732 | 11,844 |
-| JurorRegistry | 298 | 12,283 | 12,293 |
-| PanelEscalation | 712 | 23,914 | 662 |
+| JurorRegistry | 307 | 12,493 | 12,083 |
+| PanelEscalation | 680 | 21,693 | 2,883 |
 | Feeds | 147 | 7,466 | 17,110 |
 | MochiStaking | 173 | 7,474 | 17,102 |
 | ClerkVoting | 180 | 6,278 | 18,298 |
@@ -97,30 +97,47 @@ claim, and vote-lock sequences. It asserts `totalStaked == Σ stakeOf`, paid plu
 do not exceed notifications, and locked stake cannot be unstaked before expiry for the handler's four actors.
 `test/invariant/EscrowInvariant.t.sol` drives the whole QueryEscrow lifecycle on all four pay paths: USDG, Anonyma
 voucher (bound to the queryId), shielded (mock pool) and feed-budget opens; seal and reseal; VERDICT and HUNG posts
-with random timeout masks through MochiVerdicts; USDG, shielded, voucher and feed expansions; expiry; operator claims;
-float and budget funding; and time and block warps. Each action checks its own money movement exactly (an open or
-expansion moves exactly the quote; a post pays exactly the answering seats' fees and releases exactly the round's
-escrow; an expiry refunds exactly the round's escrow to the path's refund target; a claim pays exactly what was owed).
-The invariants assert that the escrow balance equals Anonyma's float plus the feed budget plus all claimable fees plus
-the current-round escrow of every OPEN or SEALED query, that each query's status and `paid` match the handler's ghost
-state (no transition behind its back), that seat counts match the round, and that every posted verdict ID is unique
-and stored. `test/invariant/JurorRegistryInvariant.t.sol` drives a bonded registry: enrollment, attestation, the
-attestation-failure, equivocation and timeout slashes, service records, exits and withdrawals (including withdrawals
-attempted before the hold ends), pruning, measurement changes, time, and snapshot selection. It asserts that the
-registry's MOCHI equals the sum of bonds, which equals deposits minus withdrawals minus slashes, and that the sink holds
-exactly the slashes. It also asserts that no bond exceeds its deposit, that delisted keys hold no bond, that every pool
-has only its class's JUROR keys with no duplicates, that every key that has not exited or been delisted is still in its
-pool, and that exited or delisted keys are never active. Its selection action checks that each seat is an active,
-distinct, class-correct, non-excluded key inside the snapshot, and that later enrollment and pruning do not move a
-seat. Both suites treat any handler revert as a failure, and each has a scripted test that reaches every action.
+with random timeout masks through MochiVerdicts, also after the query deadline while nobody has expired the round;
+USDG, shielded, voucher and feed expansions, and expansions refused after the deadline; expiry; operator claims; float
+and budget funding; juror attestation lapses and restores (one key or a whole class); and time and block warps, mostly
+short with one call in eight jumping up to two hours. Each action checks its own money movement exactly (an open or
+expansion moves exactly the quote; a post pays exactly the answering seats' fees, releases exactly the round's escrow
+and stamps `lastServedAt`; an expiry refunds exactly the round's escrow to the path's refund target; a claim pays
+exactly what was owed). Every seal is checked seat by seat against `test/utils/SelectionModel.sol`, a reference model
+written from the `selectJurors` spec, which also predicts each `NoEligibleJuror` revert (a lapsed class) that the
+handler then asserts; expansion and reseal must leave a fresh pool snapshot. The invariants assert that the escrow
+balance equals Anonyma's float plus the feed budget plus all claimable fees plus the current-round escrow of every
+OPEN or SEALED query, that each query's status and `paid` match the handler's ghost state (no transition behind its
+back), that seat counts match the round, and that every posted verdict ID is unique and stored.
+`test_randomWalkCoverage` replays a fixed pseudo-random action mix (16 runs × depth 64) and asserts minimum effective
+rates (at least half of post calls and a sixth of expand calls do something, at least one `NoEligibleJuror` seal and
+one late post); it also measures the earlier uniform two-hour warps, which posted 32 of 66 and expanded 11 of 89
+against 41 of 66 and 18 of 89.
+`test/invariant/JurorRegistryInvariant.t.sol` runs the same handler in bonded (permissionless) and zero-bond
+(governor-approved) mode, from 15 live keys and, behind LARGE_A's, 24 keys that joined and lapsed: enrollment,
+attestation and its lapse (one key or a whole class), the attestation-failure, equivocation and timeout slashes,
+service records, exits and withdrawals (including withdrawals attempted before the hold ends), zero-bond approval and
+revocation, governor delisting, pruning, measurement changes, time, and snapshot selection. It asserts that the
+registry's MOCHI equals the sum of bonds, which equals deposits minus withdrawals minus slashes, and that the sink
+holds exactly the slashes; that no bond exceeds its deposit and only a governance delisting leaves a delisted key with
+a bond; that every pool has only its class's JUROR keys with no duplicates and `inPool` set exactly for the keys an
+attestation refresh left active and no prune dropped since (so an unattested key is in no pool); that exited or
+delisted keys are never active; and that the pools a snapshot names never change. Its selection action checks every
+seat, or the exact `NoEligibleJuror` revert, against `SelectionModel`; that enrollment, joining and pruning after the
+seed change nothing; and that one key exiting after the seed changes only what the model says and never gives its
+operator more seats. Prune predicts the keys it drops and asserts `NothingToPrune` when there are none. Expected
+reverts are predicted and asserted inside the handlers, so any other handler revert fails the campaign; each suite has
+a scripted test that reaches every action and both outcomes of selection. A mutation that restores the old 16-draw
+count-based fallback fails every JurorRegistry campaign within the default 128 runs.
 
 Invariant runs and depth come from `contracts/foundry.toml`: the default profile is 128 runs × depth 64, and the `deep`
 profile (`FOUNDRY_PROFILE=deep forge test --match-test '^invariant_'`) is 1,600 runs × depth 64. Suites under
-`test/invariant` no longer cap runs inline. On 2026-10-02 every invariant passed at the deep profile (16 properties:
-102,400 calls each with zero reverts; 92.6 s wall-clock, 232 s CPU). `test/panel/PanelEscalationInvariant.t.sol` no
-longer caps runs inline either; its six properties (now including fixed eligibility of pending draws and seed-fixed
-seated panels, with dead positions and held draws in the handler) passed at the deep profile on 2026-10-02 (102,400
-calls each, zero reverts).
+`test/invariant` no longer cap runs inline. On 2026-10-02 every invariant passed at the deep profile (27 properties:
+102,400 calls each with zero reverts; 207 s wall-clock, 1,139 s CPU, of which each JurorRegistry bond mode took about
+410 s). `test/panel/PanelEscalationInvariant.t.sol` no
+longer caps runs inline either; its seven properties (now including fixed eligibility of pending draws, seed-fixed
+seated panels, and void panels slashing nobody, with dead positions, held draws and abstentions in the handler) passed
+at the deep profile on 2026-10-02 (102,400 calls each, zero reverts).
 
 `test/invariant/ClerkVotingSnapshotPoC.t.sol` is now a regression suite for the ClerkVoting live-stake versus
 proposal-snapshot issue (late or same-timestamp stake has no weight; stake moved after the snapshot gives the
@@ -141,9 +158,10 @@ substitute for stateful invariants:
 
 The test tree contains unit suites for escrow/staking, registry/token/randomness/schema, governance/class mix and clerk
 voting, verdicts/feeds/crosschecks/feed reader, panel escalation, and integration/full-stack flows. The repository
-review log records 104 contract tests green before this audit-prep work. On 2026-10-02 `forge test` passed 245 tests
-across 41 suites with none skipped, including sixteen invariants (three staking, three staking reward-accounting, two
-ClerkVoting snapshot, two escrow lifecycle, two JurorRegistry and four PanelEscalation properties).
+review log records 104 contract tests green before this audit-prep work. On 2026-10-02 `forge test` passed 340 tests
+across 57 suites with none skipped, including 27 invariants (three staking, four staking reward-accounting, three
+staking probe, two ClerkVoting snapshot, two escrow lifecycle, six JurorRegistry (three per bond mode) and seven
+PanelEscalation properties).
 
 ## Known limitations and exclusions
 
@@ -158,8 +176,9 @@ ClerkVoting snapshot, two escrow lifecycle, two JurorRegistry and four PanelEsca
 
 ## Ten areas for the auditor to prioritize
 
-1. QueryEscrow's near-limit 24,316-byte runtime, settlement waterfall, expansion snapshots, and per-path liability
-   accounting (only 260 bytes remain under EIP-170).
+1. QueryEscrow's near-limit 24,274-byte runtime, settlement waterfall, per-ticket juror-pool snapshots (open,
+   expansion, reseal; `openSelection` is each transaction's last call), and per-path liability accounting (only 302
+   bytes remain under EIP-170).
 2. ClerkVoting proposal snapshot semantics, stake locks across overlapping proposals, quorum math, and execution
    against mutable governance targets.
 3. Role handover: DEFAULT_ADMIN/GOVERNOR/guardian separation, timelock ownership, ClerkVoting grants, and the actual
@@ -167,8 +186,11 @@ ClerkVoting snapshot, two escrow lifecycle, two JurorRegistry and four PanelEsca
 4. MochiVerdicts signature domains, answer/vote ordering, timeout masks, status threshold boundary math, and
    equivocation evidence verification.
 5. JurorRegistry enrollment proof-of-possession, attestation refresh/slashing authority, timeout counters, bond
-   withdrawals and the post-service hold, open-time selection snapshots, rehash selection and its exact fallback,
-   and pool pruning.
+   withdrawals and the post-service hold, selection snapshots, rehash selection with a 128-draw budget and no
+   fallback, pool entry on attestation, pool pruning (exits, delisting, lapses past the grace, revoked approvals) and
+   governor delisting. `prunePool` is linear in the pool size (cold, about 35k gas per kept key and 17k per dropped
+   key), so a class pool of more than about 900 keys cannot be pruned in one 32M-gas block; bonded mode needs an
+   incremental prune before it reaches that scale.
 6. PanelEscalation commit/reveal deadlines, reseal, appeals, slash attribution, fee and reserve conservation, and
    handling of zero-reveal/no-majority panels.
 7. MochiStaking reward accumulator precision/remainder behavior, just-in-time staking around notifications, and vote

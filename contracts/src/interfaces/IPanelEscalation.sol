@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
-pragma solidity ^0.8.28;
+pragma solidity 0.8.28;
 
 /// @title IPanelEscalation
 /// @notice HUNG → 3 staked human evaluators. Commit-reveal of (answerHash, payloadHash); 2-of-3 match posts a panel
@@ -25,7 +25,7 @@ interface IPanelEscalation {
         RESOLVED_NO_MAJORITY,
         APPEALED, // unused (second panel progress is DRAWING/COMMIT/REVEAL with panelIndex = 1)
         FINAL, // terminal; a verdict was posted iff the outcome hashes are nonzero
-        DRAW_EXPIRED // terminal for the first panel: nobody drawn by drawDeadline, fee refunded; may be escalated again
+        DRAW_EXPIRED // terminal for the first panel: not drawn, or void; fee refunded; may be escalated again
     }
 
     struct Case {
@@ -81,6 +81,11 @@ interface IPanelEscalation {
     event PayoutOwed(address indexed to, uint256 amount);
     /// @notice A draw call used its attempt budget before seating the panel; the next call continues from here.
     event DrawProgress(bytes32 indexed caseId, uint8 filled, uint256 attempt);
+    /// @notice A seat declared it cannot evaluate the case (for example, the materials could not be served to it).
+    event Abstained(bytes32 indexed caseId, address indexed evaluator);
+    /// @notice Two or more seats abstained: the panel ended without an outcome and nobody was slashed. The fee was
+    ///         refunded; a first panel became DRAW_EXPIRED, an appeal lapsed (the first panel's majority stands).
+    event PanelVoided(bytes32 indexed caseId, uint8 panelIndex, uint256 refund);
 
     error NotEscalatable(bytes32 queryId);
     error DisclosureNotAllowed(bytes32 queryId);
@@ -134,11 +139,19 @@ interface IPanelEscalation {
     ///         still become available before the expiry.
     function expireDraw(bytes32 caseId) external;
     /// @notice commitment = keccak256(abi.encode(caseId, panelIndex, msg.sender, answerHash, payloadHash, salt)).
+    ///         A seat acts once, by commit or abstain, until commitDeadline; once all three acted the case is REVEAL.
     function commit(bytes32 caseId, bytes32 commitment) external;
+    /// @notice A seat of the current panel that has not committed, while the case is COMMIT and until commitDeadline
+    ///         (REVEAL means every seat has acted): records that it cannot evaluate the case. An abstention is never
+    ///         revealed. If at least two of the three seats abstain, resolve voids the panel: nobody is slashed, the
+    ///         fee is refunded, a first panel becomes DRAW_EXPIRED (it may be escalated again) and an appeal lapses
+    ///         like an expired appeal draw. A lone abstainer is a non-revealer and is slashed like one.
+    function abstain(bytes32 caseId) external;
     /// @notice answerHash and payloadHash must be nonzero (MochiVerdicts rejects a zero panel result).
     function reveal(bytes32 caseId, bytes32 answerHash, bytes32 payloadHash, bytes32 salt) external;
     /// @notice Anyone after revealDeadline (or when all 3 revealed). Majority = 2+ identical (answerHash, payloadHash).
-    ///         Non-revealers slashed 10%. Opens a 24h appeal window if a majority exists on panel 0.
+    ///         Non-revealers slashed 10%. Opens a 24h appeal window if a majority exists on panel 0. Once at least two
+    ///         seats abstained, anyone may call it at once: it voids the panel instead (see abstain; PanelVoided).
     function resolve(bytes32 caseId) external;
     /// @notice Payer, within the appeal window after panel 0 resolved with a majority. Pulls panelFee; draws panel 1.
     function appeal(bytes32 caseId) external;

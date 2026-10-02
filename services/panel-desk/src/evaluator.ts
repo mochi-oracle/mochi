@@ -73,6 +73,28 @@ export async function payloadSig(account: SigningAccount, caseId: Hex, panelInde
 
 export function evaluatorSalt(): Hex { return toHex(randomBytes(32)); }
 
+/** The evaluator CLI command that abstains on chain for a case (PanelEscalation.abstain). */
+export function abstainCommand(caseId: Hex): string {
+  if (!/^0x[0-9a-fA-F]{64}$/.test(caseId)) throw new Error("invalid case id");
+  return `bun services/panel-desk/bin/evaluator.ts abstain --case-id ${caseId}`;
+}
+
+/**
+ * What to tell an evaluator whose materials request failed with `code`, or undefined when there is nothing to add.
+ * MATERIALS_UNAVAILABLE is permanent (the intake no longer holds the document): the seat cannot evaluate the case and
+ * should abstain before the commit deadline rather than be slashed for not revealing.
+ */
+export function materialsFailureAdvice(code: string | undefined, caseId: Hex): string | undefined {
+  if (code !== "MATERIALS_UNAVAILABLE") return undefined;
+  return [
+    "The intake can no longer serve this case's document (MATERIALS_UNAVAILABLE). It will not come back, so you cannot evaluate the case.",
+    "Abstain on chain before the commit deadline instead of committing. If at least two of the three seats abstain the panel is void:",
+    "nobody is slashed, the fee is refunded and a new panel may be drawn. A lone abstainer is slashed like a seat that does not reveal.",
+    "",
+    `  ${abstainCommand(caseId)}`,
+  ].join("\n");
+}
+
 /** A private query's payload carries private field values and never leaves the evaluator: refuse to submit it. */
 export function assertPublicPayload(isPublic: boolean): void {
   if (!isPublic) throw new Error("refusing to submit: the query is private, so its payload stays with the evaluator");

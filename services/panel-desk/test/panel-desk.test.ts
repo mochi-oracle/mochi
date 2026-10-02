@@ -6,7 +6,8 @@ import { aad, DispatchPanelResSchema } from "@mochi/protocol";
 import { seal } from "@mochi/tee";
 import { buildPayload, normalizeValue, normalizeParams, resolveSchema } from "@mochi/schemas";
 import { createPanelDeskApp } from "../src/app.ts";
-import { assertPublicPayload, commitment, generateEvaluatorKey, openMaterials, payloadSig, bindKey, buildAnswer } from "../src/evaluator.ts";
+import { abstainCommand, assertPublicPayload, commitment, generateEvaluatorKey, materialsFailureAdvice, openMaterials, payloadSig, bindKey, buildAnswer } from "../src/evaluator.ts";
+import { createIntakeClient } from "../src/adapters/intake.ts";
 import { feedRejection, PanelKeeper } from "../src/keeper.ts";
 import { feedEntry } from "../src/adapters/chain.ts";
 import type { ChainPort, DrawInfo, PanelCase, PanelDeps, Store } from "../src/ports.ts";
@@ -118,6 +119,18 @@ describe("panel evaluator library", () => {
   });
 });
 
+describe("evaluator abstain guidance", () => {
+  test("MATERIALS_UNAVAILABLE tells the evaluator to abstain and gives the command", () => {
+    const advice = materialsFailureAdvice("MATERIALS_UNAVAILABLE", caseId);
+    expect(advice).toContain("Abstain on chain before the commit deadline");
+    expect(advice).toContain("A lone abstainer is slashed");
+    expect(advice).toContain(`bun services/panel-desk/bin/evaluator.ts abstain --case-id ${caseId}`);
+    expect(abstainCommand(caseId)).toBe(`bun services/panel-desk/bin/evaluator.ts abstain --case-id ${caseId}`);
+    for (const code of [undefined, "PANEL_CLOSED", "MATERIALS_REJECTED", "NOT_PANELIST"]) expect(materialsFailureAdvice(code, caseId)).toBeUndefined();
+    expect(() => abstainCommand("0x1234; rm -rf /" as Hex)).toThrow("invalid case id");
+  });
+});
+
 describe("panel API", () => {
   test("serves materials only while the seated panel votes (not while a draw is still choosing seats)", async () => {
     const state = fakes();
@@ -125,6 +138,41 @@ describe("panel API", () => {
     const ask = () => app.request(`/v1/panel/${caseId}/materials`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ evaluator: evaluator.address.toLowerCase(), encryptionPubKey: H(5), keySig: "0x01" }) });
     for (const status of [1, 4, 5, 7, 8]) { state.setCase(baseCase({ status })); expect((await ask()).status).toBe(409); }
     for (const status of [2, 3]) { state.setCase(baseCase({ status })); expect((await ask()).status).toBe(200); }
+  });
+
+  test("passes MATERIALS_UNAVAILABLE and PANEL_CLOSED through from intake; other refusals stay MATERIALS_REJECTED", async () => {
+    const refusal = { code: "", status: 0 };
+    const state = fakes({ intake: { dispatchPanel: async () => { throw Object.assign(new Error("intake returned an error"), refusal); } } });
+    state.setCase(baseCase({ status: 2 }));
+    const app = createPanelDeskApp(state.deps).app;
+    const ask = async () => {
+      const response = await app.request(`/v1/panel/${caseId}/materials`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ evaluator: evaluator.address.toLowerCase(), encryptionPubKey: H(5), keySig: "0x01" }) });
+      return { status: response.status, error: (await response.json() as { error: { code: string; message: string } }).error };
+    };
+    Object.assign(refusal, { code: "MATERIALS_UNAVAILABLE", status: 410 });
+    expect(await ask()).toEqual({ status: 410, error: { code: "MATERIALS_UNAVAILABLE", message: "The case document is no longer available; abstain on chain before the commit deadline" } });
+    Object.assign(refusal, { code: "PANEL_CLOSED", status: 409 });
+    expect(await ask()).toEqual({ status: 409, error: { code: "PANEL_CLOSED", message: "Panel case is not open for evaluation" } });
+    Object.assign(refusal, { code: "BAD_KEY_SIG", status: 403 });
+    expect(await ask()).toEqual({ status: 403, error: { code: "MATERIALS_REJECTED", message: "Materials request was rejected" } });
+    // A known code with an unexpected status is not passed through.
+    Object.assign(refusal, { code: "MATERIALS_UNAVAILABLE", status: 404 });
+    expect((await ask()).error.code).toBe("MATERIALS_REJECTED");
+  });
+
+  test("the intake client keeps the intake's error code", async () => {
+    const realFetch = globalThis.fetch;
+    let body: unknown = { error: { code: "MATERIALS_UNAVAILABLE", message: "ignored" } };
+    globalThis.fetch = (async () => new Response(JSON.stringify(body), { status: 410, headers: { "content-type": "application/json" } })) as unknown as typeof fetch;
+    try {
+      const client = createIntakeClient("http://intake.invalid");
+      const request = { queryId, panelIndex: 0 as const, evaluators: [] };
+      await expect(client.dispatchPanel(request)).rejects.toMatchObject({ status: 410, code: "MATERIALS_UNAVAILABLE" });
+      body = { error: { code: "not a code <script>" } };
+      const error = await client.dispatchPanel(request).catch((e: unknown) => e) as { status: number; code?: string };
+      expect(error.status).toBe(410);
+      expect(error.code).toBeUndefined();
+    } finally { globalThis.fetch = realFetch; }
   });
 
   test("rejects non-panelists and shows public juror split only on public queries", async () => {

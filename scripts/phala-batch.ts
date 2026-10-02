@@ -102,6 +102,10 @@ if (import.meta.main) {
       const registered = await chain.getJuror(identity.address);
       if (!await chain.isActive(identity.address, role) || registered.measurement.toLowerCase() !== identity.measurement.toLowerCase() || registered.operator.toLowerCase() !== identity.operator.toLowerCase()) throw new Error(`enclave is not enrolled and active with the reviewed identity: ${identity.address}`);
       if (role === 1 && registered.jurorClass !== input.jurors.find(j => j.address === identity.address)!.class) throw new Error("juror class mismatch");
+      // A juror joins its class's selection pool at the attestor's first refresh that leaves it active, not at enrollment.
+      if (role === 1 && !await chain.publicClient.readContract({ address: deployment.contracts.jurorRegistry, abi: parseAbi(["function inPool(address) view returns (bool)"]), functionName: "inPool", args: [identity.address] })) {
+        throw new Error(`juror is active but not yet in its selection pool (the attestor's next refresh adds it): ${identity.address}`);
+      }
     }
   }
   console.log(JSON.stringify(batch, null, 2));

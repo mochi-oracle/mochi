@@ -22,6 +22,8 @@ export interface ChainPort {
   panelFee(): Promise<bigint>; usdgApprove(spender: Address, amount: bigint): Promise<Hex>;
   /** QueryEscrow.panel(): zero while panel escalation is off (docs/PANEL-ESCALATION.md). */
   escrowPanel(): Promise<Address>;
+  /** PanelEscalation.getCase(id).status (IPanelEscalation.CaseStatus); 0 when the deployment names no panel. */
+  panelCaseStatus(id: Hex): Promise<number>;
   /** USDG allowance from the account that approves and escalates (the feed runner key) to `spender`. */
   usdgAllowance(spender: Address): Promise<bigint>;
   post(v: VerdictInputArg, votes: JurorVoteArg[], sig: Hex): Promise<Hex>;
@@ -40,8 +42,11 @@ export interface Store {
   insertQuery(query: QueryView & { id: Hex; ts: Date }): Promise<void>;
   setCursor(name: string, block: bigint): Promise<void>;
   getCursor(name: string): Promise<bigint | null>;
-  /** Queries the orchestrator still has work on: DB status not DECIDED / ESCALATED / EXPIRED. */
-  queryIds(): Promise<Hex[]>;
+  /**
+   * Queries the orchestrator still has work on: DB status not DECIDED / ESCALATED / EXPIRED. With `escalatedFeed`
+   * (a panel is configured) also ESCALATED feed queries, whose panel case may need escalating again.
+   */
+  queryIds(options?: { escalatedFeed?: boolean }): Promise<Hex[]>;
   hasVerdict(verdictId: Hex): Promise<boolean>;
   getFeedQuery(id: Hex): Promise<FeedQuery | null>;
   /** Result key for a private query, looked up by its on-chain payerCommit (cannot be overwritten by others). */

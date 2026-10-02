@@ -50,6 +50,22 @@ describe('createAciJuror', () => {
     expect(JSON.stringify(events)).not.toContain('Provider request unavailable');
   });
 
+  test('follows the runtime TCB policy: a reviewed wider list admits those statuses, never Revoked', async () => {
+    const seen: unknown[] = [];
+    const events: unknown[] = [];
+    const reply = (tcbStatus: string) => injected(async (_body, options) => { seen.push(options); return { json: response('{"assessment":"supported"}'), established: { ...established, tcbStatus }, receipt: {} } as never; });
+    const relaxed = (tcbStatus: string) => createAciJuror({ id: 'j', model: 'm', baseUrl: 'https://aci.test/v1', allowedTcbStatuses: ['UpToDate', 'OutOfDate'], onTelemetry: (event) => events.push(event), client: reply(tcbStatus) });
+    expect(await relaxed('OutOfDate').assess(bundle)).toEqual({ assessment: 'supported' });
+    expect(seen[0]).toMatchObject({ allowedTcbStatuses: ['UpToDate', 'OutOfDate'] });
+    expect((seen[0] as { requireUpToDate?: boolean }).requireUpToDate).toBeUndefined();
+    await expect(relaxed('SWHardeningNeeded').assess(bundle)).rejects.toThrow('Provider request unavailable');
+    await expect(relaxed('Revoked').assess(bundle)).rejects.toThrow('Provider request unavailable');
+    expect(events.slice(1)).toMatchObject([{ errorCode: 'TCB_STATUS_NOT_ALLOWED' }, { errorCode: 'TCB_STATUS_NOT_ALLOWED' }]);
+    // The default stays UpToDate only, and an invalid policy is refused at configuration.
+    await expect(createAciJuror({ id: 'j', model: 'm', baseUrl: 'https://aci.test/v1', client: reply('OutOfDate') }).assess(bundle)).rejects.toThrow('Provider request unavailable');
+    for (const bad of [[], ['OutOfDate'], ['UpToDate', 'Revoked']]) expect(() => createAciJuror({ id: 'j', model: 'm', baseUrl: 'https://aci.test/v1', allowedTcbStatuses: bad, client: reply('UpToDate') })).toThrow('Invalid TCB policy');
+  });
+
   test('propagates cancellation to AciClient and isolates telemetry callback failures', async () => {
     let signal: AbortSignal | undefined;
     let telemetryEvent: unknown;

@@ -172,10 +172,18 @@ contract JurorRegistryTest is Test {
         _enroll(key, MochiTypes.JurorClass.LARGE_A, BOND);
         assertEq(token.balanceOf(address(registry)), beforeBal + BOND);
         assertEq(registry.operatorOf(key), OP);
-        assertEq(registry.jurorsOfClass(MochiTypes.JurorClass.LARGE_A)[0], key);
+        // A key joins its pool on its first attestation refresh, not at enrollment.
+        assertEq(registry.jurorsOfClass(MochiTypes.JurorClass.LARGE_A).length, 0);
+        assertFalse(registry.inPool(key));
         assertFalse(registry.isActive(key, MochiTypes.Role.JUROR));
+        vm.expectEmit(address(registry));
+        emit IJurorRegistry.PoolJoined(key, MochiTypes.JurorClass.LARGE_A, 0);
         _attest(key);
         assertTrue(registry.isActive(key, MochiTypes.Role.JUROR));
+        assertEq(registry.jurorsOfClass(MochiTypes.JurorClass.LARGE_A)[0], key);
+        assertTrue(registry.inPool(key));
+        _attest(key); // later refreshes never add it twice
+        assertEq(registry.jurorsOfClass(MochiTypes.JurorClass.LARGE_A).length, 1);
         vm.prank(ADMIN);
         registry.setMeasurement(MEASUREMENT, MochiTypes.Role.JUROR, false);
         assertFalse(registry.isActive(key, MochiTypes.Role.JUROR));
@@ -507,13 +515,16 @@ contract JurorRegistryTest is Test {
         assertEq(current[1], keys[2]);
     }
 
-    /// One active key behind 200 unattested ones: almost every seat goes through the exact fallback, which still
-    /// finds it, and honors exclusion.
-    function testFallbackFindsTheOnlyEligibleKey() public {
+    /// Keys the attestor never vouched for never enter a pool, so they cannot pad it: one active key enrolled behind 200
+    /// unattested ones is the whole pool, and every seat of its class goes to it.
+    function testUnattestedKeysNeverEnterThePool() public {
         vm.prank(ADMIN);
         registry.setMinJurorBond(1 ether);
         for (uint256 i; i < 200; ++i) _enroll(_key(10_000 + i), MochiTypes.JurorClass.DISSENTER, 1 ether);
         address only = _addKeys(MochiTypes.JurorClass.DISSENTER, 1)[0];
+        address[] memory pool = registry.jurorsOfClass(MochiTypes.JurorClass.DISSENTER);
+        assertEq(pool.length, 1);
+        assertEq(pool[0], only);
         bytes32 qid = _snap();
         address[] memory none = new address[](0);
         for (uint256 i; i < 8; ++i) {
@@ -531,8 +542,17 @@ contract JurorRegistryTest is Test {
         address[] memory honest = _addKeys(MochiTypes.JurorClass.LARGE_A, 3);
         vm.prank(ADMIN);
         registry.setMinJurorBond(1 ether);
-        for (uint256 i; i < 30; ++i) _enroll(_key(20_000 + i), MochiTypes.JurorClass.LARGE_A, 1 ether);
+        // Thirty keys that joined on attestation and then lapsed, followed by one active key.
+        uint256 t0 = vm.getBlockTimestamp();
+        address[] memory lapsing = new address[](30);
+        for (uint256 i; i < 30; ++i) {
+            lapsing[i] = _key(20_000 + i);
+            _enroll(lapsing[i], MochiTypes.JurorClass.LARGE_A, 1 ether);
+        }
+        registry.refreshAttestation(lapsing, uint64(t0 + 1 hours));
         address behind = _addKeys(MochiTypes.JurorClass.LARGE_A, 1)[0];
+        vm.warp(t0 + 2 hours);
+        assertEq(registry.jurorsOfClass(MochiTypes.JurorClass.LARGE_A).length, 34);
         bytes32 qid = _snap();
         address[] memory none = new address[](0);
         uint256[4] memory hits;
@@ -587,5 +607,263 @@ contract JurorRegistryTest is Test {
         vm.prank(OP);
         registry.withdrawBond(key);
         assertEq(token.balanceOf(OP), before + BOND);
+    }
+
+    // ───────────── pool entry on attestation, pruning, delisting (review findings 2, 3 and 5) ─────────────
+
+    function _zeroBond(address key) private {
+        vm.startPrank(ADMIN);
+        registry.setMinJurorBond(0);
+        registry.setUnbondedJuror(key, OP);
+        vm.stopPrank();
+    }
+
+    function testPruneDropsKeysLapsedPastTheGraceAndTheyRejoin() public {
+        address[] memory keys = _addKeys(MochiTypes.JurorClass.SMALL_FAST, 3);
+        uint256 t0 = vm.getBlockTimestamp();
+        address[] memory one = new address[](1);
+        one[0] = keys[1];
+        registry.refreshAttestation(one, uint64(t0 + 1 hours)); // keys[1] lapses first
+        uint256 grace = registry.ATTESTATION_GRACE();
+        vm.warp(t0 + 1 hours + grace); // lapsed, but not longer than the grace
+        assertFalse(registry.isActive(keys[1], MochiTypes.Role.JUROR));
+        vm.expectRevert(abi.encodeWithSelector(IJurorRegistry.NothingToPrune.selector, MochiTypes.JurorClass.SMALL_FAST));
+        registry.prunePool(MochiTypes.JurorClass.SMALL_FAST);
+        vm.warp(t0 + 1 hours + grace + 1);
+        (uint256 kept, uint256 removed) = registry.prunePool(MochiTypes.JurorClass.SMALL_FAST);
+        assertEq(kept, 2);
+        assertEq(removed, 1);
+        assertFalse(registry.inPool(keys[1]));
+        assertTrue(registry.inPool(keys[0]) && registry.inPool(keys[2]));
+        // A refresh that leaves it active brings it back, at the end of the current generation.
+        vm.expectEmit(address(registry));
+        emit IJurorRegistry.PoolJoined(keys[1], MochiTypes.JurorClass.SMALL_FAST, 1);
+        _attest(keys[1]);
+        address[] memory pool = registry.jurorsOfClass(MochiTypes.JurorClass.SMALL_FAST);
+        assertEq(pool.length, 3);
+        assertEq(pool[0], keys[0]);
+        assertEq(pool[1], keys[2]);
+        assertEq(pool[2], keys[1]);
+        assertEq(registry.poolAt(MochiTypes.JurorClass.SMALL_FAST, 0).length, 3); // the old generation is untouched
+    }
+
+    /// Finding 5: revoking a zero-bond approval used to leave the key in every future snapshot, with prunePool reverting
+    /// NothingToPrune. Revocation is now prunable, and re-approval plus a refresh restores the seat.
+    function testRevokedZeroBondKeyIsPrunedAndRejoinsAfterReapproval() public {
+        address key = _key(910);
+        address other = _key(911);
+        _zeroBond(key);
+        vm.prank(ADMIN);
+        registry.setUnbondedJuror(other, OP);
+        _enroll(key, MochiTypes.JurorClass.LARGE_B, 0);
+        _enroll(other, MochiTypes.JurorClass.LARGE_B, 0);
+        _attest(key);
+        _attest(other);
+        assertEq(registry.jurorsOfClass(MochiTypes.JurorClass.LARGE_B).length, 2);
+        vm.prank(ADMIN);
+        registry.setUnbondedJuror(key, address(0));
+        assertFalse(registry.isActive(key, MochiTypes.Role.JUROR));
+        (uint256 kept, uint256 removed) = registry.prunePool(MochiTypes.JurorClass.LARGE_B);
+        assertEq(kept, 1);
+        assertEq(removed, 1);
+        address[] memory pool = registry.jurorsOfClass(MochiTypes.JurorClass.LARGE_B);
+        assertEq(pool.length, 1);
+        assertEq(pool[0], other);
+        // A refresh while still revoked does not bring it back.
+        _attest(key);
+        assertFalse(registry.inPool(key));
+        vm.prank(ADMIN);
+        registry.setUnbondedJuror(key, OP);
+        assertTrue(registry.isActive(key, MochiTypes.Role.JUROR));
+        assertFalse(registry.inPool(key)); // active, but selectable only after the attestor's next refresh
+        _attest(key);
+        assertTrue(registry.inPool(key));
+        assertEq(registry.jurorsOfClass(MochiTypes.JurorClass.LARGE_B).length, 2);
+    }
+
+    /// Finding 5: a positive minimum bond turns every zero-bond key inactive at once (the operating rule is to switch only
+    /// while the escrow is paused and drained); those keys are then prunable.
+    function testSwitchingToBondedModeDeactivatesAndPrunesZeroBondKeys() public {
+        address key = _key(920);
+        _zeroBond(key);
+        _enroll(key, MochiTypes.JurorClass.DISSENTER, 0);
+        _attest(key);
+        assertTrue(registry.isActive(key, MochiTypes.Role.JUROR));
+        vm.prank(ADMIN);
+        registry.setMinJurorBond(1 ether);
+        assertFalse(registry.isActive(key, MochiTypes.Role.JUROR));
+        bytes32 qid = _snap();
+        vm.expectRevert(abi.encodeWithSelector(IJurorRegistry.NoEligibleJuror.selector, MochiTypes.JurorClass.DISSENTER));
+        registry.selectJurors(address(this), qid, bytes32(0), 2, 3, new address[](0));
+        (, uint256 removed) = registry.prunePool(MochiTypes.JurorClass.DISSENTER);
+        assertEq(removed, 1);
+    }
+
+    function testGovernorDelistRetiresAKeyWithoutTakingItsBond() public {
+        address[] memory keys = _addKeys(MochiTypes.JurorClass.DOC_SPECIALIST, 2);
+        address key = keys[0];
+        vm.prank(address(0xBAD));
+        vm.expectRevert();
+        registry.delist(key);
+        vm.prank(ADMIN);
+        vm.expectRevert(abi.encodeWithSelector(IJurorRegistry.NotEnrolled.selector, address(0xDEAD)));
+        registry.delist(address(0xDEAD));
+        vm.expectEmit(address(registry));
+        emit IJurorRegistry.Delisted(key, keccak256("GOVERNANCE"));
+        vm.prank(ADMIN);
+        registry.delist(key);
+        assertTrue(registry.getJuror(key).delisted);
+        assertFalse(registry.isActive(key, MochiTypes.Role.JUROR));
+        assertEq(registry.getJuror(key).bond, BOND);
+        // The attestor's batch still goes through: the delisted key is skipped, the others are refreshed.
+        uint64 until = uint64(vm.getBlockTimestamp() + 40 days);
+        uint64 before = registry.getJuror(key).attestedUntil;
+        registry.refreshAttestation(keys, until);
+        assertEq(registry.getJuror(key).attestedUntil, before);
+        assertEq(registry.getJuror(keys[1]).attestedUntil, until);
+        (uint256 kept, uint256 removed) = registry.prunePool(MochiTypes.JurorClass.DOC_SPECIALIST);
+        assertEq(kept, 1);
+        assertEq(removed, 1);
+        // The bond comes back through the normal exit.
+        vm.prank(OP);
+        registry.requestExit(key);
+        vm.warp(vm.getBlockTimestamp() + EXIT_DELAY);
+        uint256 bal = token.balanceOf(OP);
+        vm.prank(OP);
+        registry.withdrawBond(key);
+        assertEq(token.balanceOf(OP), bal + BOND);
+        // A delisted service key stays inactive too.
+        address service = address(0x2233);
+        vm.prank(ADMIN);
+        registry.registerServiceKey(service, OP, MEASUREMENT, MochiTypes.Role.INTAKE);
+        _attest(service);
+        vm.prank(ADMIN);
+        registry.delist(service);
+        assertFalse(registry.isActive(service, MochiTypes.Role.INTAKE));
+    }
+
+    /// Finding 3: the old exact fallback scanned the whole snapshot pool (1,000 dead keys cost 9.72M seal gas; about 3,350
+    /// exceeded a 32M block). Selection now costs at most 128 draws per seat, whatever the pool size.
+    function testSelectionGasIsBoundedWhateverThePoolSize() public {
+        vm.prank(ADMIN);
+        registry.setMinJurorBond(1 ether);
+        uint256 t0 = vm.getBlockTimestamp();
+        uint256 dead = 3_400;
+        address[] memory batch = new address[](200);
+        for (uint256 b; b < dead / 200; ++b) {
+            for (uint256 i; i < 200; ++i) {
+                batch[i] = _key(50_000 + b * 200 + i);
+                _enroll(batch[i], MochiTypes.JurorClass.DISSENTER, 1 ether);
+            }
+            registry.refreshAttestation(batch, uint64(t0 + 1 hours)); // they join, then lapse
+        }
+        address live = _addKeys(MochiTypes.JurorClass.DISSENTER, 1)[0];
+        vm.warp(t0 + 2 hours);
+        assertEq(registry.jurorsOfClass(MochiTypes.JurorClass.DISSENTER).length, dead + 1);
+        bytes32 qid = _snap();
+        address[] memory none = new address[](0);
+        uint256 worst;
+        uint256 found;
+        uint256 reverted;
+        for (uint256 i; i < 6; ++i) {
+            vm.cool(address(registry)); // measure with cold storage, as a seal transaction would see it
+            uint256 g = gasleft();
+            try registry.selectJurors(address(this), qid, keccak256(abi.encode("gas", i)), 2, 3, none) returns (address[] memory p) {
+                assertEq(p[0], live);
+                ++found;
+            } catch (bytes memory reason) {
+                assertEq(bytes4(reason), IJurorRegistry.NoEligibleJuror.selector);
+                ++reverted;
+            }
+            uint256 used = g - gasleft();
+            if (used > worst) worst = used;
+        }
+        emit log_named_uint("worst one-seat selection gas (cold), 3,401-key pool", worst);
+        emit log_named_uint("seeds that found the live key", found);
+        emit log_named_uint("seeds that reverted NoEligibleJuror", reverted);
+        assertLt(worst, 1_500_000); // 128 cold misses; nine seats stay far below a 32M block
+        // Pruning removes the lapsed keys once the grace has passed.
+        vm.warp(t0 + 1 hours + registry.ATTESTATION_GRACE() + 1);
+        (uint256 kept, uint256 removed) = registry.prunePool(MochiTypes.JurorClass.DISSENTER);
+        assertEq(kept, 1);
+        assertEq(removed, dead);
+        bytes32 after_ = _snap();
+        assertEq(registry.selectJurors(address(this), after_, bytes32(0), 2, 3, none)[0], live);
+    }
+
+    /// A seat takes its first eligible draw, so a draw budget that runs out reverts rather than falling back to a scan.
+    function testSelectionMatchesTheDrawSequence(bytes32 seed_) public {
+        vm.prank(ADMIN);
+        registry.setMinJurorBond(1 ether);
+        uint256 t0 = vm.getBlockTimestamp();
+        // 40 keys, about one in eight left active: some seeds need many draws, some exhaust all 128.
+        address[] memory keys = new address[](40);
+        for (uint256 i; i < 40; ++i) {
+            keys[i] = _key(uint256(keccak256(abi.encode("draw-seq", i))));
+            _enroll(keys[i], MochiTypes.JurorClass.LARGE_A, 1 ether);
+        }
+        registry.refreshAttestation(keys, uint64(t0 + 30 days));
+        for (uint256 i; i < 40; ++i) if (uint256(keccak256(abi.encode(seed_, i))) % 8 != 0) _retire(keys[i]);
+        bytes32 qid = _snap();
+        address[] memory none = new address[](0);
+        address expected;
+        for (uint256 attempt; attempt < 128 && expected == address(0); ++attempt) {
+            address candidate = keys[uint256(keccak256(abi.encode(seed_, uint8(0), attempt))) % 40];
+            if (registry.isActive(candidate, MochiTypes.Role.JUROR)) expected = candidate;
+        }
+        if (expected == address(0)) {
+            vm.expectRevert(abi.encodeWithSelector(IJurorRegistry.NoEligibleJuror.selector, MochiTypes.JurorClass.LARGE_A));
+            registry.selectJurors(address(this), qid, seed_, 0, 1, none);
+        } else {
+            assertEq(registry.selectJurors(address(this), qid, seed_, 0, 1, none)[0], expected);
+        }
+    }
+
+    /// Finding 2: exits after the seed is known must not win seats. For every seed and every subset of the attacker's
+    /// keys it could exit, the attacker holds no more seats of a class than with no exit.
+    function testExitsAfterTheSeedNeverGainSeats() public {
+        vm.prank(ADMIN);
+        registry.setMinJurorBond(1 ether);
+        uint256 t0 = vm.getBlockTimestamp();
+        // LARGE_A has two seats in N9 (0 and 5): 40 lapsed keys, 3 honest and 3 attacker keys.
+        address[] memory lapsing = new address[](40);
+        for (uint256 i; i < 40; ++i) {
+            lapsing[i] = _key(uint256(keccak256(abi.encode("exit-grind-dead", i))));
+            _enroll(lapsing[i], MochiTypes.JurorClass.LARGE_A, 1 ether);
+        }
+        registry.refreshAttestation(lapsing, uint64(t0 + 1 hours));
+        _addKeys(MochiTypes.JurorClass.LARGE_A, 3);
+        address[] memory attacker = _addKeys(MochiTypes.JurorClass.LARGE_A, 3);
+        vm.warp(t0 + 2 hours);
+        for (uint8 c = 1; c < 5; ++c) _addKeys(MochiTypes.JurorClass(c), 2);
+        address[] memory none = new address[](0);
+        uint256 baselineSeats;
+        for (uint256 q; q < 24; ++q) {
+            bytes32 qid = _snap();
+            bytes32 seed_ = keccak256(abi.encode("exit-grind", q));
+            uint256 base = _attackerLargeASeats(qid, seed_, attacker, none);
+            baselineSeats += base == type(uint256).max ? 0 : base;
+            for (uint256 subset = 1; subset < 8; ++subset) {
+                uint256 snap = vm.snapshotState();
+                for (uint256 b; b < 3; ++b) if (subset & (1 << b) != 0) _retire(attacker[b]);
+                uint256 got = _attackerLargeASeats(qid, seed_, attacker, none);
+                vm.revertToState(snap);
+                if (got != type(uint256).max) assertLe(got, base == type(uint256).max ? 0 : base, "an exit won a seat");
+            }
+        }
+        emit log_named_uint("attacker LARGE_A seats without exits, 24 queries x 2 seats", baselineSeats);
+    }
+
+    /// Attacker keys among LARGE_A seats 0 and 5 of an N9 selection, or max when it reverts.
+    function _attackerLargeASeats(bytes32 qid, bytes32 seed_, address[] memory attacker, address[] memory none)
+        private
+        view
+        returns (uint256 seats)
+    {
+        try registry.selectJurors(address(this), qid, seed_, 0, 9, none) returns (address[] memory s) {
+            for (uint256 b; b < attacker.length; ++b) if (s[0] == attacker[b] || s[5] == attacker[b]) ++seats;
+        } catch {
+            return type(uint256).max;
+        }
     }
 }

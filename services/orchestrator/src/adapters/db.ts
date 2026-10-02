@@ -1,9 +1,20 @@
-import { eq, notInArray, sql } from "drizzle-orm";
-import { queries, jurorAnswers, verdicts } from "@mochi/db";
+import { and, eq, inArray, notInArray, or, sql, type SQL } from "drizzle-orm";
+import { feedQueries, queries, jurorAnswers, verdicts } from "@mochi/db";
 import { getCursor, setCursor, getFeedQuery, getPayerResultKey, insertJurorAnswer, insertVerdict, storePrivateResult, updateQueryStatus } from "@mochi/db";
 import type { Database } from "@mochi/db";
 import type { Hex } from "viem";
 import type { Store } from "../ports.ts";
+
+/**
+ * Rows the orchestrator lists each tick. Terminal DB statuses (DECIDED 3, ESCALATED 5, EXPIRED 6) are only written after
+ * everything is persisted. With `escalatedFeed`, ESCALATED feed queries are listed too (their panel case may need
+ * escalating again); the orchestrator reads each one's case at most once per backoff period.
+ */
+export function openQueryFilter(escalatedFeed = false): SQL | undefined {
+  const open = notInArray(queries.status, [3, 5, 6]);
+  if (!escalatedFeed) return open;
+  return or(open, and(eq(queries.status, 5), inArray(queries.id, sql`(select ${feedQueries.queryId} from ${feedQueries})`)));
+}
 
 export function createDbAdapter(db: Database): Store {
   return {
@@ -12,9 +23,8 @@ export function createDbAdapter(db: Database): Store {
       await db.insert(queries).values(value).onConflictDoUpdate({ target: queries.id, set: { n: value.n, round: value.round, status: value.status } });
     },
     getCursor: (name) => getCursor(db, name), setCursor: (name, block) => setCursor(db, name, block),
-    async queryIds() {
-      // Terminal DB statuses (DECIDED 3, ESCALATED 5, EXPIRED 6) are only written after everything is persisted.
-      const rows = await db.select({ id: queries.id }).from(queries).where(notInArray(queries.status, [3, 5, 6]));
+    async queryIds(options) {
+      const rows = await db.select({ id: queries.id }).from(queries).where(openQueryFilter(options?.escalatedFeed));
       return rows.map(x => x.id as Hex);
     },
     async hasVerdict(verdictId) {

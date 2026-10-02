@@ -74,6 +74,16 @@ test("production fleet uses 11 unique KMS labels and remains stable across servi
   expect(keyCalls.some((path) => path.includes("operator-override-is-ignored"))).toBe(false);
 });
 
+test("the quote check follows the runtime config's TCB policy, not the parent process's environment", async () => {
+  const { keySource } = makeDeps();
+  const base = { mock, keySource, providerFactory: async () => { throw new Error("verifier accepted"); } };
+  // The parent environment's setting is invalid (Revoked); without an explicit policy it is what the verifier reads.
+  const env = { TEE_MODE: "dstack", TEE_KEYS: "kms", QUOTE_VERIFIER: "dcap", TDX_ALLOWED_TCB_STATUSES: "UpToDate,Revoked" };
+  await expect(createProductionIdentityReadiness({ ...base, env })).rejects.toThrow("must not include Revoked");
+  // The runtime config's list replaces it.
+  await expect(createProductionIdentityReadiness({ ...base, env, allowedTcbStatuses: ["UpToDate", "OutOfDate"] })).rejects.toThrow("verifier accepted");
+});
+
 test("production fleet refuses ephemeral or unverifiable configuration", async () => {
   const { create } = makeDeps();
   const options = {

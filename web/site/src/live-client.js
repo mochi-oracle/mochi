@@ -19,6 +19,70 @@ const rand = size => toHex(crypto.getRandomValues(new Uint8Array(size)));
 const base64 = bytes => { let text=''; for(const byte of bytes) text+=String.fromCharCode(byte); return btoa(text); };
 const unbase64 = text => Uint8Array.from(atob(text), c=>c.charCodeAt(0));
 export const json = value => JSON.stringify(value, (_key,v)=>typeof v==='bigint'?v.toString():v, 2);
+/** Intel TCB statuses a deployment may accept for the intake's quote ("Revoked" never). */
+const TCB_STATUSES = ['UpToDate','SWHardeningNeeded','ConfigurationNeeded','ConfigurationAndSWHardeningNeeded','OutOfDate','OutOfDateConfigurationNeeded'];
+const QUERY_STATUS = ['Unknown','Opened','Jury selected','Decided','HUNG','Escalated','Expired'];
+
+/**
+ * Chain reads while waiting for a verdict: the query and its latest verdict id together, as one batched /rpc request
+ * (2 calls), every POLL_INTERVAL_MS. With receipts polled at the same interval, one paid check costs at most about 120
+ * RPC calls and peaks at about 30 a minute; web/server.ts sizes its /rpc limits from these numbers.
+ */
+export const POLL_INTERVAL_MS = 4000;
+const MAX_BACKOFF_MS = 30_000;
+
+/** The website asked this browser to slow down (HTTP 429). `retryAfterMs` is its Retry-After, when it sent one. */
+export class RateLimitedError extends Error {
+  constructor(retryAfterMs) { super('The service asked to slow down.'); this.name='RateLimitedError'; this.retryAfterMs=retryAfterMs; }
+}
+const retryAfterMs = headers => { const seconds=Number(headers?.get?.('retry-after')); return Number.isFinite(seconds)&&seconds>0?seconds*1000:undefined; };
+/** Throws a RateLimitedError for an HTTP 429 response, so a polling loop backs off instead of failing. */
+export function rejectRateLimited(response) {
+  if(response.status===429) throw new RateLimitedError(retryAfterMs(response.headers));
+  return response;
+}
+/** For a rate-limit refusal (an HTTP 429, directly or wrapped by viem): the wait it asked for in ms (0 if none). Else undefined. */
+export function rateLimitDelay(error) {
+  for(let e=error,depth=0;e&&typeof e==='object'&&depth<8;e=e.cause,depth++) {
+    if(e instanceof RateLimitedError) return e.retryAfterMs??0;
+    if(e.status===429) return retryAfterMs(e.headers)??0;
+  }
+  return undefined;
+}
+export const slowDownMessage = seconds => `The service is busy; checking again in ${seconds} s.`;
+function pause(ms,signal) {
+  return new Promise((resolve,reject)=>{
+    const stop=()=>{clearTimeout(timer);reject(new DOMException('Stopped','AbortError'));};
+    const timer=setTimeout(()=>{signal?.removeEventListener('abort',stop);resolve();},ms);
+    signal?.addEventListener('abort',stop,{once:true});
+  });
+}
+/**
+ * Runs `round` every `interval` ms until it returns something other than undefined (resolving {done:true,value}) or
+ * `deadline` (ms since the epoch) passes ({done:false}). A round refused for rate limiting (HTTP 429) is not an error:
+ * the loop waits for the server's Retry-After, at least twice the previous wait (up to 30 s), tells onBackoff how many
+ * seconds, and carries on. Any other error ends the loop.
+ */
+export async function pollUntil(round,{deadline,signal,onBackoff=()=>{},interval=POLL_INTERVAL_MS}={}) {
+  let backoff=0;
+  while(Date.now()<deadline) {
+    signal?.throwIfAborted();
+    let wait=interval;
+    try {
+      const value=await round();
+      if(value!==undefined) return {done:true,value};
+      backoff=0;
+    } catch(error) {
+      const asked=rateLimitDelay(error);
+      if(asked===undefined) throw error;
+      backoff=Math.min(MAX_BACKOFF_MS,Math.max(asked,backoff*2,interval*2));
+      wait=backoff;
+      onBackoff(Math.ceil(wait/1000));
+    }
+    await pause(Math.min(wait,Math.max(0,deadline-Date.now())),signal);
+  }
+  return {done:false};
+}
 
 export function validateConfig(config) {
   if (!config || ![4663,46630,31337].includes(config.chainId)) throw new Error('A supported deployment is required.');
@@ -29,6 +93,8 @@ export function validateConfig(config) {
   if (!address.test(config.intakeAddress)) throw new Error('An approved intake address is required.');
   if (!Array.isArray(config.jurySizes) || !config.jurySizes.length || config.jurySizes.some(n=>![3,5,7,9].includes(n))) throw new Error('Supported jury sizes are required.');
   if (typeof config.rpcUrl !== 'string' || !config.rpcUrl.startsWith('/rpc')) throw new Error('Use the same-origin read-only RPC endpoint.');
+  const tcb=config.tdxAllowedTcbStatuses;
+  if (tcb!==undefined && (!Array.isArray(tcb) || !tcb.includes('UpToDate') || new Set(tcb).size!==tcb.length || tcb.some(s=>!TCB_STATUSES.includes(s)))) throw new Error('Unsupported Intel TCB policy in the deployment.');
   return config;
 }
 
@@ -60,8 +126,12 @@ export class LiveClient {
     this.config=validateConfig(config); this.fetcher=(input,init)=>fetcher(input,init);
     const rpcUrl = new URL(config.rpcUrl, globalThis.location?.origin ?? 'http://localhost').href;
     this.chain=defineChain({id:config.chainId,name:`Mochi ${config.chainId===4663?'mainnet':'test network'}`,nativeCurrency:{name:'Ether',symbol:'ETH',decimals:18},rpcUrls:{default:{http:[rpcUrl]}}});
-    this.public=publicClient ?? createPublicClient({chain:this.chain,transport:http(rpcUrl)});
-    this.verifier=verifier ?? new DcapQuoteVerifier({collateral:{get:(fmspc,ca)=>this.request(`/api/v1/attestation/collateral/${fmspc}/${ca}`)}});
+    // Reads issued together go out as one JSON-RPC batch (the website accepts up to 20 calls per request); receipts are
+    // polled every POLL_INTERVAL_MS. viem retries a 429 after its Retry-After.
+    this.public=publicClient ?? createPublicClient({chain:this.chain,pollingInterval:POLL_INTERVAL_MS,transport:http(rpcUrl,{batch:{batchSize:20}})});
+    // The intake's quote is checked under the deployment's published Intel TCB policy (default UpToDate only), the
+    // same list the CVM's own checks use.
+    this.verifier=verifier ?? new DcapQuoteVerifier({policy:{allowedStatuses:[...(this.config.tdxAllowedTcbStatuses??['UpToDate'])]},collateral:{get:(fmspc,ca)=>this.request(`/api/v1/attestation/collateral/${fmspc}/${ca}`)}});
   }
   async request(path, body, signal) {
     const response=await this.fetcher(path,{method:body===undefined?'GET':'POST',headers:body===undefined?{}:{'content-type':'application/json'},body:body===undefined?undefined:json(body),signal:signal ?? AbortSignal.timeout(30000),cache:'no-store'});
@@ -152,22 +222,24 @@ export class LiveClient {
       return await send(prepared.escrow,prepared.data,true);
     } catch(error) { throw withPaymentAttempt(error,attempt); }
   }
+  /** The query and its latest verdict id, read together (one batched /rpc request of two calls). */
+  queryStatus(queryId) {
+    return Promise.all([this.read('queryEscrow',QueryEscrowAbi,'getQuery',[queryId]),this.read('verdicts',MochiVerdictsAbi,'latestVerdictOf',[queryId])]);
+  }
   async poll(queryId,{signal,onProgress=()=>{},timeoutMs=180000}={}) {
     if(!hex32.test(queryId)) throw new Error('Invalid query ID.');
-    const deadline=Date.now()+timeoutMs;
-    while(Date.now()<deadline) {
-      signal?.throwIfAborted();
-      const q=await this.read('queryEscrow',QueryEscrowAbi,'getQuery',[queryId]);
-      onProgress(['Unknown','Opened','Jury selected','Decided','HUNG','Escalated','Expired'][Number(q.status)]??'Pending');
+    const outcome=await pollUntil(async()=>{
+      const [q,id]=await this.queryStatus(queryId);
+      onProgress(QUERY_STATUS[Number(q.status)]??'Pending');
       if(Number(q.status)===6) throw new Error('Query expired. Check escrow refunds.');
-      const id=await this.read('verdicts',MochiVerdictsAbi,'latestVerdictOf',[queryId]);
       if(!same(id,zeroHash)) {
-        const response=await this.fetcher(`/api/v1/verdict/${id}`,{signal:signal??AbortSignal.timeout(30000),cache:'no-store'});
+        const response=rejectRateLimited(await this.fetcher(`/api/v1/verdict/${id}`,{signal:signal??AbortSignal.timeout(30000),cache:'no-store'}));
         if(response.ok) return {verdictId:id,queryId,packet:await response.json()};
         if(response.status!==404) throw new Error('Verdict retrieval failed. Retry from the saved query ID.');
       }
-      await new Promise((resolve,reject)=>{ const stop=()=>{clearTimeout(timer);reject(new DOMException('Stopped','AbortError'));}; const timer=setTimeout(()=>{signal?.removeEventListener('abort',stop);resolve();},1500);signal?.addEventListener('abort',stop,{once:true}); });
-    }
+      return undefined;
+    },{deadline:Date.now()+timeoutMs,signal,onBackoff:seconds=>onProgress(slowDownMessage(seconds))});
+    if(outcome.done) return outcome.value;
     throw new Error('Still awaiting a verdict. Resume using the saved query ID; do not pay again.');
   }
   async verifyResult(item,secrets) {

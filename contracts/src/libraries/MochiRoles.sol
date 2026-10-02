@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
-pragma solidity ^0.8.28;
+pragma solidity 0.8.28;
 
 /// @title MochiRoles
 /// @notice AccessControl role ids shared by all Mochi contracts. DEFAULT_ADMIN_ROLE and GOVERNOR_ROLE are held by

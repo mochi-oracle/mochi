@@ -14,9 +14,10 @@ const optionalInteger = (value: unknown) => value === undefined ? undefined : ty
  * entry may also set `attestation` (ACI pins, e.g. ["os:<64 hex>", "compose:<64 hex>"]; when present they are enforced),
  * `dailyCallLimit` and `dailyTokenLimit` (local per-juror budget; defaults: the daily action limit times the juror's
  * provider attempts per action, retries included, and 1.5M tokens), and `usdPerMillionTokens` with `dailySpendLimitUsd`
- * (lowers the token limit to that spend). Invalid values disable the pilot.
+ * (lowers the token limit to that spend). Invalid values disable the pilot. `allowedTcbStatuses` is the Intel TCB
+ * policy for the ACI gateway (on the CVM, the runtime config's tdxAllowedTcbStatuses); default ["UpToDate"].
  */
-export function createClaimsRuntime(env: Record<string, string | undefined> = process.env) {
+export function createClaimsRuntime(env: Record<string, string | undefined> = process.env, options: { allowedTcbStatuses?: readonly string[] } = {}) {
   const disabled = () => createClaimsHandler({ store: new SqlitePublicClaimStore(':memory:') });
   if (env.MOCHI_CLAIMS_MODE !== 'pilot') return disabled();
   let store: SqlitePublicClaimStore | undefined;
@@ -60,7 +61,7 @@ export function createClaimsRuntime(env: Record<string, string | undefined> = pr
       }
       if (transport === 'phala-aci') {
         if (!apiKey) throw new Error('config');
-        return createAciJuror({ id: item.id, model: item.model, baseUrl: item.baseUrl, apiKey, maxOutputTokens: 1400, timeoutMs: 75_000, budget, ...(attestation ? { allowedWorkloads: attestation } : {}) });
+        return createAciJuror({ id: item.id, model: item.model, baseUrl: item.baseUrl, apiKey, maxOutputTokens: 1400, timeoutMs: 75_000, budget, ...(attestation ? { allowedWorkloads: attestation } : {}), ...(options.allowedTcbStatuses ? { allowedTcbStatuses: options.allowedTcbStatuses } : {}) });
       }
       return createChatJuror({ id: item.id, model: item.model, baseUrl: item.baseUrl, apiKey, maxOutputTokens: 1400, timeoutMs: 45_000, budget });
     });

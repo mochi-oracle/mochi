@@ -1,7 +1,7 @@
 import { createPublicClient, createWalletClient, http, type Hex } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
 import { loadDeployment, chainFor, PanelEscalationAbi, QueryEscrowAbi } from "@mochi/chain";
-import { assertPublicPayload, bindKey, commitment, evaluatorSalt, generateEvaluatorKey, payloadSig } from "../src/evaluator.ts";
+import { assertPublicPayload, bindKey, commitment, evaluatorSalt, generateEvaluatorKey, materialsFailureAdvice, payloadSig } from "../src/evaluator.ts";
 
 const args = process.argv.slice(2);
 const command = args[0];
@@ -48,7 +48,13 @@ if (command === "stake") {
   const current = await caseResponse.json() as { panelIndex: number };
   if (current.panelIndex !== panelIndex) throw new Error("panel index is no longer current");
   const response = await fetch(`${baseUrl}/v1/panel/${caseId}/materials`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ evaluator: account.address.toLowerCase(), encryptionPubKey: generated.pubKey, keySig }), signal: AbortSignal.timeout(20_000) });
-  if (!response.ok) throw new Error("materials request failed");
+  if (!response.ok) {
+    const code = ((await response.json().catch(() => ({}))) as { error?: { code?: string } }).error?.code;
+    // Materials that can never be served: tell the evaluator to abstain and print the command.
+    const advice = materialsFailureAdvice(code, caseId);
+    if (advice) { console.error(advice); process.exit(2); }
+    throw new Error(`materials request failed: ${code ?? response.status}`);
+  }
   console.log(JSON.stringify({ ...(await response.json()), evaluatorPrivateKey: generated.privKey }, null, 2));
 } else if (command === "commit") {
   const caseId = required("case-id") as Hex;
@@ -60,6 +66,11 @@ if (command === "stake") {
   const value = commitment(caseId, panelIndex, account.address, answerHash, payloadHash, salt);
   console.log(JSON.stringify({ commitment: value, salt }));
   console.log(await writePanel("commit", [caseId, value]));
+} else if (command === "abstain") {
+  // Instead of committing, before the commit deadline, when the case cannot be evaluated (MATERIALS_UNAVAILABLE).
+  const caseId = required("case-id") as Hex;
+  if (!/^0x[0-9a-fA-F]{64}$/.test(caseId)) throw new Error("invalid --case-id");
+  console.log(await writePanel("abstain", [caseId]));
 } else if (command === "claim") {
   // Only needed when a payout transfer to this evaluator failed and was kept as an owed balance.
   console.log(await writePanel("claim", []));
@@ -79,5 +90,5 @@ if (command === "stake") {
   if (!response.ok) throw new Error(`payload submission failed: ${((await response.json().catch(() => ({}))) as { error?: { code?: string } }).error?.code ?? response.status}`);
   console.log(await response.text());
 } else {
-  throw new Error("usage: evaluator <stake|materials|commit|reveal|submit-payload|claim> [--flags]");
+  throw new Error("usage: evaluator <stake|materials|commit|abstain|reveal|submit-payload|claim> [--flags]");
 }

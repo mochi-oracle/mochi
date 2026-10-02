@@ -65,6 +65,11 @@ export function createChainAdapter(dep: Deployment, orchestratorKey: Hex, feedRu
     panelFee: () => base.publicClient.readContract({ address: dep.contracts.panel, abi: PanelEscalationAbi, functionName: "panelFee" }),
     usdgApprove: (spender, amount) => write(feed, dep.contracts.usdg, erc20, "approve", [spender, amount]),
     escrowPanel: () => base.publicClient.readContract({ address: dep.contracts.queryEscrow, abi: QueryEscrowAbi, functionName: "panel" }),
+    async panelCaseStatus(id) {
+      if (!dep.contracts.panel || /^0x0{40}$/i.test(dep.contracts.panel)) return 0;
+      const c = await base.publicClient.readContract({ address: dep.contracts.panel, abi: PanelEscalationAbi, functionName: "getCase", args: [id] });
+      return Number(c.status);
+    },
     usdgAllowance: (spender) => base.publicClient.readContract({ address: dep.contracts.usdg, abi: erc20, functionName: "allowance", args: [feed.account!.address, spender] }),
     expand: (id, n) => write(feed, dep.contracts.queryEscrow, QueryEscrowAbi, "expand", [id, n]),
     escalate: (id) => write(feed, dep.contracts.panel, PanelEscalationAbi, "escalate", [id]),

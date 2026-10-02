@@ -225,4 +225,5 @@ test("launch inputs require panel escalation off when recorded and offer the N3 
   expect((prepared.runtime.deployment as any).panelEscalation).toBe("off");
   expect(() => validateLaunchConfig(prepared.runtime)).not.toThrow();
   expect((prepared.website as any).jurySizes).toEqual([3]);
+  expect((prepared.website as any).tdxAllowedTcbStatuses).toEqual(prepared.runtime.tdxAllowedTcbStatuses);
 });

@@ -20,6 +20,11 @@ export interface AciJurorOptions {
   /** ACI pinning policy (`os:`/`compose:` pins); see parseAciPolicy in @mochi/aci. */
   allowedWorkloads?: string[];
   /**
+   * Intel TCB statuses accepted for the ACI gateway: the runtime config's tdxAllowedTcbStatuses, the one policy every
+   * DCAP check on the CVM shares. Default ["UpToDate"]; "Revoked" is never accepted.
+   */
+  allowedTcbStatuses?: readonly string[];
+  /**
    * Local daily call/token budget; every provider attempt reserves from it before it is sent. An attempt is refunded
    * only when this juror's client provably never dispatched the inference request (see inferenceDispatchTracker).
    */
@@ -66,7 +71,12 @@ function isAttestationRead(input: Parameters<typeof globalThis.fetch>[0], init?:
   try { return new URL(input).pathname.endsWith('/aci/attestation'); } catch { return false; }
 }
 
+const DEFAULT_TCB_STATUSES = ['UpToDate'] as const;
+const tcbAllowed = (allowed: readonly string[], status: string | undefined) => status !== undefined && status !== 'Revoked' && allowed.includes(status);
+const strictTcb = (allowed: readonly string[]) => allowed.length === 1 && allowed[0] === 'UpToDate';
+
 function buildClient(options: AciJurorOptions, track: (fetch: typeof globalThis.fetch) => typeof globalThis.fetch): AciClient {
+  const allowed = options.allowedTcbStatuses ?? DEFAULT_TCB_STATUSES;
   if (options.client) return typeof options.client === 'function' ? options.client(track) : options.client;
   if (!options.apiKey) throw new TypeError('ACI API key is required');
   let url: URL;
@@ -77,7 +87,8 @@ function buildClient(options: AciJurorOptions, track: (fetch: typeof globalThis.
     apiKey: options.apiKey,
     fetch: track(globalThis.fetch),
     // With an `attestation` policy the gateway must match its os:/compose: pins. Without one, the pilot explicitly
-    // accepts any DCAP-verified, UpToDate TDX gateway (signed receipts and confidential routing are still verified).
+    // accepts any DCAP-verified TDX gateway whose TCB status is allowed (signed receipts and confidential routing are
+    // still verified).
     ...(options.allowedWorkloads ? { allowedWorkloads: options.allowedWorkloads } : { allowUnpinned: true }),
     // Each juror requests exactly its configured model; the signed receipt must name it too.
     allowedModels: [options.model],
@@ -86,7 +97,7 @@ function buildClient(options: AciJurorOptions, track: (fetch: typeof globalThis.
       const attrs = result.tdReport?.tdAttributes;
       // Debug TDs are never accepted by claims, even if the shared verifier's
       // operator setting permits debug measurements for another service.
-      if (result.status !== 'UpToDate' || (attrs?.[0] !== undefined && (attrs[0] & 1) !== 0)) return { ...result, ok: false };
+      if (!tcbAllowed(allowed, result.status) || (attrs?.[0] !== undefined && (attrs[0] & 1) !== 0)) return { ...result, ok: false };
       return result;
     },
   });
@@ -102,6 +113,8 @@ export function createAciJuror(options: AciJurorOptions): Juror {
   if (options.timeoutMs !== undefined && (!Number.isInteger(options.timeoutMs) || options.timeoutMs < 1 || options.timeoutMs > MAX_TIMEOUT_MS)) throw new TypeError('Invalid juror timeout');
   const maxAttempts = options.maxAttempts ?? DEFAULT_ACI_MAX_ATTEMPTS;
   if (!Number.isInteger(maxAttempts) || maxAttempts < 1 || maxAttempts > 5) throw new TypeError('Invalid juror attempt limit');
+  const allowedTcb = options.allowedTcbStatuses ?? DEFAULT_TCB_STATUSES;
+  if (!allowedTcb.length || !allowedTcb.includes('UpToDate') || allowedTcb.includes('Revoked')) throw new TypeError('Invalid TCB policy');
   const tracker = inferenceDispatchTracker();
   const client = buildClient(options, tracker.track);
   // Without a tracked fetch (e.g. a prebuilt client) no attempt can be proven unsent, so none is refunded.
@@ -152,7 +165,9 @@ export function createAciJuror(options: AciJurorOptions): Juror {
           if (options.budget && !hold) throw new ProviderBudgetExceeded();
           const dispatchedBefore = dispatch?.count();
           try {
-            const result = await client.chat(body, { signal, maxResponseBytes: CLAIMS_MAX_RESPONSE_BYTES, requireUpToDate: true });
+            const result = await client.chat(body, strictTcb(allowedTcb)
+              ? { signal, maxResponseBytes: CLAIMS_MAX_RESPONSE_BYTES, requireUpToDate: true }
+              : { signal, maxResponseBytes: CLAIMS_MAX_RESPONSE_BYTES, allowedTcbStatuses: allowedTcb });
             hold?.settle(reportedTotalTokens(reportedClaimUsage(result.json)));
             return result;
           } catch (error) {
@@ -173,7 +188,7 @@ export function createAciJuror(options: AciJurorOptions): Juror {
         attempts = outcome.attempts;
         attemptFailures = outcome.failures;
         const result = outcome.value;
-        if (result.established.tcbStatus !== 'UpToDate') { stage = 'attestation'; errorCode = 'TCB_STATUS_NOT_UP_TO_DATE'; throw new Error('Provider request unavailable'); }
+        if (!tcbAllowed(allowedTcb, result.established.tcbStatus)) { stage = 'attestation'; errorCode = strictTcb(allowedTcb) ? 'TCB_STATUS_NOT_UP_TO_DATE' : 'TCB_STATUS_NOT_ALLOWED'; throw new Error('Provider request unavailable'); }
         stage = 'response_parse';
         usage = reportedClaimUsage(result.json);
         const answer = parseClaimChatResponse(result.json);

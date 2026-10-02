@@ -5,19 +5,24 @@ import { privateKeyToAccount } from 'viem/accounts';
 import { createProductionIdentityReadiness } from '../production-identities/identities.ts';
 import { createIdentityEndpoint } from '../production-identities/http.ts';
 import { DstackKeySource } from '@mochi/tee';
-import { startProductionRuntime, startupFailureReason, PRODUCTION_PORTS } from '../../production/runtime.ts';
+import { launchTdxAllowedTcbStatuses, startProductionRuntime, startupFailureReason, PRODUCTION_PORTS } from '../../production/runtime.ts';
 import { createProductionProxy, createEnrollmentEndpoint, publicProxySettings } from '../../production/public-proxy.ts';
+import { visitorSecretFromEnv } from '../../../services/claims/src/visitor-key.ts';
+import { closeAbandonedConnection } from '../../../services/claims/src/bounded-body.ts';
 import { createFrontHandler } from './front.ts';
+const launchConfig = process.env.MOCHI_PRODUCTION_CONFIG_JSON || undefined;
+// One Intel TCB policy for every DCAP check on this CVM: the runtime config's tdxAllowedTcbStatuses (default UpToDate)
+// also governs the checks this process makes itself, not only the protocol services it starts.
+const allowedTcbStatuses = launchTdxAllowedTcbStatuses(launchConfig);
 const identities = createIdentityEndpoint(() => createProductionIdentityReadiness({
-  env:process.env,
+  env:process.env, allowedTcbStatuses,
   // Required only by the shared factory signature; dstack+kms is enforced before use.
   mock:{seed:`0x${'11'.repeat(32)}`,measurement:`0x${'22'.repeat(32)}`,mockRoot:privateKeyToAccount(`0x${'33'.repeat(32)}`)},
 }));
-const handler = createClaimsRuntime();
+const handler = createClaimsRuntime(process.env, { allowedTcbStatuses });
 const readiness = await handler(new Request('http://localhost/api/claims/config'));
 if (!(await readiness.json() as { enabled: boolean }).enabled) throw new Error('Claims service requires complete protected pilot configuration');
 const revenue = createRevenueStatusReader({ reportPath: process.env.MOCHI_REVENUE_REPORT_FILE, tokenConfigured: process.env.MOCHI_TOKEN_CONFIRMED === 'true' });
-const launchConfig = process.env.MOCHI_PRODUCTION_CONFIG_JSON || undefined;
 const production = await startProductionRuntime(launchConfig, {
   keySource: new DstackKeySource({ socketPath: process.env.DSTACK_SOCKET }),
   artifactDir: process.env.MOCHI_PRODUCTION_RUNTIME_DIR || '/tmp/mochi-runtime',
@@ -27,11 +32,11 @@ const production = await startProductionRuntime(launchConfig, {
 const productionMode = launchConfig ? JSON.parse(launchConfig).mode : 'standby';
 const productionReady = () => production.status === 'running' && productionMode === 'active'
   && Object.keys(production.childhealth).length > 0 && Object.values(production.childhealth).every(status => status === 'healthy');
-// Per-client keys: the website's signed per-visitor header (same invitation token as the website), else the transport
+// Per-client keys: the website's signed per-visitor header (the same visitor secret as the website), else the transport
 // peer; X-Forwarded-For only if the launch config's publicProxy.trustForwardedFor says the ingress appends it.
 const protocol = createProductionProxy({
   ready: productionReady, gatewayPort: PRODUCTION_PORTS.gateway, indexerPort: PRODUCTION_PORTS.indexer,
-  visitorSecret: process.env.MOCHI_CLAIMS_ACCESS_TOKEN, ...publicProxySettings(launchConfig),
+  visitorSecret: visitorSecretFromEnv(process.env), ...publicProxySettings(launchConfig),
 });
 const enrollment = createEnrollmentEndpoint({ready:()=>production.status === 'running',jurorPorts:PRODUCTION_PORTS.jurors});
 const front = createFrontHandler({
@@ -42,7 +47,8 @@ const front = createFrontHandler({
 });
 const server = Bun.serve({
   hostname: '0.0.0.0', port: 8080, idleTimeout: 120, maxRequestBodySize: 1_048_576,
-  fetch: (request, bun) => front(request, bun.requestIP(request)?.address),
+  // A response to an abandoned request body closes its connection within seconds instead of after idleTimeout.
+  fetch: async (request, bun) => closeAbandonedConnection(bun, request, await front(request, bun.requestIP(request)?.address)),
 });
 // Optional worker shares the existing persistent volume; absent config performs no chain or wallet work.
 const workerManifest = process.env.MOCHI_REVENUE_WORKER_MANIFEST;

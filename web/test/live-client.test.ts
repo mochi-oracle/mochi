@@ -1,5 +1,5 @@
 import {test,expect} from 'bun:test';
-import {LiveClient,validateConfig,formatValue} from '../site/src/live-client.js';
+import {LiveClient,validateConfig,formatValue,pollUntil,rateLimitDelay,RateLimitedError,rejectRateLimited,slowDownMessage,POLL_INTERVAL_MS} from '../site/src/live-client.js';
 import {MockTeeProvider,MockQuoteVerifier,signProvenance,seal,open} from '@mochi/tee';
 import {privateKeyToAccount} from 'viem/accounts';
 import {toHex,fromHex,keccak256,zeroHash} from 'viem';
@@ -98,4 +98,52 @@ test('the default fetch is never invoked with the client as this (browsers throw
   expect(await (client as any).fetcher('/api/v1/verdict/x',{})).toBeInstanceOf(Response);
   expect(seen.every(value=>value===undefined||value===globalThis)).toBe(true);
  }finally{globalThis.fetch=original;}
+});
+
+test('polling backs off on HTTP 429 (Retry-After, at least twice the interval, doubling) and stops on other errors',async()=>{
+ const rateLimited=(seconds?:string)=>Object.assign(new Error('ContractFunctionExecutionError'),{cause:Object.assign(new Error('HTTP request failed.'),{status:429,headers:new Headers(seconds===undefined?{}:{'retry-after':seconds})})});
+ expect(rateLimitDelay(rateLimited('3'))).toBe(3000);
+ expect(rateLimitDelay(rateLimited())).toBe(0);
+ expect(rateLimitDelay(new RateLimitedError(1500))).toBe(1500);
+ expect(rateLimitDelay(new Error('boom'))).toBeUndefined();
+ expect(rateLimitDelay(Object.assign(new Error('x'),{status:500}))).toBeUndefined();
+ expect(()=>rejectRateLimited(new Response('{}',{status:429,headers:{'retry-after':'7'}}))).toThrow(RateLimitedError);
+ const ok=new Response('{}');expect(rejectRateLimited(ok)).toBe(ok);
+ const waits:number[]=[];const started=Date.now();let round=0;
+ const outcome=await pollUntil(async()=>{round++;if(round===1)throw new RateLimitedError(30);if(round===2)throw rateLimited();if(round===3)return undefined;return 'done';},{deadline:Date.now()+5000,interval:10,onBackoff:(s:number)=>waits.push(s)});
+ expect(outcome).toEqual({done:true,value:'done'});
+ expect(round).toBe(4);
+ expect(waits).toEqual([1,1]);
+ // 30 ms (Retry-After), then 60 ms (doubled), then one 10 ms interval.
+ expect(Date.now()-started).toBeGreaterThanOrEqual(95);
+ await expect(pollUntil(async()=>{throw new Error('boom')},{deadline:Date.now()+1000,interval:10})).rejects.toThrow('boom');
+ expect(await pollUntil(async()=>undefined,{deadline:Date.now()+30,interval:10})).toEqual({done:false});
+ const controller=new AbortController();setTimeout(()=>controller.abort(),20);
+ await expect(pollUntil(async()=>undefined,{deadline:Date.now()+5000,interval:1000,signal:controller.signal})).rejects.toMatchObject({name:'AbortError'});
+ expect(POLL_INTERVAL_MS).toBeGreaterThanOrEqual(3000);expect(POLL_INTERVAL_MS).toBeLessThanOrEqual(5000);
+});
+
+test('waiting for a verdict reads the query and its verdict id in one batched /rpc request and survives a 429',async()=>{
+ const original=globalThis.fetch;const bodies:any[]=[];
+ globalThis.fetch=(async(url:any,init:any)=>{
+  if(String(url).endsWith('/rpc')){bodies.push(JSON.parse(init.body));return new Response(JSON.stringify({error:'Rate limit exceeded; try again later'}),{status:429,headers:{'retry-after':'0','content-type':'application/json'}});}
+  throw new Error('unexpected fetch '+url);
+ }) as any;
+ try{
+  const client=new LiveClient(config,{verifier:new MockQuoteVerifier({mockRootAddress:root.address})});
+  const progress:string[]=[];
+  await expect(client.poll(h('8'),{timeoutMs:150,onProgress:(p:string)=>progress.push(p)})).rejects.toThrow('Still awaiting a verdict');
+  // viem retried the refused batch a few times after its Retry-After; every request carried both reads.
+  expect(bodies.length).toBeGreaterThan(0);
+  for(const body of bodies){expect(Array.isArray(body)).toBe(true);expect(body).toHaveLength(2);expect(body.every((call:any)=>call.method==='eth_call')).toBe(true);}
+  expect(progress).toEqual([slowDownMessage(8)]);
+ }finally{globalThis.fetch=original;}
+});
+
+test('the intake quote is checked under the deployment\'s published TCB policy, UpToDate only by default',()=>{
+ const strict=new LiveClient(config,{publicClient:{} as any});
+ expect((strict.verifier as any).policy.allowedStatuses).toEqual(['UpToDate']);
+ const relaxed=new LiveClient({...config,tdxAllowedTcbStatuses:['UpToDate','SWHardeningNeeded']},{publicClient:{} as any});
+ expect((relaxed.verifier as any).policy.allowedStatuses).toEqual(['UpToDate','SWHardeningNeeded']);
+ for(const bad of [[],['OutOfDate'],['UpToDate','Revoked'],['UpToDate','UpToDate'],'UpToDate'])expect(()=>validateConfig({...config,tdxAllowedTcbStatuses:bad})).toThrow('TCB policy');
 });

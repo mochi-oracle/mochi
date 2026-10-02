@@ -47,7 +47,9 @@ bun scripts/deploy-local.ts
 ```bash
 bun scripts/e2e-core.ts
 ```
-Full system (every service as a real process, fake model server, local document origin):
+Full system (every service as a real process, fake model server, local document origin). It starts its own anvil on a
+free OS-assigned loopback port and checks that the listener is that anvil before sending anything; `MOCHI_E2E_ANVIL_PORT`
+picks a port explicitly, which must be free and must not be one another local project uses (8545, 18545):
 ```bash
 bun scripts/e2e.ts
 ```
@@ -128,7 +130,9 @@ not yet installed the new microcode or TDX module is rated `OutOfDate` (or `SWHa
 patches it. During that window MOCHI attestations lapse and jurors refuse the gateway: a deliberate outage rather than
 trust in a platform with a published, unpatched vulnerability. Adding statuses keeps the service up through the window
 and accepts those platforms; pair it with `TDX_REJECT_ADVISORIES`. Production sets the list explicitly from the reviewed
-runtime config field `tdxAllowedTcbStatuses` (default `["UpToDate"]`).
+runtime config field `tdxAllowedTcbStatuses` (default `["UpToDate"]`). The claims service applies that list to its own
+checks (the research pilot's ACI gateway and `/production/identities`), and the website publishes its copy, set in
+`MOCHI_WEB_CONFIG_JSON`, in `/mochi-config.json` for the browser's check of the intake's quote.
 
 Intel PCS collateral is cached once per process and, when `SEALED_STORE_DIR` is set, persisted in `dcap-collateral`
 beside it. All services on a host share that directory, and a restart does not need PCS. Entries are refreshed in the

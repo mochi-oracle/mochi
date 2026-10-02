@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
-pragma solidity ^0.8.28;
+pragma solidity 0.8.28;
 
 /// @title ISchemaRegistry
 /// @notice Versioned task schemas. A proposal activates after the timelock delay (24h). Old versions stay valid for

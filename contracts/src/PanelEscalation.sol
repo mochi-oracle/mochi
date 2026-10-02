@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
-pragma solidity ^0.8.28;
+pragma solidity 0.8.28;
 
 import {IPanelEscalation} from "@mochi/interfaces/IPanelEscalation.sol";
 import {IQueryEscrow} from "@mochi/interfaces/IQueryEscrow.sol";
@@ -81,6 +81,8 @@ contract PanelEscalation is IPanelEscalation, AccessControl, ReentrancyGuard {
     mapping(bytes32 => mapping(uint8 => mapping(address => bytes32))) private answerHashes;
     mapping(bytes32 => mapping(uint8 => mapping(address => bytes32))) private payloadHashes;
     mapping(bytes32 => mapping(uint8 => uint256)) private panelSlashAmount;
+    /// Seats of a case's panel that abstained.
+    mapping(bytes32 => mapping(uint8 => uint256)) private abstentions;
     mapping(bytes32 => uint256) private firstPanelFee;
     /// @notice USDG owed to accounts whose direct payout transfer failed; withdrawn with claim().
     mapping(address => uint256) public owed;
@@ -314,36 +316,20 @@ contract PanelEscalation is IPanelEscalation, AccessControl, ReentrancyGuard {
             _drawSteps(caseId, c, d);
             return;
         }
-        uint8 pi = c.panelIndex;
-        uint256 refund = c.fee;
-        delete panels[caseId][pi]; // seats chosen before the draw ended
         _endDraw(d);
-        if (pi == 0) {
-            c.fee = 0;
-            c.status = CaseStatus.DRAW_EXPIRED;
-        } else {
-            // No appeal panel can be drawn: the appeal lapses and the first panel's majority decision stands.
-            c.panelIndex = 0;
-            c.fee = firstPanelFee[caseId];
-            c.status = CaseStatus.RESOLVED_MAJORITY;
-        }
-        emit DrawExpired(caseId, pi, refund);
-        _pay(c.payer, refund);
-        if (pi != 0) _finalize(caseId, c);
+        _lapse(caseId, c, c.panelIndex, false); // also drops the seats chosen before the draw ended
     }
 
     /// @inheritdoc IPanelEscalation
     function commit(bytes32 caseId, bytes32 commitment) external {
-        Case storage c = cases[caseId];
-        if (c.status != CaseStatus.COMMIT && c.status != CaseStatus.REVEAL) revert WrongCaseStatus(c.status);
-        // forge-lint: disable-next-line(block-timestamp)
-        if (block.timestamp > c.commitDeadline) revert WindowClosed();
-        if (!_isPanelist(caseId, c.panelIndex, msg.sender)) revert NotPanelist(msg.sender);
-        if (committed[caseId][c.panelIndex][msg.sender]) revert AlreadyCommitted();
-        commitments[caseId][c.panelIndex][msg.sender] = commitment;
-        committed[caseId][c.panelIndex][msg.sender] = true;
-        if (_allCommitted(caseId, c.panelIndex)) c.status = CaseStatus.REVEAL;
+        commitments[caseId][_act(caseId)][msg.sender] = commitment;
         emit Committed(caseId, msg.sender);
+    }
+
+    /// @inheritdoc IPanelEscalation
+    function abstain(bytes32 caseId) external {
+        ++abstentions[caseId][_act(caseId)];
+        emit Abstained(caseId, msg.sender);
     }
 
     /// @inheritdoc IPanelEscalation
@@ -373,10 +359,12 @@ contract PanelEscalation is IPanelEscalation, AccessControl, ReentrancyGuard {
     }
 
     /// @inheritdoc IPanelEscalation
-    function resolve(bytes32 caseId) external {
+    function resolve(bytes32 caseId) external nonReentrant {
         Case storage c = cases[caseId];
         if (c.status != CaseStatus.COMMIT && c.status != CaseStatus.REVEAL) revert WrongCaseStatus(c.status);
         uint8 pi = c.panelIndex;
+        // With two abstentions no majority can form: the panel is void at once, whatever the third seat does.
+        if (abstentions[caseId][pi] > 1) return _void(caseId, c, pi);
         // forge-lint: disable-next-line(block-timestamp)
         if (!_allRevealed(caseId, pi) && block.timestamp <= c.revealDeadline) revert WindowOpen();
         for (uint256 i; i < 3; ++i) {
@@ -462,24 +450,29 @@ contract PanelEscalation is IPanelEscalation, AccessControl, ReentrancyGuard {
         uint8 pi = c.panelIndex;
         bool post = status == CaseStatus.RESOLVED_MAJORITY;
         c.status = CaseStatus.FINAL;
+        // Zero without a final majority: the splits below then pay every revealer.
+        bytes32 ah = c.outcomeAnswerHash;
+        bytes32 ph = c.outcomePayloadHash;
+        uint256 fee = c.fee;
+        uint256 firstFee = pi == 1 ? firstPanelFee[caseId] : 0;
+        escrowedCaseFees -= fee + firstFee;
         // Trusted callee: MochiVerdicts is immutable here; postPanelOutcome is nonReentrant and only records the
         // verdict and calls QueryEscrow.markDecided. The case is already FINAL.
         // slither-disable-start unused-return -- the returned verdict id is not needed; a failure reverts
         // aderyn-fp-next-line(reentrancy-state-change) trusted immutable callee that cannot call back; case is FINAL
-        if (post) verdicts.postPanelOutcome(caseId, c.outcomeAnswerHash, c.outcomePayloadHash);
+        if (post) verdicts.postPanelOutcome(caseId, ah, ph);
         // slither-disable-end unused-return
-        if (pi == 0) {
-            if (post) _payMajority(caseId, 0, c.fee);
-            else _payRevealersOrPayer(caseId, 0, c.fee, c.payer);
-        } else if (post) {
-            _payMajority(caseId, 1, c.fee);
-            _payFirstPanelOnAppeal(caseId, c.outcomeAnswerHash, c.outcomePayloadHash);
-            _slashFirstPanelLosers(caseId, c.outcomeAnswerHash, c.outcomePayloadHash);
-        } else {
-            _payRevealersOrPayer(caseId, 1, c.fee, c.payer);
-            _payRevealersOrPayer(caseId, 0, firstPanelFee[caseId], c.payer);
+        // The final panel's fee goes to its majority; without one to its revealers, or back to the payer if none.
+        if (!_split(caseId, pi, fee, ah, ph)) _send(c.payer, fee);
+        if (pi == 1) {
+            // The first panel's fee: with a final majority to the first-panel seats that revealed the final outcome,
+            // else to the final majority; without one to the first panel's revealers, or back to the payer if none.
+            if (!_split(caseId, 0, firstFee, ah, ph) && !(post && _split(caseId, 1, firstFee, ah, ph))) {
+                _send(c.payer, firstFee);
+            }
+            if (post) _slashFirstPanelLosers(caseId, ah, ph);
         }
-        _distributeSlashes(caseId, pi, post, c.outcomeAnswerHash, c.outcomePayloadHash);
+        _distributeSlashes(caseId, pi, post, ah, ph);
         if (pi == 1) _closePanel(caseId, 0);
         _closePanel(caseId, pi);
         emit Finalized(caseId, post);
@@ -546,6 +539,57 @@ contract PanelEscalation is IPanelEscalation, AccessControl, ReentrancyGuard {
         c.revealDeadline = c.commitDeadline + revealWindow;
         _endDraw(d);
         emit PanelDrawn(caseId, pi, selected);
+    }
+
+    /// A seat of the current panel acts once, by commit or abstain, until the commit deadline; once all three have
+    /// acted the case is REVEAL (so an abstention is only possible while it is COMMIT). An abstention is never
+    /// revealed.
+    function _act(bytes32 caseId) private returns (uint8 pi) {
+        Case storage c = cases[caseId];
+        if (c.status != CaseStatus.COMMIT && c.status != CaseStatus.REVEAL) revert WrongCaseStatus(c.status);
+        // forge-lint: disable-next-line(block-timestamp)
+        if (block.timestamp > c.commitDeadline) revert WindowClosed();
+        pi = c.panelIndex;
+        if (!_isPanelist(caseId, pi, msg.sender)) revert NotPanelist(msg.sender);
+        if (committed[caseId][pi][msg.sender]) revert AlreadyCommitted();
+        committed[caseId][pi][msg.sender] = true;
+        if (_allCommitted(caseId, pi)) c.status = CaseStatus.REVEAL;
+    }
+
+    /// Two or more seats abstained: the panel is void and nobody is slashed. Its seats are released and their votes
+    /// cleared (a first panel escalated again is drawn afresh under the same panel index), then the panel lapses.
+    function _void(bytes32 caseId, Case storage c, uint8 pi) private {
+        address[3] memory p = panels[caseId][pi];
+        for (uint256 i; i < 3; ++i) {
+            address e = p[i];
+            --openPanels[e];
+            delete committed[caseId][pi][e];
+            delete revealed[caseId][pi][e];
+            delete answerHashes[caseId][pi][e];
+            delete payloadHashes[caseId][pi][e];
+        }
+        delete abstentions[caseId][pi];
+        _lapse(caseId, c, pi, true);
+    }
+
+    /// Ends the current panel without an outcome (its draw ended, or it was void) and refunds its fee to the payer. A
+    /// first panel becomes DRAW_EXPIRED and may be escalated again; an appeal lapses and the first panel's majority
+    /// decision is finalized.
+    function _lapse(bytes32 caseId, Case storage c, uint8 pi, bool voided) private {
+        uint256 refund = c.fee;
+        delete panels[caseId][pi];
+        if (pi == 0) {
+            c.fee = 0;
+            c.status = CaseStatus.DRAW_EXPIRED;
+        } else {
+            c.panelIndex = 0;
+            c.fee = firstPanelFee[caseId];
+            c.status = CaseStatus.RESOLVED_MAJORITY;
+        }
+        if (voided) emit PanelVoided(caseId, pi, refund);
+        else emit DrawExpired(caseId, pi, refund);
+        _pay(c.payer, refund);
+        if (pi != 0) _finalize(caseId, c);
     }
 
     /// Opens a draw for the current panel (escalate, appeal). The deadline and expiry are fixed here; a reseal keeps
@@ -788,74 +832,32 @@ contract PanelEscalation is IPanelEscalation, AccessControl, ReentrancyGuard {
         return (false, 0, 0);
     }
 
-    function _payMajority(bytes32 id, uint8 pi, uint256 amount) private {
-        (bool majority, bytes32 ah, bytes32 ph) = _majority(id, pi);
-        require(majority, "no majority");
-        address[3] storage p = panels[id][pi];
-        // slither-disable-next-line uninitialized-local -- set to the first majority seat below
-        address first;
+    /// Splits `amount` equally among the seats of panel `pi` that revealed (answerHash, payloadHash) = (ah, ph), or
+    /// that revealed at all when ah is zero (a reveal is never zero); the first such seat also gets the remainder.
+    /// Returns false, paying nothing, when no seat qualifies.
+    function _split(bytes32 id, uint8 pi, uint256 amount, bytes32 ah, bytes32 ph) private returns (bool) {
+        address[3] memory p = panels[id][pi];
+        // slither-disable-next-line uninitialized-local -- all false until a seat qualifies below
+        bool[3] memory paid;
         // slither-disable-next-line uninitialized-local -- counter, starts at zero
         uint256 count;
         for (uint256 i; i < 3; ++i) {
-            if (revealed[id][pi][p[i]] && answerHashes[id][pi][p[i]] == ah && payloadHashes[id][pi][p[i]] == ph) {
-                if (first == address(0)) first = p[i];
+            address e = p[i];
+            if (revealed[id][pi][e] && (ah == 0 || (answerHashes[id][pi][e] == ah && payloadHashes[id][pi][e] == ph))) {
+                paid[i] = true;
                 ++count;
             }
         }
+        if (count == 0) return false;
         uint256 each = amount / count;
         uint256 dust = amount % count;
-        _pay(first, each + dust);
         for (uint256 i; i < 3; ++i) {
-            if (
-                p[i] != first && revealed[id][pi][p[i]] && answerHashes[id][pi][p[i]] == ah
-                    && payloadHashes[id][pi][p[i]] == ph
-            ) _pay(p[i], each);
-        }
-    }
-
-    function _payRevealersOrPayer(bytes32 id, uint8 pi, uint256 amount, address payer) private {
-        address[3] storage p = panels[id][pi];
-        // slither-disable-next-line uninitialized-local -- counter, starts at zero
-        uint256 count;
-        for (uint256 i; i < 3; ++i) {
-            if (revealed[id][pi][p[i]]) ++count;
-        }
-        if (count == 0) {
-            _pay(payer, amount);
-            return;
-        }
-        uint256 each = amount / count;
-        uint256 dust = amount % count;
-        bool first = true;
-        for (uint256 i; i < 3; ++i) {
-            if (revealed[id][pi][p[i]]) {
-                _pay(p[i], each + (first ? dust : 0));
-                first = false;
+            if (paid[i]) {
+                _send(p[i], each + dust);
+                dust = 0;
             }
         }
-    }
-
-    function _payFirstPanelOnAppeal(bytes32 id, bytes32 ah, bytes32 ph) private {
-        address[3] storage p = panels[id][0];
-        // slither-disable-next-line uninitialized-local -- counter, starts at zero
-        uint256 count;
-        for (uint256 i; i < 3; ++i) {
-            if (revealed[id][0][p[i]] && answerHashes[id][0][p[i]] == ah && payloadHashes[id][0][p[i]] == ph) ++count;
-        }
-        if (count == 0) {
-            _payMajority(id, 1, firstPanelFee[id]);
-            return;
-        }
-        uint256 amount = firstPanelFee[id];
-        uint256 each = amount / count;
-        uint256 dust = amount % count;
-        bool first = true;
-        for (uint256 i; i < 3; ++i) {
-            if (revealed[id][0][p[i]] && answerHashes[id][0][p[i]] == ah && payloadHashes[id][0][p[i]] == ph) {
-                _pay(p[i], each + (first ? dust : 0));
-                first = false;
-            }
-        }
+        return true;
     }
 
     function _slashFirstPanelLosers(bytes32 id, bytes32 ah, bytes32 ph) private {
@@ -874,25 +876,8 @@ contract PanelEscalation is IPanelEscalation, AccessControl, ReentrancyGuard {
         panelSlashAmount[id][0] = 0;
         if (pi == 1) panelSlashAmount[id][1] = 0;
         slashedPool -= amount;
-        if (!hasMajority) return; // becomes reserve
-        address[3] storage p = panels[id][pi];
-        // slither-disable-next-line uninitialized-local -- counter, starts at zero
-        uint256 count;
-        for (uint256 i; i < 3; ++i) {
-            if (revealed[id][pi][p[i]] && answerHashes[id][pi][p[i]] == ah && payloadHashes[id][pi][p[i]] == ph) {
-                ++count;
-            }
-        }
-        if (count == 0) return;
-        uint256 each = amount / count;
-        uint256 dust = amount % count;
-        bool first = true;
-        for (uint256 i; i < 3; ++i) {
-            if (revealed[id][pi][p[i]] && answerHashes[id][pi][p[i]] == ah && payloadHashes[id][pi][p[i]] == ph) {
-                _send(p[i], each + (first ? dust : 0));
-                first = false;
-            }
-        }
+        // To the final majority; without one the slashes become reserve.
+        if (hasMajority) _split(id, pi, amount, ah, ph);
     }
 
     function _pay(address to, uint256 amount) private {

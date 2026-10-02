@@ -1,15 +1,18 @@
 import { isCrossOriginPost } from '../../services/claims/src/origin.ts';
 import { QuotaLimiter, tooManyRequests, type QuotaRule } from '../../services/claims/src/quota.ts';
 import { TRUSTED_CLIENT_HEADER, forwardedClient, forwardingFacts, keyTagger } from '../../services/claims/src/client-address.ts';
-import { VISITOR_HEADER, visitorKey } from '../../services/claims/src/visitor-key.ts';
-import { BODY_READ_DEADLINE_MS, BodyReadError, readBoundedBody } from '../../services/claims/src/bounded-body.ts';
+import { KEY_CHECK_HEADER, VISITOR_HEADER, visitorKey } from '../../services/claims/src/visitor-key.ts';
+import { BODY_READ_DEADLINE_MS, BodyReadError, abandonedBodyResponse, readBoundedBody } from '../../services/claims/src/bounded-body.ts';
 import { withSecurityHeaders } from '../../services/claims/src/security-headers.ts';
 
 const gatewayGet = /^\/v1\/(?:intake\/attestation|stats|queries\/0x[0-9a-f]{64}|verdict\/0x[0-9a-f]{64}|feeds\/[^/]+\/[^/]+|disagreement(?:\/models)?)$/;
 const gatewayPost = /^\/v1\/(?:intake\/upload|query)$/;
 const indexerGet = /^\/v1\/receipts\/0x[0-9a-f]{64}$/;
-const MAX_BODY = 1_048_576;
-const MiB = 1024 * 1024, HOUR = 3600, DAY = 86_400;
+const KiB = 1024, MiB = 1024 * KiB, HOUR = 3600, DAY = 86_400;
+/** Largest body read per route: an upload envelope, or a query (the gateway's own query cap is 64 KiB). */
+export const PUBLIC_BODY_LIMITS = { '/v1/intake/upload': MiB, '/v1/query': 64 * KiB } as const;
+/** Operator key checks (X-Mochi-Key-Check on /production/status): each is one online guess at the visitor secret. */
+const KEY_CHECK_QUOTAS: QuotaRule[] = [{ scope: 'client', unit: 'requests', limit: 10, windowSec: HOUR }, { scope: 'global', unit: 'requests', limit: 60, windowSec: HOUR }];
 
 /**
  * Public write quotas. Every upload is stored on the CVM disk shared with Postgres and the research pilot (about 1.75
@@ -26,7 +29,8 @@ const MiB = 1024 * 1024, HOUR = 3600, DAY = 86_400;
  *
  * Uploads: a body must arrive whole within BODY_READ_DEADLINE_MS (12 s) before it takes an intake slot; then at most 2
  * per client and 8 in total are processed at once. A body being read holds no slot (a caller that sends one byte a
- * second only spends its own request quota), and at most 64 MiB of request bodies are held in memory at once.
+ * second only spends its own request quota), and at most 64 MiB of request bodies are held in memory at once. Bodies
+ * are capped per route (PUBLIC_BODY_LIMITS): 1 MiB for an upload, 64 KiB for a query.
  */
 export const DEFAULT_PUBLIC_QUOTAS: { upload: QuotaRule[]; query: QuotaRule[]; maxConcurrentUploads: number; maxUploadsPerClient: number; maxBufferedBytes: number } = {
   upload: [
@@ -56,7 +60,7 @@ export type ProductionProxyOptions = {
    * appends the caller's address to every request; otherwise the header is caller-chosen and the peer is used.
    */
   trustForwardedFor?: boolean;
-  /** MOCHI_CLAIMS_ACCESS_TOKEN: checks the website's X-Mochi-Visitor header. Without it the header is ignored. */
+  /** The visitor secret (visitorSecretFromEnv): checks the website's X-Mochi-Visitor header. Without it the header is ignored. */
   visitorSecret?: string;
   /** Client identity override for tests; by default visitor header, then forwarded address (if trusted), then peer. */
   clientKey?: (request: Request, peer?: string) => string;
@@ -89,6 +93,7 @@ export function createProductionProxy(options: ProductionProxyOptions) {
   };
   const clientKey = options.clientKey ?? ((request: Request, peer?: string) => identify(request, peer).key);
   const tag = keyTagger();
+  const keyChecks = new QuotaLimiter(KEY_CHECK_QUOTAS, { now });
   const uploadsByClient = new Map<string, number>();
   let uploadsInFlight = 0, bufferedBytes = 0;
   const handle = async (request: Request, peer?: string): Promise<Response> => {
@@ -106,8 +111,9 @@ export function createProductionProxy(options: ProductionProxyOptions) {
       let body: Uint8Array | undefined;
       if(request.method==='POST') {
         const limiter=limiters[path as keyof typeof limiters];
+        const maxBytes=PUBLIC_BODY_LIMITS[path as keyof typeof PUBLIC_BODY_LIMITS];
         const declared=Number(request.headers.get('content-length')??0);
-        if(declared>MAX_BODY) return error(413,'Request too large');
+        if(declared>maxBytes) return abandonedBodyResponse(error(413,'Request too large'));
         const clientBusy=()=>upload&&(uploadsByClient.get(client)??0)>=quotas.maxUploadsPerClient;
         if(clientBusy()) return error(429,'Too many uploads in progress; try again shortly',{'retry-after':'5'});
         // Charged before the read, so each slow or abandoned body still costs its caller a request.
@@ -115,7 +121,7 @@ export function createProductionProxy(options: ProductionProxyOptions) {
         if(!admission.ok) return tooManyRequests(admission.retryAfterSec);
         // The whole body arrives within the deadline before it is charged or takes an intake slot. A body being read
         // holds no slot, so callers who cannot be told apart do not block each other by sending slowly.
-        body=await readBoundedBody(request,{maxBytes:MAX_BODY,deadlineMs:options.bodyDeadlineMs??BODY_READ_DEADLINE_MS,onChunk:bytes=>{
+        body=await readBoundedBody(request,{maxBytes,deadlineMs:options.bodyDeadlineMs??BODY_READ_DEADLINE_MS,onChunk:bytes=>{
           if(bufferedBytes+bytes>quotas.maxBufferedBytes) throw new BodyReadError(503,'Upload capacity is busy; try again shortly');
           bufferedBytes+=bytes; buffered+=bytes;
         }});
@@ -140,7 +146,8 @@ export function createProductionProxy(options: ProductionProxyOptions) {
       const payload=upload?new Uint8Array(await response.arrayBuffer()):response.body;
       return new Response(payload,{status:response.status,headers:{'content-type':'application/json','cache-control':'no-store'}});
     } catch (caught) {
-      if(caught instanceof BodyReadError) return error(caught.status,caught.message,caught.status===503?{'retry-after':'5'}:{});
+      // A body that was not read to the end: the connection is closed rather than kept (see closeAbandonedConnection).
+      if(caught instanceof BodyReadError) return abandonedBodyResponse(error(caught.status,caught.message,caught.status===503?{'retry-after':'5'}:{}));
       return error(502,'Protocol service unavailable');
     } finally {
       if(heldSlot) uploadsInFlight--;
@@ -152,17 +159,20 @@ export function createProductionProxy(options: ProductionProxyOptions) {
   /**
    * Content-free description of how this caller is keyed, for GET /production/status: where the key came from, a
    * per-process tag of it (equal for two callers exactly when they share limits), what arrived in X-Forwarded-For and
-   * the class of the transport peer, with tags of both. No address, header value or secret.
+   * the class of the transport peer, with tags of both. With an operator's X-Mochi-Key-Check proof, also whether this
+   * server holds the same visitor secret as the sender ("match" or "mismatch"). No address, header value, secret or
+   * anything derived from the secret.
    */
   const clientDiagnostics = (request: Request, peer?: string) => {
     const identity = identify(request, peer);
+    const proof = request.headers.get(KEY_CHECK_HEADER);
     return {
       keySource: identity.source,
       keyTag: tag(identity.key),
       trustForwardedFor: policy.trustForwardedFor,
       ...forwardingFacts(request, peer, tag),
       visitor: visitors ? visitors.verify(request.headers.get(VISITOR_HEADER), now()).status : 'unconfigured',
-      visitorKeyId: visitors?.id ?? null,
+      visitorKeyCheck: !visitors ? 'unconfigured' : proof && !keyChecks.take(identity.key, 'requests').ok ? 'rate_limited' : visitors.checkKey(proof),
     };
   };
   return Object.assign(proxy, { clientDiagnostics });

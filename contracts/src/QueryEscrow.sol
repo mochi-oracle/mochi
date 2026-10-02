@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
-pragma solidity ^0.8.28;
+pragma solidity 0.8.28;
 
 import {IQueryEscrow} from "@mochi/interfaces/IQueryEscrow.sol";
 import {IMochiStaking} from "@mochi/interfaces/IMochiStaking.sol";
@@ -265,11 +265,13 @@ contract QueryEscrow is IQueryEscrow, EIP712, AccessControl, Pausable, Reentranc
         bytes32 provenanceHash = MochiTypes.hashProvenanceCalldata(prov);
         queryId = computeQueryId(msg.sender, prov.docCommit, prov.nonce);
         if (_queries[queryId].status != MochiTypes.QueryStatus.NONE) revert QueryExists(queryId);
+        // slither-disable-next-line unused-return -- err is checked; the third value only details err
         (address signer, ECDSA.RecoverError err,) = ECDSA.tryRecover(_hashTypedDataV4(provenanceHash), intakeSig);
-        // One registry call checks the intake key and fixes this query's juror pools before any of its seeds exists.
-        if (err != ECDSA.RecoverError.NoError || !registry.openSelection(queryId, signer)) revert BadIntakeSignature();
         total = _recordOpen(queryId, p, prov, path, provenanceHash);
         _emitOpened(queryId, path, total);
+        // Interaction last: one registry call checks the intake key and fixes this query's juror pools, in the
+        // transaction that drew the first ticket, so before any seed of the query exists.
+        if (err != ECDSA.RecoverError.NoError || !registry.openSelection(queryId, signer)) revert BadIntakeSignature();
     }
 
     function _recordOpen(
@@ -343,8 +345,7 @@ contract QueryEscrow is IQueryEscrow, EIP712, AccessControl, Pausable, Reentranc
         if (q.status != MochiTypes.QueryStatus.OPEN || !randomness.isExpired(q.sealBlock)) {
             revert WrongStatus(queryId, q.status);
         }
-        q.sealBlock = randomness.nextTicket();
-        emit QueryResealed(queryId, q.round, q.sealBlock);
+        emit QueryResealed(queryId, q.round, _nextTicket(queryId, q));
     }
 
     /// @inheritdoc IQueryEscrow
@@ -427,8 +428,18 @@ contract QueryEscrow is IQueryEscrow, EIP712, AccessControl, Pausable, Reentranc
         q.status = MochiTypes.QueryStatus.OPEN;
         q.paid += total;
         q.deadline = uint64(block.timestamp) + queryTtl;
-        q.sealBlock = randomness.nextTicket();
-        emit QueryExpanded(queryId, q.round, newN, total, q.sealBlock);
+        emit QueryExpanded(queryId, q.round, newN, total, _nextTicket(queryId, q));
+    }
+
+    /// @dev Every ticket after the open's: draw it, then (the interaction last) re-snapshot the juror pools in the same
+    ///      transaction, so (as at open) they are fixed before the round's seed can be known, and the round can seat keys
+    ///      that joined since the last ticket (e.g. a replacement for a key that left).
+    function _nextTicket(bytes32 queryId, MochiTypes.Query storage q) private returns (uint64 ticket) {
+        // aderyn-fp-next-line(reentrancy-state-change) STATICCALL to an immutable protocol contract; cannot reenter
+        ticket = randomness.nextTicket();
+        q.sealBlock = ticket;
+        // slither-disable-next-line unused-return -- no intake key here (open checks it); only the snapshot is wanted
+        registry.openSelection(queryId, address(0));
     }
 
     /// @inheritdoc IQueryEscrow

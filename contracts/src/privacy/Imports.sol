@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
-pragma solidity ^0.8.28;
+pragma solidity 0.8.28;
 
 // Import deployment artifacts from the vendored, unmodified 0xbow contracts.
 import {Entrypoint} from "ppcore/contracts/Entrypoint.sol";

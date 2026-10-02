@@ -2,7 +2,7 @@
 // Flows: (A) public query via the gateway, (B) private FREEFORM query with a sealed result, (C) a standing feed query
 // fetched by the intake enclave that HANGs at N=3, is auto-expanded to N=5, reaches a VERDICT and updates
 // corp-actions.split@RHC through the on-chain crosscheck.
-// Prereqs: anvil on :8545, TimescaleDB on :55432 (see README). Usage: bun scripts/e2e.ts
+// Prereqs: Foundry's anvil (the harness starts its own) and TimescaleDB on :55432 (see README). Usage: bun scripts/e2e.ts
 import { spawn, type Subprocess } from "bun";
 import { existsSync, mkdirSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
@@ -26,13 +26,29 @@ import { bindKey, buildAnswer, commitment, generateEvaluatorKey, openMaterials, 
 import * as A from "@mochi/chain";
 import { chainFor, drandRoundMessage, type Deployment } from "@mochi/chain";
 import { DEV_KEYS } from "./deploy-local.ts";
+import { RESERVED_PORTS, freePort, listenerPids } from "./launch-ops/anvil-harness.ts";
 
 const ROOT = join(import.meta.dir, "..");
 const RUN = process.env.MOCHI_E2E_RUN_DIR ?? join(ROOT, ".e2e");
-// The harness runs its own anvil (fresh chain + clock every run) on a dedicated port.
-// MOCHI_E2E_ANVIL_PORT moves it off the default when another local node (e.g. a Hardhat node) already uses that port.
-const ANVIL_PORT = Number(process.env.MOCHI_E2E_ANVIL_PORT ?? 18545);
-const RPC = `http://127.0.0.1:${ANVIL_PORT}`;
+// The harness runs its own anvil (fresh chain + clock every run) on an OS-assigned free loopback port: other local
+// projects run nodes on fixed ports (e.g. a Hardhat node on 18545), so there is no default port. MOCHI_E2E_ANVIL_PORT
+// picks one explicitly; it must not be reserved or already listening. Before anything is sent, the listener must be the
+// anvil this harness spawned. Both are set in main().
+let ANVIL_PORT = 0;
+let RPC = "";
+
+/** The port for the harness's anvil: a free OS-assigned one, or MOCHI_E2E_ANVIL_PORT if nothing listens there. */
+async function anvilPort(): Promise<number> {
+  const requested = process.env.MOCHI_E2E_ANVIL_PORT;
+  if (requested === undefined || requested === "") return freePort();
+  const port = Number(requested);
+  if (!Number.isInteger(port) || port < 1024 || port > 65_535) throw new Error(`MOCHI_E2E_ANVIL_PORT is not a usable port: ${requested}`);
+  if (RESERVED_PORTS.has(port)) throw new Error(`port ${port} belongs to another local project; unset MOCHI_E2E_ANVIL_PORT to use a free port`);
+  const listeners = listenerPids(port);
+  if (listeners === undefined) throw new Error("lsof is unavailable, so an explicit MOCHI_E2E_ANVIL_PORT cannot be checked; unset it to use a free port");
+  if (listeners.length > 0) throw new Error(`port ${port} already has a listener (pid ${listeners.join(", ")}); the harness only talks to the anvil it starts`);
+  return port;
+}
 const PG_ADMIN = process.env.MOCHI_E2E_PG_ADMIN ?? "postgres://mochi:mochi@127.0.0.1:55432/mochi";
 const DB_URL = process.env.MOCHI_E2E_DATABASE_URL ?? "postgres://mochi:mochi@127.0.0.1:55432/mochi_e2e";
 const DEPLOYMENT = join(RUN, "deployment.json");
@@ -181,16 +197,29 @@ async function main() {
     mkdirSync(RUN, { recursive: true });
   }
 
+  ANVIL_PORT = await anvilPort();
+  RPC = `http://127.0.0.1:${ANVIL_PORT}`;
   // Preflight: the harness owns these ports; fail fast (instead of timing out) if a stale run still holds one.
-  for (const port of [ANVIL_PORT, ...Object.values(PORTS).filter((p) => p !== PORTS.jurorBase), ...Array.from({ length: 10 }, (_, i) => PORTS.jurorBase + i)]) {
+  for (const port of [...Object.values(PORTS).filter((p) => p !== PORTS.jurorBase), ...Array.from({ length: 10 }, (_, i) => PORTS.jurorBase + i)]) {
     const busy = await fetch(`http://127.0.0.1:${port}/`).then(() => true, () => false);
     if (busy) throw new Error(`port ${port} is in use — stale e2e processes? (pkill -f "bun src/main.ts")`);
   }
   for (const sig of ["SIGINT", "SIGTERM"] as const) process.on(sig, () => { for (const p of procs) p.kill(); process.exit(130); });
   console.log(`0. Fresh anvil, deploy contracts, fresh database (randomness: ${RANDOMNESS_MODE})`);
-  procs.push(spawn(["anvil", "--silent", "--host", "127.0.0.1", "--port", String(ANVIL_PORT), "--hardfork", "prague"], { stdout: "ignore", stderr: "ignore" }));
+  const anvil = spawn(["anvil", "--silent", "--host", "127.0.0.1", "--port", String(ANVIL_PORT), "--hardfork", "prague"], { stdout: "ignore", stderr: "ignore" });
+  procs.push(anvil);
+  // Never deploy to or send through a node this harness did not start (a Hardhat node also reports chain id 31337):
+  // the only listener on the port must be the anvil spawned above, and it must say it is anvil.
+  await until("anvil listening", async () => {
+    if (anvil.exitCode !== null) throw new Error("anvil exited");
+    const pids = listenerPids(ANVIL_PORT);
+    return pids === undefined || pids.includes(anvil.pid);
+  }, 20_000);
+  const pids = listenerPids(ANVIL_PORT);
+  if (anvil.exitCode !== null || (pids !== undefined && (pids.length !== 1 || pids[0] !== anvil.pid))) {
+    throw new Error(`port ${ANVIL_PORT} is not served by the harness's anvil (listeners ${JSON.stringify(pids)}, ours ${anvil.pid}); nothing sent`);
+  }
   await until("anvil up", async () => (await createPublicClient({ transport: http(RPC) }).getChainId()) === 31337, 20_000);
-  // Never deploy to or send through a node this harness did not start: a Hardhat node also reports chain id 31337.
   const client = String(await createPublicClient({ transport: http(RPC) }).request({ method: "web3_clientVersion" as never }));
   if (!client.toLowerCase().startsWith("anvil")) throw new Error(`the node on port ${ANVIL_PORT} is not the harness's anvil`);
   if (RANDOMNESS_MODE === "drand") {

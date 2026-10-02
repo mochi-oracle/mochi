@@ -7,7 +7,7 @@ import { QueryStatus, SchemaId } from '@mochi/core';
 import { zeroHash } from 'viem';
 import { normalizeParams, paramsHash, resolveSchema } from '@mochi/schemas';
 import { PaymentNotSentError, createProtocolClient, loadProtocolConfig, parseClaimRecovery, payForClaimReview, preparePaidClaimReview, waitForPaidClaimReview } from '../site/src/claim-protocol-client.js';
-import { PAYMENT_STAGE, paymentNotSent } from '../site/src/live-client.js';
+import { PAYMENT_STAGE, paymentNotSent, slowDownMessage } from '../site/src/live-client.js';
 
 const h = c => `0x${c.repeat(64)}`;
 const a = c => `0x${c.repeat(40)}`;
@@ -146,7 +146,37 @@ test('an expired query returns a distinct terminal EXPIRED result instead of an 
   const result = await waitForPaidClaimReview(client, { prepared: { queryId: h('8') } }, { timeoutMs: 1_000, onProgress: p => progress.push(p) });
   expect(result).toEqual({ execution: 'onchain_protocol', status: 'EXPIRED' });
   expect(progress).toEqual(['Expired']);
-  expect(verdictLookups).toBe(0);
+  // Read in the same batched request as the query, and not used.
+  expect(verdictLookups).toBe(1);
+});
+
+test('resume wait reads the query and its verdict id together, and backs off on a rate-limited round instead of failing', async () => {
+  const reads = [];
+  let refusals = 2;
+  const progress = [];
+  const client = {
+    read: async (_contract, _abi, method) => {
+      reads.push(method);
+      // Like viem: the website's 429 is an HttpRequestError (status, headers) inside the contract error's causes.
+      if (refusals > 0) { refusals--; throw Object.assign(new Error('ContractFunctionExecutionError'), { cause: Object.assign(new Error('HTTP request failed.'), { status: 429, headers: new Headers({ 'retry-after': '1' }) }) }); }
+      return method === 'getQuery' ? { status: QueryStatus.OPEN, schemaId: SchemaId.FREEFORM_FACT, deadline: 0n } : `0x${'0'.repeat(64)}`;
+    },
+  };
+  const result = await waitForPaidClaimReview(client, { prepared: { queryId: h('8') } }, { timeoutMs: 200, onProgress: p => progress.push(p) });
+  expect(result).toEqual({ execution: 'onchain_protocol', status: 'unresolved' });
+  expect(reads.slice(0, 2).sort()).toEqual(['getQuery', 'latestVerdictOf']);
+  // At least twice the 4 s polling interval, whatever Retry-After asked for.
+  expect(progress).toEqual([slowDownMessage(8)]);
+  // A verdict fetch the website refuses with 429 also waits rather than failing the resume.
+  const limited = waitFixture();
+  limited.client.fetcher = async () => new Response('{}', { status: 429, headers: { 'retry-after': '20' } });
+  const seen = [];
+  expect(await waitForPaidClaimReview(limited.client, limited.claim, { timeoutMs: 100, onProgress: p => seen.push(p) })).toMatchObject({ status: 'unresolved' });
+  expect(seen).toEqual(['Decided', slowDownMessage(20)]);
+  // Any other failure still ends the wait with an error.
+  const broken = waitFixture();
+  broken.client.fetcher = async () => new Response('{}', { status: 500 });
+  await expect(waitForPaidClaimReview(broken.client, broken.claim, { timeoutMs: 100 })).rejects.toThrow('Verdict retrieval failed');
 });
 
 test('a timed-out wait flags an open query whose one-hour deadline has passed', async () => {

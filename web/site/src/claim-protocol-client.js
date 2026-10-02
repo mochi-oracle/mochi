@@ -1,7 +1,7 @@
 import { createClaimReviewProtocolInput } from '../../../packages/sdk/src/claims.ts';
 import { QueryStatus, SchemaId, VerdictStatus } from '@mochi/core';
 import { MochiVerdictsAbi, QueryEscrowAbi } from '../../../packages/chain/src/abis.ts';
-import { LiveClient, isUserRejection, paymentNotSent } from './live-client.js';
+import { LiveClient, isUserRejection, paymentNotSent, pollUntil, rejectRateLimited, slowDownMessage } from './live-client.js';
 
 const claimBytes = 4_000;
 const excerptBytes = 18_000;
@@ -99,12 +99,15 @@ function deadlinePassed(query, now = Date.now()) {
   return deadline > 0 && deadline * 1000 < now;
 }
 
+/**
+ * Polls the chain for the query's outcome (see pollUntil in live-client.js): every 4 s one batched /rpc request reads
+ * the query and its latest verdict id together, and a rate-limited round (HTTP 429) waits and continues.
+ */
 export async function waitForPaidClaimReview(client, prepared, { signal, onProgress = () => {}, timeoutMs = 180_000 } = {}) {
-  const deadline = Date.now() + timeoutMs;
   let lastQuery;
-  while (Date.now() < deadline) {
-    signal?.throwIfAborted();
-    const query = await client.read('queryEscrow', QueryEscrowAbi, 'getQuery', [prepared.prepared.queryId]);
+  const outcome = await pollUntil(async () => {
+    const queryId = prepared.prepared.queryId;
+    const [query, verdictId] = await Promise.all([client.read('queryEscrow', QueryEscrowAbi, 'getQuery', [queryId]), client.read('verdicts', MochiVerdictsAbi, 'latestVerdictOf', [queryId])]);
     lastQuery = query;
     const queryStatus = Number(query.status);
     if (Number(query.schemaId) !== SchemaId.FREEFORM_FACT) return { execution: 'onchain_protocol', status: 'unresolved' };
@@ -112,10 +115,9 @@ export async function waitForPaidClaimReview(client, prepared, { signal, onProgr
     if (queryStatus === QueryStatus.HUNG) return { execution: 'onchain_protocol', status: 'HUNG' };
     // Terminal: expire() ran on chain after the deadline and refunded the remaining escrow. No outcome exists.
     if (queryStatus === QueryStatus.EXPIRED) return { execution: 'onchain_protocol', status: 'EXPIRED' };
-    const verdictId = await client.read('verdicts', MochiVerdictsAbi, 'latestVerdictOf', [prepared.prepared.queryId]);
     if (verdictId !== `0x${'0'.repeat(64)}`) {
       const requestSignal = signal ? AbortSignal.any([signal, AbortSignal.timeout(30_000)]) : AbortSignal.timeout(30_000);
-      const response = await client.fetcher(`/api/v1/verdict/${verdictId}`, { signal: requestSignal, cache: 'no-store', redirect: 'error' });
+      const response = rejectRateLimited(await client.fetcher(`/api/v1/verdict/${verdictId}`, { signal: requestSignal, cache: 'no-store', redirect: 'error' }));
       if (response.ok) {
         const packet = await response.json();
         const verified = await client.verifyResult({ queryId: prepared.prepared.queryId, verdictId, packet }, prepared.prepared.secrets);
@@ -129,11 +131,8 @@ export async function waitForPaidClaimReview(client, prepared, { signal, onProgr
       }
       if (response.status !== 404) throw new Error('Verdict retrieval failed. Resume with the saved query ID.');
     }
-    await new Promise((resolve, reject) => {
-      const stop = () => { clearTimeout(timer); reject(new DOMException('Stopped', 'AbortError')); };
-      const timer = setTimeout(() => { signal?.removeEventListener('abort', stop); resolve(); }, 1500);
-      signal?.addEventListener('abort', stop, { once: true });
-    });
-  }
+    return undefined;
+  }, { deadline: Date.now() + timeoutMs, signal, onBackoff: seconds => onProgress(slowDownMessage(seconds)) });
+  if (outcome.done) return outcome.value;
   return { execution: 'onchain_protocol', status: 'unresolved', ...(deadlinePassed(lastQuery) ? { deadlinePassed: true } : {}) };
 }
