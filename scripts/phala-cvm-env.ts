@@ -11,9 +11,11 @@ export const CVM_ENV_NAMES = [
   "MOCHI_CLAIMS_ACCESS_TOKEN",
   "MOCHI_PRODUCTION_POSTGRES_PASSWORD",
   "MOCHI_PRODUCTION_ATTESTOR_ADMIN_TOKEN",
+  "MOCHI_VISITOR_KEY_SECRET",
   "MOCHI_PRODUCTION_CONFIG_JSON",
 ] as const;
-const BASE_NAMES = CVM_ENV_NAMES.slice(0, 4);
+// Every name but the last comes from the protected base env; MOCHI_PRODUCTION_CONFIG_JSON is always written last.
+const BASE_NAMES = CVM_ENV_NAMES.slice(0, -1);
 
 export function renderCvmEnv(baseText: string, config?: unknown): string {
   const values = new Map<string, string>();
@@ -28,6 +30,8 @@ export function renderCvmEnv(baseText: string, config?: unknown): string {
   const unexpected = [...values.keys()].filter((name) => !(BASE_NAMES as readonly string[]).includes(name));
   if (unexpected.length) throw new Error(`unexpected env names change the measurement: ${unexpected.join(", ")}`);
   for (const name of BASE_NAMES) if (!values.get(name)) throw new Error(`base env must set ${name}`);
+  // Shorter than the visitor-key minimum would silently switch per-visitor limits off inside the CVM.
+  if (values.get("MOCHI_VISITOR_KEY_SECRET")!.length < 24) throw new Error("MOCHI_VISITOR_KEY_SECRET must have at least 24 characters");
   const configLine = config === undefined ? "" : JSON.stringify(config);
   if (configLine.includes("\n")) throw new Error("config must serialise to one line");
   return [...BASE_NAMES.map((name) => `${name}=${values.get(name)}`), `MOCHI_PRODUCTION_CONFIG_JSON=${configLine}`].join("\n") + "\n";

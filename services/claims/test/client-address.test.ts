@@ -232,8 +232,10 @@ test('the operator key check answers only match or mismatch, and every proof is 
   expect(() => keyCheckHeader('too-short')).toThrow('24 characters');
   expect(() => keyCheckHeader(token, 'not-a-nonce')).toThrow('base64url');
   // The secret's source is named in one place.
-  expect(visitorSecretFromEnv({ MOCHI_CLAIMS_ACCESS_TOKEN: token })).toBe(token);
+  expect(visitorSecretFromEnv({ MOCHI_VISITOR_KEY_SECRET: token })).toBe(token);
   expect(visitorSecretFromEnv({})).toBeUndefined();
+  // The pilot invitation token is never the visitor secret.
+  expect(visitorSecretFromEnv({ MOCHI_CLAIMS_ACCESS_TOKEN: token })).toBeUndefined();
 });
 
 test('bounded body reads stop at the size cap and the deadline', async () => {

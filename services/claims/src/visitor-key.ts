@@ -30,12 +30,13 @@ const FORMAT = /^v1\.([A-Za-z0-9_-]{22})\.(\d{1,12})\.([A-Za-z0-9_-]{43})$/;
 const CHECK_FORMAT = /^v1\.([A-Za-z0-9_-]{43})\.([A-Za-z0-9_-]{43})$/;
 
 /**
- * The visitor secret. Today it is the invitation token MOCHI_CLAIMS_ACCESS_TOKEN, which both servers already hold; this
- * is the one place that names its source, so giving visitor keys their own secret later changes only this function
- * (and the matching variable on Railway and in the CVM's environment).
+ * The visitor secret: MOCHI_VISITOR_KEY_SECRET, a dedicated random value set to the same value on Railway and in the
+ * CVM's encrypted environment. It is deliberately not the pilot invitation token, so the website never holds pilot
+ * access and a leak of this secret exposes only the ability to mint per-visitor rate-limit keys. This is the one place
+ * that names its source.
  */
 export function visitorSecretFromEnv(env: Record<string, string | undefined>): string | undefined {
-  return env.MOCHI_CLAIMS_ACCESS_TOKEN;
+  return env.MOCHI_VISITOR_KEY_SECRET;
 }
 
 export type VisitorCheck = { status: 'valid'; visitor: string } | { status: 'absent' | 'invalid' | 'expired' };
